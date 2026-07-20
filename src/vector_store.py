@@ -63,6 +63,66 @@ from .config import (
 logger = logging.getLogger(__name__)
 
 # ============================================================
+# 🛠️ DEBUG 诊断辅助函数区
+# ============================================================
+
+def debug_print_vector_store_info(vector_store: Chroma):
+    """
+    【DEBUG 辅助函数 1】深入剖析 ChromaDB 的存储结构与维度
+    """
+    print("\n" + "=" * 25 + " [DEBUG 1: ChromaDB 内部状态] " + "=" * 25)
+    try:
+        collection = vector_store._collection
+        count = collection.count()
+        print(f"📊 集合名称 (Collection): {collection.name}")
+        print(f"🔢 存储片段总数 (Count): {count}")
+
+        if count > 0:
+            # 抽样提取 1 条记录查看底层真实数据
+            sample = collection.get(limit=1, include=["metadatas", "documents", "embeddings"])
+            print(f"🆔 示例数据 ID: {sample['ids'][0]}")
+            print(f"📌 来源元数据 (Metadata): {sample['metadatas'][0]}")
+            print(f"📝 文本前 80 字: {sample['documents'][0][:80].strip()}...")
+            
+            if sample.get('embeddings') is not None and len(sample['embeddings']) > 0:
+                vec = sample['embeddings'][0]
+                print(f"📐 向量维度 (Dimension): {len(vec)}")
+                print(f"🔢 向量数值前 5 位: {vec[:5]}")
+    except Exception as e:
+        print(f"⚠️ 读取 ChromaDB 内部状态时出错: {e}")
+    print("=" * 70 + "\n")
+
+
+def debug_search_similar_with_scores(
+    vector_store: Chroma,
+    query: str,
+    k: int = RETRIEVAL_K
+) -> List[Tuple[Document, float]]:
+    """
+    【DEBUG 辅助函数 2】显式输出带距离/相似度得分的检索结果
+    """
+    print("\n" + "=" * 20 + f" [DEBUG 2: 检索诊断 (Query: '{query}')] " + "=" * 20)
+    
+    # 使用 similarity_search_with_score 可以拿到 (Document, score) 元组
+    # 注意：ChromaDB 默认使用的 L2/余弦距离，Score 越小代表越相似，或者接近 0/1 视度量函数而定
+    results_with_scores = vector_store.similarity_search_with_score(query, k=k)
+    
+    if not results_with_scores:
+        print("⚠️ 未检索到任何匹配文档。")
+    else:
+        for i, (doc, score) in enumerate(results_with_scores, 1):
+            print(f"\n📄 [召回切片 {i}/{len(results_with_scores)}] (匹配得分/距离 Score: {score:.4f})")
+            print(f"📌 来源 (Source): {doc.metadata.get('source', '未知')}")
+            print("📝 召回文本内容:")
+            print("┌" + "─" * 60)
+            for line in doc.page_content.strip().split("\n"):
+                print(f"│ {line}")
+            print("└" + "─" * 60)
+            
+    print("=" * 70 + "\n")
+    return results_with_scores
+
+# ============================================================
 # 嵌入函数创建（带自动回退）
 # ============================================================
 
@@ -367,3 +427,24 @@ def get_vector_store_info(vector_store: Chroma) -> dict:
         return {"document_count": count}
     except Exception:
         return {"document_count": 0}
+    
+    
+# ============================================================
+# 命令行测试入口
+# ============================================================
+if __name__ == "__main__":
+    from .pdf_loader import load_pdfs_from_directory
+    from .config import PDF_DATA_DIR, CHUNK_SIZE, CHUNK_OVERLAP
+
+    # 1. 独立测试加载 PDF 文本块
+    test_docs = load_pdfs_from_directory(PDF_DATA_DIR, CHUNK_SIZE, CHUNK_OVERLAP)
+
+    if test_docs:
+        # 2. 创建或加载向量库 (开启 debug=True 观察细节)
+        store = create_vector_store(test_docs, debug=True)
+
+        # 3. 模拟一条测试查询语句，验证余弦距离与召回得分
+        test_query = "核心业务是什么？"
+        search_similar(store, query=test_query, k=3, debug=True)
+    else:
+        print("未能读取到测试文档，无法测试向量库 CRUD 功能。")
