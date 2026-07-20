@@ -3,7 +3,15 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>NewsPage</title>
+    <title>NewsPage — 湖南比邻星科技文档智能问答系统</title>
+
+    <!-- highlight.js 代码高亮 -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+
+    <!-- marked.js Markdown 渲染 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -11,83 +19,95 @@
     <!-- 顶部导航栏 -->
     <!-- ============================================================ -->
     <header class="header">
-        <div class="header-content">
-            <h1 class="header-title">NewsPage</h1>
-            <span class="header-subtitle">湖南比邻星科技文档智能问答系统</span>
+        <div class="header-brand">
+            <div class="brand-icon">⬡</div>
+            <div class="brand-text">
+                <h1 class="header-title">NewsPage</h1>
+                <span class="header-subtitle">湖南比邻星科技文档智能问答系统</span>
+            </div>
         </div>
-        <div class="header-status" id="statusIndicator">
-            <span class="status-dot" id="statusDot"></span>
-            <span id="statusText">检查中...</span>
+        <div class="header-right">
+            <div class="header-status" id="statusIndicator">
+                <span class="status-dot" id="statusDot"></span>
+                <span class="status-label" id="statusText">检查中...</span>
+            </div>
         </div>
     </header>
 
     <!-- ============================================================ -->
-    <!-- 主容器：左侧对话区 + 右侧上传区 -->
+    <!-- 主容器 -->
     <!-- ============================================================ -->
     <div class="main-container">
 
         <!-- ========== 左侧：对话区域 ========== -->
-        <div class="chat-section">
-            <!-- 消息列表 -->
+        <main class="chat-section">
             <div class="chat-messages" id="chatMessages">
                 <div class="welcome-message">
-                    <div class="welcome-icon">📚</div>
+                    <div class="welcome-logo">⬡</div>
                     <h2>湖南比邻星科技文档智能问答系统</h2>
-                    <p>上传公司内部开发文档、API规范或产品使用手册后，即可基于文档内容进行智能问答。</p>
-                    <p class="welcome-hint">本系统由湖南比邻星科技有限公司开发，请先上传相关文档开始使用。</p>
+                    <p class="welcome-desc">上传公司内部开发文档、API 规范或产品使用手册后，<br>即可基于文档内容进行专业级智能问答。</p>
+                    <div class="welcome-features">
+                        <span>📄 多文档检索</span>
+                        <span>🔍 语义搜索</span>
+                        <span>💡 智能问答</span>
+                        <span>📊 代码高亮</span>
+                    </div>
                 </div>
             </div>
 
-            <!-- 输入区域 -->
             <div class="chat-input-area">
                 <form id="chatForm" class="chat-form">
-                    <textarea
-                        id="queryInput"
-                        class="chat-input"
-                        placeholder="输入你的问题..."
-                        rows="1"
-                        autofocus
-                    ></textarea>
-                    <button type="submit" class="send-button" id="sendButton">
-                        <span class="send-icon">▶</span>
-                    </button>
+                    <div class="input-wrapper">
+                        <textarea
+                            id="queryInput"
+                            class="chat-input"
+                            placeholder="输入你的问题，基于已上传文档获取准确回答…"
+                            rows="1"
+                            autofocus
+                        ></textarea>
+                        <button type="submit" class="send-button" id="sendButton" title="发送 (Enter)">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                                <line x1="12" y1="19" x2="12" y2="5"></line>
+                                <polyline points="5 12 12 5 19 12"></polyline>
+                            </svg>
+                        </button>
+                    </div>
                 </form>
                 <div class="input-hint">
-                    按 Enter 发送，Shift+Enter 换行
+                    <kbd>Enter</kbd> 发送 · <kbd>Shift</kbd> + <kbd>Enter</kbd> 换行
                 </div>
             </div>
-        </div>
+        </main>
 
-        <!-- ========== 右侧：PDF 上传 + 状态面板 ========== -->
+        <!-- ========== 右侧：工具面板 ========== -->
         <aside class="sidebar">
-            <!-- PDF 上传区域 -->
-            <div class="sidebar-card">
-                <h3 class="card-title">📄 上传文档</h3>
+            <!-- 上传 -->
+            <div class="sidebar-card card-upload">
+                <h3 class="card-title">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                    上传文档
+                </h3>
                 <div class="upload-area" id="uploadArea">
-                    <div class="upload-icon">📁</div>
-                    <p class="upload-text">拖拽 PDF 到此处，或点击选择文件</p>
-                    <input
-                        type="file"
-                        id="fileInput"
-                        accept=".pdf"
-                        class="file-input-hidden"
-                    />
-                    <button class="upload-button" id="uploadButton">
-                        选择 PDF 文件
-                    </button>
+                    <div class="upload-icon">
+                        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                    </div>
+                    <p class="upload-text">拖拽 PDF 到此处<br>或点击下方按钮选择文件</p>
+                    <input type="file" id="fileInput" accept=".pdf" class="file-input-hidden" />
+                    <button class="upload-button" id="uploadButton">选择 PDF 文件</button>
                 </div>
                 <div class="upload-progress" id="uploadProgress" style="display: none;">
-                    <div class="progress-bar">
-                        <div class="progress-fill" id="progressFill"></div>
-                    </div>
+                    <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
                     <p class="progress-text" id="progressText">正在处理...</p>
                 </div>
                 <div class="upload-result" id="uploadResult"></div>
             </div>
 
             <!-- 知识库状态 -->
-            <div class="sidebar-card">
-                <h3 class="card-title">📊 知识库状态</h3>
+            <div class="sidebar-card card-status">
+                <h3 class="card-title">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+                    知识库状态
+                </h3>
                 <div class="stat-item">
                     <span class="stat-label">状态</span>
                     <span class="stat-value" id="kbReady">-</span>
@@ -97,26 +117,28 @@
                     <span class="stat-value" id="kbCount">-</span>
                 </div>
                 <button class="refresh-button" id="refreshStatus">
-                    🔄 刷新状态
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                    刷新状态
                 </button>
             </div>
 
             <!-- 使用提示 -->
-            <div class="sidebar-card">
-                <h3 class="card-title">💡 使用提示</h3>
+            <div class="sidebar-card card-tips">
+                <h3 class="card-title">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+                    使用提示
+                </h3>
                 <ul class="tips-list">
                     <li>支持上传多个 PDF 文档</li>
-                    <li>每次上传会自动重建知识库</li>
-                    <li>建议使用文字型 PDF（非扫描件）</li>
-                    <li>回答严格基于已上传的文档内容</li>
+                    <li>每次上传自动重建知识库</li>
+                    <li>建议使用文字型 PDF</li>
+                    <li>回答基于已上传文档内容</li>
+                    <li>支持 Markdown 与代码高亮</li>
                 </ul>
             </div>
         </aside>
     </div>
 
-    <!-- ============================================================ -->
-    <!-- JavaScript -->
-    <!-- ============================================================ -->
     <script src="/static/app.js"></script>
 </body>
 </html>

@@ -104,7 +104,7 @@ async def index(request: Request):
     使用 Jinja2 模板引擎将 index.html 渲染为完整 HTML 页面。
     页面标题在 <title> 和 header 中均设为 "NewsPage"。
     """
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(request, "index.html", {"request": request})
 
 
 # ============================================================
