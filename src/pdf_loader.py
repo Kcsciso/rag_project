@@ -72,6 +72,36 @@ def extract_text_from_pdf(file_path: str) -> str:
     # 拼接所有页面，页面间用双换行分隔
     return "\n\n".join(full_text_parts)
 
+def debug_print_chunks(chunks: List[Document], max_show: int = 3):
+    """
+    【DEBUG 辅助函数】详细打印切片内容，帮助观察：
+    1. 每个 Chunk 的字符数是否超出限制
+    2. Chunk 之间的 Overlap（重叠区域）是否正常工作
+    3. Metadata 是否被完好保留
+    """
+    print("\n" + "=" * 25 + " [DEBUG: 切片效果观察] " + "=" * 25)
+    total_chunks = len(chunks)
+    show_count = min(max_show, total_chunks)
+
+    for i in range(show_count):
+        chunk = chunks[i]
+        content = chunk.page_content.strip()
+        print(f"\n🧩 [Chunk {i + 1}/{total_chunks}] (字符数: {len(content)})")
+        print(f"📌 元数据 (Metadata): {chunk.metadata}")
+        print("📝 切片内容:")
+        print("┌" + "─" * 60)
+        # 逐行打印并加缩进，避免格式混乱
+        for line in content.split("\n"):
+            print(f"│ {line}")
+        print("└" + "─" * 60)
+
+        # 打印与下一个 Chunk 的重叠交叉区（验证 chunk_overlap）
+        if i < show_count - 1 and len(chunks) > 1:
+            next_content = chunks[i + 1].page_content.strip()
+            # 简单寻找末尾与下一个开头重合的部分
+            overlap_preview = content[-60:]  # 取当前 chunk 结尾 60 字
+            print(f"🔍 [与 Chunk {i + 2} 的交界预览 (尾部)]: ...{overlap_preview}")
+
 
 def load_pdfs_from_directory(
     data_dir: str,
@@ -171,7 +201,13 @@ def load_pdfs_from_directory(
 if __name__ == "__main__":
     from .config import PDF_DATA_DIR, CHUNK_SIZE, CHUNK_OVERLAP
 
-    docs = load_pdfs_from_directory(PDF_DATA_DIR, CHUNK_SIZE, CHUNK_OVERLAP)
+    # 运行模块测试时，默认开启 debug=True
+    docs = load_pdfs_from_directory(
+        data_dir=PDF_DATA_DIR,
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        debug=True  # 👈 直接传入 True 观察切片输出
+    )
     if docs:
         print(f"\n--- 示例：第一个文本块 ---")
         print(f"来源: {docs[0].metadata['source']}")
