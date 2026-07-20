@@ -62,7 +62,7 @@ logger = logging.getLogger("app")
 # ============================================================
 app = FastAPI(
     title="NewsPage",
-    description="基于 RAG 架构的智能文档对话系统",
+    description="湖南比邻星科技 — 官方开发与使用文档智能问答系统",
     version="1.0.0",
 )
 
@@ -83,7 +83,7 @@ vector_store = None
 async def startup_event():
     """应用启动时：加载已有向量库"""
     global vector_store
-    logger.info("🚀 NewsPage 正在启动...")
+    logger.info("🚀 NewsPage — 湖南比邻星科技文档智能问答系统 正在启动...")
     vector_store = load_vector_store(CHROMA_PERSIST_DIR)
     if vector_store:
         info = get_vector_store_info(vector_store)
@@ -99,7 +99,7 @@ async def startup_event():
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     """
-    渲染 NewsPage 主页面。
+    渲染 NewsPage 主页面（湖南比邻星科技文档智能问答系统）。
 
     使用 Jinja2 模板引擎将 index.html 渲染为完整 HTML 页面。
     页面标题在 <title> 和 header 中均设为 "NewsPage"。

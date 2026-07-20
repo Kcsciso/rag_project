@@ -49,9 +49,14 @@ DEEPSEEK_MODEL = "deepseek-v4-pro"  # 主路由模型，也可换为 deepseek-v4
 # ============================================================
 # 生效配置（环境变量 > 下方默认值）
 # ============================================================
-BASE_URL = os.environ.get("LLM_BASE_URL", DEEPSEEK_BASE_URL)
-API_KEY = os.environ.get("LLM_API_KEY", DEEPSEEK_API_KEY)
-MODEL_NAME = os.environ.get("LLM_MODEL_NAME", DEEPSEEK_MODEL)
+# 当前默认：本地 vLLM OpenAI 兼容服务
+# 如需切回云端 DeepSeek API，设置环境变量：
+#   export LLM_BASE_URL="https://api.deepseek.com/anthropic"
+#   export LLM_API_KEY="sk-your-deepseek-key"
+# ============================================================
+BASE_URL = os.environ.get("LLM_BASE_URL", "http://localhost:8000/v1")
+API_KEY = os.environ.get("LLM_API_KEY", "EMPTY")          # vLLM 默认不验证 Key
+MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "deepseek-v4-pro")
 
 # ============================================================
 # 向量库 & 嵌入模型配置
