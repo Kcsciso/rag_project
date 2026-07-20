@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NewsPage</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <!-- ============================================================ -->
+    <!-- 顶部导航栏 -->
+    <!-- ============================================================ -->
+    <header class="header">
+        <div class="header-content">
+            <h1 class="header-title">NewsPage</h1>
+            <span class="header-subtitle">RAG 智能文档对话系统</span>
+        </div>
+        <div class="header-status" id="statusIndicator">
+            <span class="status-dot" id="statusDot"></span>
+            <span id="statusText">检查中...</span>
+        </div>
+    </header>
+
+    <!-- ============================================================ -->
+    <!-- 主容器：左侧对话区 + 右侧上传区 -->
+    <!-- ============================================================ -->
+    <div class="main-container">
+
+        <!-- ========== 左侧：对话区域 ========== -->
+        <div class="chat-section">
+            <!-- 消息列表 -->
+            <div class="chat-messages" id="chatMessages">
+                <div class="welcome-message">
+                    <div class="welcome-icon">📚</div>
+                    <h2>欢迎使用 NewsPage</h2>
+                    <p>上传 PDF 文档后，即可基于文档内容进行智能对话。</p>
+                    <p class="welcome-hint">请先在右侧上传 PDF，或直接输入问题进行测试。</p>
+                </div>
+            </div>
+
+            <!-- 输入区域 -->
+            <div class="chat-input-area">
+                <form id="chatForm" class="chat-form">
+                    <textarea
+                        id="queryInput"
+                        class="chat-input"
+                        placeholder="输入你的问题..."
+                        rows="1"
+                        autofocus
+                    ></textarea>
+                    <button type="submit" class="send-button" id="sendButton">
+                        <span class="send-icon">▶</span>
+                    </button>
+                </form>
+                <div class="input-hint">
+                    按 Enter 发送，Shift+Enter 换行
+                </div>
+            </div>
+        </div>
+
+        <!-- ========== 右侧：PDF 上传 + 状态面板 ========== -->
+        <aside class="sidebar">
+            <!-- PDF 上传区域 -->
+            <div class="sidebar-card">
+                <h3 class="card-title">📄 上传文档</h3>
+                <div class="upload-area" id="uploadArea">
+                    <div class="upload-icon">📁</div>
+                    <p class="upload-text">拖拽 PDF 到此处，或点击选择文件</p>
+                    <input
+                        type="file"
+                        id="fileInput"
+                        accept=".pdf"
+                        class="file-input-hidden"
+                    />
+                    <button class="upload-button" id="uploadButton">
+                        选择 PDF 文件
+                    </button>
+                </div>
+                <div class="upload-progress" id="uploadProgress" style="display: none;">
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="progressFill"></div>
+                    </div>
+                    <p class="progress-text" id="progressText">正在处理...</p>
+                </div>
+                <div class="upload-result" id="uploadResult"></div>
+            </div>
+
+            <!-- 知识库状态 -->
+            <div class="sidebar-card">
+                <h3 class="card-title">📊 知识库状态</h3>
+                <div class="stat-item">
+                    <span class="stat-label">状态</span>
+                    <span class="stat-value" id="kbReady">-</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">已索引片段</span>
+                    <span class="stat-value" id="kbCount">-</span>
+                </div>
+                <button class="refresh-button" id="refreshStatus">
+                    🔄 刷新状态
+                </button>
+            </div>
+
+            <!-- 使用提示 -->
+            <div class="sidebar-card">
+                <h3 class="card-title">💡 使用提示</h3>
+                <ul class="tips-list">
+                    <li>支持上传多个 PDF 文件</li>
+                    <li>每次上传会自动重建知识库</li>
+                    <li>建议使用文字型 PDF（非扫描件）</li>
+                    <li>对话基于文档内容生成，避免编造</li>
+                </ul>
+            </div>
+        </aside>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- JavaScript -->
+    <!-- ============================================================ -->
+    <script src="/static/app.js"></script>
+</body>
+</html>
