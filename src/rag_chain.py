@@ -59,6 +59,8 @@ RAG 对话管线 — 检索增强生成的核心编排层
 """
 
 import logging
+import threading
+import time
 from typing import List, Dict, Optional, Generator
 
 import httpx
@@ -84,6 +86,21 @@ logger = logging.getLogger(__name__)
 # - write=30.0s  : 写入超时
 # - pool=3.0s    : 连接池获取超时
 LLM_TIMEOUT = httpx.Timeout(connect=3.0, read=30.0, write=30.0, pool=3.0)
+
+# ============================================================
+# 并发保护 — 防止高频请求压垮本地 vLLM
+# ============================================================
+
+# 互斥锁：确保同一时间仅 1 个请求访问本地 vLLM（1.5B 模型 + 共享 GPU）
+_vllm_lock = threading.Lock()
+_VLLM_LOCK_TIMEOUT = 30.0  # 获取锁的最大等待时间（秒）
+
+# ============================================================
+# 多轮对话滑动窗口 — 防止上下文超出 4096 token 限制
+# ============================================================
+
+# 最多保留最近 N 轮对话历史（1 轮 = 1 user + 1 assistant = 2 条消息）
+MAX_HISTORY_TURNS = 3  # 3 轮 = 6 条消息，加上 system + 当前 user ≈ 8 条，安全适配 4096 上下文
 
 # ============================================================
 # 用户友好错误提示
@@ -170,6 +187,34 @@ def _get_deepseek_client() -> OpenAI:
             f"timeout=connect:{LLM_TIMEOUT.connect}s/read:{LLM_TIMEOUT.read}s"
         )
     return _deepseek_client
+
+
+# ============================================================
+# 并发保护辅助函数
+# ============================================================
+
+def _acquire_vllm_lock() -> bool:
+    """
+    尝试获取 vLLM 请求锁，防止并发请求压垮本地模型。
+
+    Returns:
+        True 如果成功获取锁，False 如果超时
+    """
+    acquired = _vllm_lock.acquire(timeout=_VLLM_LOCK_TIMEOUT)
+    if not acquired:
+        logger.warning(
+            f"⚠️ vLLM 请求锁获取超时 ({_VLLM_LOCK_TIMEOUT}s)，"
+            f"可能有并发请求正在处理中，将跳过 Layer 1 直接降级"
+        )
+    return acquired
+
+
+def _release_vllm_lock():
+    """释放 vLLM 请求锁（安全释放，忽略重复释放错误）"""
+    try:
+        _vllm_lock.release()
+    except RuntimeError:
+        pass  # 锁未被持有，忽略
 
 
 # ============================================================
@@ -636,7 +681,16 @@ def _build_messages(
         {"role": "system", "content": RAG_SYSTEM_PROMPT},
     ]
 
+    # 🪟 滑动窗口：限制最多保留最近 MAX_HISTORY_TURNS 轮对话
     if chat_history:
+        max_history_msgs = MAX_HISTORY_TURNS * 2  # N 轮 = 2N 条消息
+        if len(chat_history) > max_history_msgs:
+            trimmed = chat_history[-max_history_msgs:]
+            logger.info(
+                f"🪟 滑动窗口: 对话历史 {len(chat_history)} 条 → "
+                f"裁剪至最近 {len(trimmed)} 条（{MAX_HISTORY_TURNS} 轮）"
+            )
+            chat_history = trimmed
         messages.extend(chat_history)
 
     messages.append({"role": "user", "content": current_user_message})
@@ -692,9 +746,14 @@ def rag_chat(
         LLMServiceError: 四层全部失败时抛出（第 4 层兜底）
     """
     # ---- ① 检索 (Retrieve) — 带相似度阈值过滤 ----
-    context_docs = search_similar_with_threshold(
-        vector_store, query, k=k, threshold=SIMILARITY_THRESHOLD
-    )
+    try:
+        context_docs = search_similar_with_threshold(
+            vector_store, query, k=k, threshold=SIMILARITY_THRESHOLD
+        )
+    except Exception as e:
+        logger.error(f"❌ 向量检索失败: {type(e).__name__}: {e}")
+        context_docs = []  # 检索失败时使用空上下文，让 Layer 3 优雅处理
+
     if not context_docs:
         logger.info(
             f"🔍 相似度阈值过滤后无相关切片 (threshold={SIMILARITY_THRESHOLD})，"
@@ -702,25 +761,41 @@ def rag_chat(
         )
 
     # ---- ② 增强 (Augment) ----
-    messages = _build_messages(query, context_docs, chat_history)
-
-    # ================================================================
-    # 第 1 层：本地 vLLM 推理服务
-    # ================================================================
     try:
-        answer = _call_llm(_get_client(), MODEL_NAME, messages)
-        logger.info(f"✅ 第 1 层（本地 vLLM）调用成功")
+        messages = _build_messages(query, context_docs, chat_history)
+    except Exception as e:
+        logger.error(f"❌ Prompt 构建失败: {type(e).__name__}: {e}，直接进入 Layer 3")
+        # Prompt 构建失败时直接降级到 Layer 3
+        try:
+            return _direct_retrieval_response(context_docs, query)
+        except Exception:
+            raise LLMServiceError(FRIENDLY_ERROR_MSG)
 
-        sources = list(set(
-            doc.metadata.get("source", "未知")
-            for doc in context_docs
-        ))
-        return {"answer": answer, "sources": sources, "model": MODEL_NAME}
+    # ================================================================
+    # 第 1 层：本地 vLLM 推理服务（带并发锁保护）
+    # ================================================================
+    lock_acquired = _acquire_vllm_lock()
+    try:
+        if lock_acquired:
+            answer = _call_llm(_get_client(), MODEL_NAME, messages)
+            logger.info(f"✅ 第 1 层（本地 vLLM）调用成功")
+
+            sources = list(set(
+                doc.metadata.get("source", "未知")
+                for doc in context_docs
+            ))
+            return {"answer": answer, "sources": sources, "model": MODEL_NAME}
+        else:
+            # 锁获取超时 → 视为 Layer 1 不可用
+            logger.warning("⚠️  第 1 层（本地 vLLM）跳过：并发锁获取超时")
 
     except _FALLBACK_EXCEPTIONS as e:
         logger.warning(f"⚠️  第 1 层（本地 vLLM）不可用（网络/超时）: {e}")
     except Exception as e:
         logger.warning(f"⚠️  第 1 层（本地 vLLM）调用异常: {type(e).__name__}: {e}")
+    finally:
+        if lock_acquired:
+            _release_vllm_lock()
 
     # ================================================================
     # 第 2 层：云端 DeepSeek API 降级
@@ -802,9 +877,14 @@ def rag_chat_stream(
         LLMServiceError: 四层全部失败时抛出（第 4 层兜底）
     """
     # ---- ① 检索 — 带相似度阈值过滤 ----
-    context_docs = search_similar_with_threshold(
-        vector_store, query, k=k, threshold=SIMILARITY_THRESHOLD
-    )
+    try:
+        context_docs = search_similar_with_threshold(
+            vector_store, query, k=k, threshold=SIMILARITY_THRESHOLD
+        )
+    except Exception as e:
+        logger.error(f"❌ 向量检索失败: {type(e).__name__}: {e}")
+        context_docs = []  # 检索失败时使用空上下文
+
     if not context_docs:
         logger.info(
             f"🔍 相似度阈值过滤后无相关切片 (threshold={SIMILARITY_THRESHOLD})，"
@@ -812,20 +892,35 @@ def rag_chat_stream(
         )
 
     # ---- ② 增强 ----
-    messages = _build_messages(query, context_docs, chat_history)
+    try:
+        messages = _build_messages(query, context_docs, chat_history)
+    except Exception as e:
+        logger.error(f"❌ Prompt 构建失败: {type(e).__name__}: {e}，直接进入 Layer 3 流式")
+        try:
+            yield from _direct_retrieval_response_stream(context_docs, query)
+            return
+        except Exception:
+            raise LLMServiceError(FRIENDLY_ERROR_MSG)
 
     # ================================================================
-    # 第 1 层：本地 vLLM 推理服务（流式）
+    # 第 1 层：本地 vLLM 推理服务（流式，带并发锁保护）
     # ================================================================
+    lock_acquired = _acquire_vllm_lock()
     try:
-        yield from _stream_llm(_get_client(), MODEL_NAME, messages)
-        logger.info(f"✅ 第 1 层（本地 vLLM 流式）调用成功")
-        return  # ← 成功，生成器结束
+        if lock_acquired:
+            yield from _stream_llm(_get_client(), MODEL_NAME, messages)
+            logger.info(f"✅ 第 1 层（本地 vLLM 流式）调用成功")
+            return  # ← 成功，生成器结束
+        else:
+            logger.warning("⚠️  第 1 层（本地 vLLM 流式）跳过：并发锁获取超时")
 
     except _FALLBACK_EXCEPTIONS as e:
         logger.warning(f"⚠️  第 1 层（本地 vLLM 流式）不可用（网络/超时）: {e}")
     except Exception as e:
         logger.warning(f"⚠️  第 1 层（本地 vLLM 流式）调用异常: {type(e).__name__}: {e}")
+    finally:
+        if lock_acquired:
+            _release_vllm_lock()
 
     # ================================================================
     # 第 2 层：云端 DeepSeek API 降级（流式）
