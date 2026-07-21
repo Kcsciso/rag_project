@@ -716,3 +716,127 @@ DEEPSEEK_MODEL = "glm-4.7-flash"
 ```bash
 export LLM_MODEL_NAME="Qwen/Qwen2.5-7B-Instruct"
 # 重启 vLLM 时使用 --gpu-memory-utilization 0.40
+```
+
+---
+
+## 十六、Layer 3 智能结构化直出优化
+
+> **日期**: 2026-07-21  
+> **变更范围**: `src/rag_chain.py` (Layer 3 核心逻辑重写)  
+> **变更目标**: 将 Layer 3 从"原始切片拼接"升级为"智能提取 + 结构化输出"
+
+### 16.1 问题
+
+优化前，Layer 3（纯文档检索直出模式）的行为是将所有检索到的切片原文不做加工地拼接输出：
+
+```
+1. [来源: xxx.pdf]
+<500 字符的原始切片...>
+2. [来源: xxx.pdf]
+<另一段 500 字符的原始切片...>
+```
+
+用户面对的是未加提炼的文本墙，需要自行从中寻找目标函数和代码。
+
+### 16.2 三项改进
+
+#### (1) 智能去重与关键词排序
+
+新增 `_score_chunk_for_query(chunk_text, query)` 函数：
+- 提取 query 中的英文函数名（如 `robot_Power_on`、`movj`）
+- 提取中文关键词（2-4 字滑动窗口，如 `上电`、`使能`、`位姿`）
+- 对每个切片进行命中统计，函数名命中给予 0.3 加分
+- 按得分降序排列，仅保留 Top-K 个最相关切片
+
+#### (2) 结构化提取引擎
+
+新增 `_extract_structured_content(context_docs, query)` 函数替代原有的简单拼接：
+
+```
+旧格式 → 新格式
+───────────────────────────────────────────
+[来源]     → 【精准检索结果】
+原始文本   → ■ 核心函数：robot_Power_on()
+           →   功能描述：上电指令
+           →   参数说明：无
+           →   返回值：成功 0，失败 -1
+           →   来源：robot_sdk.pdf
+           → ■ Python 示例代码：
+           →   res = robot.robot_Power_on()
+           →   print(res)
+```
+
+提取逻辑：
+- 正则匹配 `函数名称 xxx( )` + `功能描述 xxx` → 提取函数签名
+- 正则匹配 `参数说明 xxx` → 提取参数信息
+- 正则匹配 `返回值 xxx` → 提取返回类型
+- 代码行检测（`robot.`、`ctypes`、`argtypes`、`restype`、`CDLL` 等）→ 提取 Python 示例代码块
+- 函数名/代码块去重，避免重复输出
+
+#### (3) 动态 Top-K 缩减
+
+| 配置 | 旧值 | 新值 | 理由 |
+|------|------|------|------|
+| `DIRECT_RETRIEVAL_K` | 5 | **2** | 降级模式下只保留匹配度最高的 1-2 个核心片段，过滤噪声。5 片拼接 → 2 片精准提取 |
+
+**注意**: Top-K 选择不再由调用方（`rag_chat`）硬编码切片，而是由 `_extract_structured_content` 内部评分排序后动态选择，确保总是拿到最相关的 2 片。
+
+### 16.3 效果对比
+
+| 指标 | 优化前 (v1) | 优化后 (v2) |
+|------|------------|------------|
+| 输出格式 | 原始切片拼接 | **结构化：函数名/描述/参数/返回值/代码** |
+| 切片数量 | 5 片全量输出 | **Top-2 精准提取** |
+| 去重 | 无 | **函数名 + 代码双重去重** |
+| Q1 `robot_Power_on` | 淹没在文本墙中 | **■ 核心函数 + ■ 代码示例** |
+| Q3 `get_robot_pose` | 同上 | **■ get_robot_pose() → [px,py,pz,rx,ry,rz]** |
+| 内容长度 | 2700+ chars | **400-800 chars** (精简 60-70%) |
+| 用户可读性 | ⭐⭐ | **⭐⭐⭐⭐⭐** |
+
+### 16.4 实测示例
+
+**Q1「机械臂上电和使能的函数」— Layer 3 输出**:
+```
+【提示：当前大模型生成服务未就绪，已为您开启纯文档检索直出模式】
+
+【精准检索结果】
+
+■ 核心函数：robot_Power_on()
+  功能描述：上电指令
+  参数说明：无
+  返回值：成功： 0 ；失败：  -1
+  来源：六轴机械臂SDK说明文档_win.pdf
+
+■ 核心函数：robot_enable()
+  功能描述：电机使能指令
+  参数说明：无
+  返回值：成功： 0 ；失败：  -1
+  来源：六轴机械臂SDK说明文档_win.pdf
+
+■ Python 示例代码：
+  rob_ip = b"192.168.11.214"
+  rob_port = 60000
+  robot.Robot_socket_start(rob_ip, rob_port)
+  time.sleep(2)
+  res = robot.robot_Power_on()
+  print(res)
+  res = robot.robot_enable()
+  print(res)
+
+💡 以上为文档精准检索结果。如需更深入的分析与总结，请等待大模型服务恢复后重试。
+```
+
+**Q3「获取机械臂当前位姿」— Layer 3 输出**:
+```
+■ 核心函数：get_robot_pose()
+  功能描述：获取机械臂姿态数值
+  参数说明：无
+  返回值：[px,py,pz,rx,ry,rz]
+  来源：六轴机械臂SDK说明文档_win.pdf
+
+■ Python 示例代码：
+  robot.get_robot_pose.restype = ctypes.c_char_p
+  pose_data1= robot.get_robot_pose()
+  print(pose_data1.decode('utf-8'))
+```

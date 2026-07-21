@@ -222,25 +222,27 @@ def _stream_llm(
 # 当 Layer 1（本地 vLLM）和 Layer 2（DeepSeek API）全部失败或超时后触发。
 #
 # 特点：
-#   - 纯 CPU 运行：仅使用 ChromaDB 向量检索 + 模板组装，不调用任何 LLM
+#   - 纯 CPU 运行：仅使用 ChromaDB 向量检索 + 智能提取，不调用任何 LLM
 #   - 零显存消耗：不经过 vLLM / PyTorch GPU 推理
 #   - 零 API 费用：不产生任何云端 API 调用
-#   - 秒级响应：省略 LLM 推理延迟，直接返回检索结果
+#   - 秒级响应：省略 LLM 推理延迟，直接返回结构化检索结果
+#   - 智能去重：关键词匹配排序，自动提取核心函数、描述、示例代码
 #   - 支持流式：分段 yield 文本，前端打字机效果正常运作
 #
 # 局限性：
-#   - 不做内容理解与总结，仅提供原文片段
+#   - 不做内容理解与总结，仅提供经提取的结构化原文片段
 #   - 多轮对话上下文不会影响检索结果（仅基于当前 query 检索）
 # ============================================================
 
-# 纯检索模式使用的 Top-K 值（可独立于常规 RAG 的 RETRIEVAL_K 调整）
-# 纯检索模式使用的 Top-K 值（与 RETRIEVAL_K 保持一致，确保 Layer 3 输出完整召回）
-DIRECT_RETRIEVAL_K = 5
+import re
+
+# 纯检索模式使用的 Top-K 值
+# k=2: 降级模式下只保留匹配度最高的 1-2 个核心片段，过滤噪声干扰
+DIRECT_RETRIEVAL_K = 2
 
 # 纯检索模式的提示文本模板
 DIRECT_RETRIEVAL_HEADER = (
-    "【提示：当前大模型生成服务未就绪，已为您开启纯文档检索直出模式】\n\n"
-    "根据比邻星技术文档，找到以下相关内容：\n\n"
+    "【提示：当前大模型生成服务未就绪，已为您开启纯文档检索直出模式】\n"
 )
 
 DIRECT_RETRIEVAL_EMPTY = (
@@ -249,17 +251,233 @@ DIRECT_RETRIEVAL_EMPTY = (
 )
 
 DIRECT_RETRIEVAL_FOOTER = (
-    "\n---\n"
-    "💡 以上为文档原文检索结果。如需更深入的分析与总结，请等待大模型服务恢复后重试。"
+    "\n💡 以上为文档精准检索结果。如需更深入的分析与总结，请等待大模型服务恢复后重试。"
 )
+
+
+def _score_chunk_for_query(chunk_text: str, query: str) -> float:
+    """
+    对切片内容进行关键词匹配打分，用于按相关性排序。
+
+    支持中英文混合查询：
+      - 提取英文单词/函数名（如 robot_Power_on、movj）
+      - 提取中文关键词（如 上电、使能、位姿）
+      - 对命中函数名的切片给予额外加分
+
+    Args:
+        chunk_text: 文档切片文本
+        query: 用户查询
+
+    Returns:
+        0.0 ~ 1.0 的相关性得分
+    """
+    query_lower = query.lower()
+    chunk_lower = chunk_text.lower()
+
+    # ---- 提取英文/函数名 tokens ----
+    en_tokens = set()
+    for match in re.finditer(r'[a-zA-Z_]\w+', query_lower):
+        token = match.group()
+        if len(token) >= 3 and token not in ('请', '给出', '如何', '怎么', '什么', '哪些'):
+            en_tokens.add(token)
+
+    # ---- 提取中文关键词（2-6 字序列） ----
+    zh_tokens = set()
+    # 移除英文和标点，提取纯中文连续序列
+    zh_only = re.sub(r'[a-zA-Z0-9\s\(\)\?\.\？\。\，\、\：\；\（\）\“\”\‘\’\！\!\#\#\$\￥\%\%\……\&\*\-\+\=\[\]\{\}\|\/\\\@\~\`\^]', '', query)
+    # 2-6 字的中文滑动窗口
+    for size in [2, 3, 4]:
+        for i in range(len(zh_only) - size + 1):
+            seg = zh_only[i:i+size]
+            if seg.strip():
+                zh_tokens.add(seg)
+
+    all_tokens = en_tokens | zh_tokens
+    if not all_tokens:
+        return 0.5
+
+    # ---- 统计命中 ----
+    hits = 0
+    matched_funcs = set()
+    for t in all_tokens:
+        if t in chunk_lower:
+            hits += 1
+            # 记录命中的函数名（英文大写字母开头或包含下划线）
+            if re.match(r'^[a-zA-Z_]\w+$', t) and ('_' in t or any(c.isupper() for c in t[1:])):
+                matched_funcs.add(t)
+
+    base_score = hits / len(all_tokens)
+
+    # ---- 函数名命中加分：切片包含查询中提到的函数名 ----
+    func_bonus = 0.0
+    for func_name in matched_funcs:
+        # 检查该函数名是否是切片的核心内容（出现在"函数名称"附近）
+        if f'函数名称 {func_name}' in chunk_text or f'{func_name}(' in chunk_text:
+            func_bonus += 0.3
+
+    # 上限 1.0
+    return min(base_score + func_bonus, 1.0)
+
+
+def _extract_structured_content(context_docs: List, query: str) -> str:
+    """
+    从检索切片中智能提取结构化信息。
+
+    不再将切片全量拼接输出，而是：
+      1. 按 query 关键词匹配度对切片排序
+      2. 仅取 Top-K (DIRECT_RETRIEVAL_K) 个最相关切片
+      3. 从高相关性切片中提取「函数名 / 功能描述 / 参数 / 返回值 / 代码示例」
+      4. 去重合并，输出整洁的结构化文本
+
+    Args:
+        context_docs: 已检索到的全部文档片段列表
+        query: 用户查询
+
+    Returns:
+        结构化的纯文本回答
+    """
+    if not context_docs:
+        return DIRECT_RETRIEVAL_EMPTY
+
+    # ---- 第 1 步：按相关性排序并截取 Top-K ----
+    scored_docs = []
+    for doc in context_docs:
+        score = _score_chunk_for_query(doc.page_content, query)
+        scored_docs.append((score, doc))
+    scored_docs.sort(key=lambda x: x[0], reverse=True)
+
+    # 只保留 Top-K 进行结构化提取（过滤噪声）
+    top_docs = [doc for _, doc in scored_docs[:DIRECT_RETRIEVAL_K]]
+
+    # ---- 第 2 步：从排序后的切片中提取结构化字段 ----
+    extracted = {
+        "functions": [],      # [(name, description, params, returns, source)]
+        "code_blocks": [],    # [code_text]
+        "descriptions": [],   # [text]
+    }
+    seen_functions = set()
+    seen_code = set()
+
+    for doc in top_docs:
+        content = doc.page_content
+        source = doc.metadata.get("source", "未知来源")
+
+        # 提取函数定义：匹配 "函数名称 xxx( )" 或 "xxx( )" 模式
+        func_pattern = re.findall(
+            r'函数名称\s+(\w+)\s*\([^)]*\)\s*\n\s*功能描述\s+(.+?)(?:\n|$)',
+            content
+        )
+        for func_name, func_desc in func_pattern:
+            if func_name not in seen_functions:
+                seen_functions.add(func_name)
+                # 尝试提取参数说明
+                params_match = re.search(
+                    rf'{re.escape(func_name)}.*?参数说明\s+(.+?)(?:\n\s*返回值|\n\s*\n)',
+                    content, re.DOTALL
+                )
+                params = params_match.group(1).strip() if params_match else ""
+                # 尝试提取返回值
+                returns_match = re.search(
+                    rf'{re.escape(func_name)}.*?返回值\s+(.+?)(?:\n|$)',
+                    content, re.DOTALL
+                )
+                returns = returns_match.group(1).strip() if returns_match else ""
+
+                extracted["functions"].append({
+                    "name": func_name,
+                    "desc": func_desc.strip(),
+                    "params": params,
+                    "returns": returns,
+                    "source": source,
+                })
+
+        # 提取代码示例：包含 "robot." 或 "ctypes" 或 "argtypes/restype" 的连续行
+        code_lines = []
+        in_code = False
+        for line in content.split('\n'):
+            stripped = line.strip()
+            is_code_line = any(kw in stripped for kw in [
+                'robot.', 'ctypes', 'argtypes', 'restype', 'CDLL',
+                'POSE(', 'Joint(', ' = robot.', 'res =', 'print(',
+                'rob_ip', 'rob_port', 'time.sleep',
+            ])
+            if is_code_line:
+                in_code = True
+                code_lines.append(stripped)
+            elif in_code and not stripped:
+                in_code = False
+            elif in_code and (
+                stripped.startswith('函数') or stripped.startswith('示例代码') or
+                stripped.startswith('功能描述') or stripped.startswith('参数说明')
+            ):
+                in_code = False
+
+        if code_lines:
+            code_key = '\n'.join(code_lines[:12])  # 最多 12 行
+            if code_key not in seen_code:
+                seen_code.add(code_key)
+                extracted["code_blocks"].append(code_key)
+
+        # 提取补充描述（非函数定义、非代码的说明性文字）
+        desc_lines = []
+        for line in content.split('\n'):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if any(kw in stripped for kw in ['函数名称', 'robot.', 'ctypes', 'argtypes', 'restype', '示例代码']):
+                continue
+            if len(stripped) > 10:
+                desc_lines.append(stripped)
+        if desc_lines and len(desc_lines) <= 5:
+            extracted["descriptions"].append('\n'.join(desc_lines[:3]))
+
+    # ---- 第 3 步：组装结构化输出 ----
+    parts = [DIRECT_RETRIEVAL_HEADER]
+    parts.append("【精准检索结果】\n")
+
+    has_content = False
+
+    if extracted["functions"]:
+        for func in extracted["functions"][:3]:  # 最多 3 个函数
+            has_content = True
+            parts.append(f"■ 核心函数：{func['name']}()")
+            parts.append(f"  功能描述：{func['desc']}")
+            if func['params']:
+                parts.append(f"  参数说明：{func['params']}")
+            if func['returns']:
+                parts.append(f"  返回值：{func['returns']}")
+            parts.append(f"  来源：{func['source']}")
+            parts.append("")
+
+    if extracted["code_blocks"]:
+        has_content = True
+        parts.append("■ Python 示例代码：")
+        # 只取最相关的 1 段代码（排序后第一段）
+        best_code = extracted["code_blocks"][0]
+        for line in best_code.split('\n')[:10]:
+            parts.append(f"  {line}")
+        parts.append("")
+
+    if not has_content and extracted["descriptions"]:
+        # 无函数/代码，但有说明文字
+        parts.append("■ 相关说明：")
+        for desc in extracted["descriptions"][:2]:
+            parts.append(f"  {desc}")
+        parts.append("")
+
+    if not has_content and not extracted["descriptions"]:
+        # 完全无法提取结构化信息，回退到简洁摘要
+        parts.append("（检索到相关文档片段，但无法自动提取结构化信息。）\n")
+
+    parts.append(DIRECT_RETRIEVAL_FOOTER)
+    return "\n".join(parts)
 
 
 def _format_direct_retrieval_answer(context_docs: List) -> str:
     """
-    将检索到的文档片段格式化为用户可读的纯文本回答。
+    将检索到的文档片段格式化为用户可读的结构化回答（无 query 时的简化版）。
 
-    当 context_docs 为空（相似度阈值过滤后无相关切片）时，
-    返回优雅的无结果提示而非强行列出无关文本。
+    当 context_docs 为空时，返回优雅的无结果提示。
 
     Args:
         context_docs: 检索到的 LangChain Document 列表（可能为空）
@@ -270,13 +488,16 @@ def _format_direct_retrieval_answer(context_docs: List) -> str:
     if not context_docs:
         return DIRECT_RETRIEVAL_EMPTY
 
-    parts = []
+    # 无 query 时使用简化格式
+    parts = [DIRECT_RETRIEVAL_HEADER, "【精准检索结果】\n"]
     for i, doc in enumerate(context_docs, start=1):
         source = doc.metadata.get("source", "未知来源")
         content = doc.page_content.strip()
-        parts.append(f"{i}. [来源: {source}]\n{content}")
-
-    return DIRECT_RETRIEVAL_HEADER + "\n".join(parts) + DIRECT_RETRIEVAL_FOOTER
+        parts.append(f"■ 文档片段 {i}（来源：{source}）")
+        parts.append(content[:500])  # 截断长文本
+        parts.append("")
+    parts.append(DIRECT_RETRIEVAL_FOOTER)
+    return "\n".join(parts)
 
 
 def _direct_retrieval_response(
@@ -286,22 +507,23 @@ def _direct_retrieval_response(
     """
     第 3 层降级 — 纯向量检索直出模式（非流式）。
 
-    仅依赖 ChromaDB 检索结果 + 模板组装，不调用任何 LLM。
-    整个过程纯 CPU 运行，零显存消耗，零 API 费用，秒级响应。
+    使用智能提取引擎：对切片进行关键词匹配排序，
+    提取核心函数、功能描述、参数和 Python 示例代码，
+    以结构化格式输出，过滤噪声和重复。
 
     Args:
         context_docs: 已检索到的文档片段列表
-        query: 用户原始问题（保留以备未来扩展，如日志记录）
+        query: 用户原始问题（用于关键词匹配排序和智能提取）
 
     Returns:
         {"answer": ..., "sources": [...], "model": "direct-retrieval (CPU-only)"}
     """
     logger.info(
         f"🔷 进入纯检索直出模式（第 3 层降级），"
-        f"返回 Top-{len(context_docs)} 文档原文片段"
+        f"对 Top-{len(context_docs)} 文档片段进行智能提取"
     )
 
-    direct_answer = _format_direct_retrieval_answer(context_docs)
+    direct_answer = _extract_structured_content(context_docs, query)
 
     sources = list(set(
         doc.metadata.get("source", "未知")
@@ -322,22 +544,22 @@ def _direct_retrieval_response_stream(
     """
     第 3 层降级 — 纯向量检索直出模式（流式）。
 
-    将组装好的文本以 ~15 字符/块的速率分段 yield，
+    将智能提取后的结构化文本以 ~15 字符/块的速率分段 yield，
     模拟打字机效果，确保前端 SSE 流式渲染正常工作。
 
     Args:
         context_docs: 已检索到的文档片段列表
-        query: 用户原始问题（保留以备未来扩展）
+        query: 用户原始问题（用于智能提取）
 
     Yields:
         文本增量（每次约 15 个字符）
     """
     logger.info(
         f"🔷 进入纯检索直出模式-流式（第 3 层降级），"
-        f"返回 Top-{len(context_docs)} 文档原文片段"
+        f"对 Top-{len(context_docs)} 文档片段进行智能提取"
     )
 
-    direct_answer = _format_direct_retrieval_answer(context_docs)
+    direct_answer = _extract_structured_content(context_docs, query)
 
     # 分段 yield 模拟流式打字机效果
     # 块大小 ~15 字符：平衡前端渲染频率与网络开销
@@ -527,9 +749,8 @@ def rag_chat(
     # ================================================================
     logger.info("🔄 正在切换到第 3 层（纯向量检索直出模式）...")
     try:
-        # 使用已检索到的 context_docs，取前 DIRECT_RETRIEVAL_K 条
-        top_docs = context_docs[:DIRECT_RETRIEVAL_K]
-        return _direct_retrieval_response(top_docs, query)
+        # 传入全部 context_docs，由 _extract_structured_content 内部评分排序后截取 Top-K
+        return _direct_retrieval_response(context_docs, query)
     except Exception as e:
         logger.error(f"❌ 第 3 层（纯检索直出模式）失败: {type(e).__name__}: {e}")
 
@@ -628,8 +849,8 @@ def rag_chat_stream(
     # ================================================================
     logger.info("🔄 正在切换到第 3 层（纯向量检索直出模式-流式）...")
     try:
-        top_docs = context_docs[:DIRECT_RETRIEVAL_K]
-        yield from _direct_retrieval_response_stream(top_docs, query)
+        # 传入全部 context_docs，由 _extract_structured_content 内部评分排序后截取 Top-K
+        yield from _direct_retrieval_response_stream(context_docs, query)
         logger.info("✅ 第 3 层（纯检索直出模式-流式）成功")
         return  # ← 成功，生成器结束
 
