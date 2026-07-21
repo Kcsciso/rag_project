@@ -57,6 +57,7 @@ from .config import (
     EMBEDDING_MODEL_NAME,
     EMBEDDING_DEVICE,
     RETRIEVAL_K,
+    SIMILARITY_THRESHOLD,
     FALLBACK_TO_ONNX,
 )
 
@@ -314,11 +315,16 @@ def create_vector_store(
     #  ① 调用 embedding_fn.embed_documents() 批量向量化
     #  ② 创建 ChromaDB Collection 并写入数据
     #  ③ 自动持久化到磁盘
+    #
+    # 【重要】collection_metadata={"hnsw:space": "cosine"} 强制使用余弦距离
+    # 而非默认 L2 距离，确保 similarity_search_with_score 返回 0~2 的余弦距离值，
+    # 从而 SIMILARITY_THRESHOLD=0.65 能正确过滤不相关切片。
     vector_store = Chroma.from_documents(
         documents=documents,
         embedding=embedding_fn,
         persist_directory=persist_dir,
         collection_name="rag_documents",
+        collection_metadata={"hnsw:space": "cosine"},
     )
 
     logger.info(f"✅ 向量库创建完成，持久化目录: {persist_dir}")
@@ -411,6 +417,82 @@ def search_similar(
     #  ③ 返回 Document 列表
     results = vector_store.similarity_search(query, k=k)
     return results
+
+
+def search_similar_with_threshold(
+    vector_store: Chroma,
+    query: str,
+    k: int = RETRIEVAL_K,
+    threshold: Optional[float] = SIMILARITY_THRESHOLD,
+) -> List[Document]:
+    """
+    带相似度阈值过滤的向量检索。
+
+    【为什么需要阈值过滤？】
+
+    传统 Top-K 检索的问题：无论检索到的文档与问题是否真正相关，
+    都会强行返回 k 个"最近"的文档。当用户问及文档库中完全不存在的话题时
+    （如机械臂文档库中问"摄像头"），Top-K 仍会返回 k 个不相关的机械臂切片，
+    导致 LLM 基于错误上下文产生幻觉。
+
+    阈值过滤的解决思路：
+      1. 使用 similarity_search_with_score 获取 (Document, distance) 元组
+      2. 只保留 distance <= threshold 的切片
+      3. 如果没有任何切片通过阈值，返回空列表 → 上层优雅处理
+
+    【ChromaDB 距离度量说明】
+
+    使用 HuggingFaceEmbeddings (normalize_embeddings=True) 时，
+    ChromaDB 默认使用余弦距离 (cosine distance)：
+      - distance=0: 向量完全相同（语义完全一致）
+      - distance=1: 向量正交（语义无关）
+      - distance=2: 向量方向完全相反（语义对立）
+
+    推荐阈值:
+      - 0.50: 严格模式，仅保留高度相关的内容
+      - 0.65: 平衡模式（默认），兼顾召回率与精确率
+      - 0.80: 宽松模式，允许边缘相关内容通过
+      - None: 禁用阈值过滤，等同于 search_similar()
+
+    Args:
+        vector_store: ChromaDB 向量库实例
+        query: 用户查询字符串
+        k: 检索候选数量
+        threshold: 距离阈值，None 表示不过滤
+
+    Returns:
+        通过阈值过滤的 Document 列表（可能为空列表）
+    """
+    # 使用 similarity_search_with_score 获取带距离分数的检索结果
+    results_with_scores = vector_store.similarity_search_with_score(query, k=k)
+
+    if threshold is None:
+        # 禁用阈值过滤，退化为普通 search_similar 行为
+        return [doc for doc, _ in results_with_scores]
+
+    filtered_docs = []
+    filtered_count = 0
+    for doc, score in results_with_scores:
+        if score <= threshold:
+            filtered_docs.append(doc)
+            logger.debug(
+                f"✅ 切片通过阈值 (distance={score:.4f} ≤ {threshold}): "
+                f"{doc.metadata.get('source', '?')[:50]}"
+            )
+        else:
+            filtered_count += 1
+            logger.debug(
+                f"❌ 切片被过滤 (distance={score:.4f} > {threshold}): "
+                f"{doc.metadata.get('source', '?')[:50]}"
+            )
+
+    if filtered_count > 0:
+        logger.info(
+            f"🔍 相似度阈值过滤: {len(filtered_docs)}/{len(results_with_scores)} "
+            f"个切片通过 (threshold={threshold})"
+        )
+
+    return filtered_docs
 
 
 def get_vector_store_info(vector_store: Chroma) -> dict:

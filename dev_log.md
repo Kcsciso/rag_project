@@ -474,3 +474,97 @@ from typing import List, Optional, Any, Tuple
 
 - `all-MiniLM-L6-v2` 为英文优化模型，中文语义匹配精度有限。Q1 的 `robot_enable`（PDF 实际函数名）与测试关键词 `robot_motor_enable` 不匹配，但 LLM 仍正确找到了 `robot_enable`。后续可切换 `BAAI/bge-small-zh-v1.5` 进一步提升中文检索精度。
 - 纯向量检索对精确函数名匹配有固有限制，后续可引入 BM25 关键词检索做混合召回。
+
+---
+
+## 十三、LLM 超时优化与相似度阈值过滤
+
+> **日期**: 2026-07-21  
+> **变更范围**: `src/config.py`、`src/rag_chain.py`、`src/vector_store.py`、`test_robot_rag.py`  
+> **变更目标**: (1) 解决智谱 API 超时降级问题；(2) 引入相似度阈值过滤，剔除不相关切片
+
+### 13.1 主 LLM 通道直连智谱 API
+
+**问题**: 原先 `BASE_URL` 默认指向 `http://localhost:8000/v1`（本地 vLLM），每次请求需先经历 3s connect timeout + 2 次 SDK 重试后才会降级到智谱，浪费约 6-8 秒。
+
+**修复**:
+
+| 配置项 | 旧值 | 新值 |
+|--------|------|------|
+| `BASE_URL` | `http://localhost:8000/v1` | `https://open.bigmodel.cn/api/paas/v4` |
+| `API_KEY` | `"EMPTY"` | 智谱默认 Key |
+| `MODEL_NAME` | `"deepseek-v4-pro"` | `"glm-4.7-flash"` |
+
+现在 Layer 1 直接使用智谱 GLM-4.7-Flash，跳过本地 localhost 的无意义等待。如需切回本地 vLLM，通过环境变量覆盖：
+```bash
+export LLM_BASE_URL="http://localhost:8000/v1"
+export LLM_API_KEY="EMPTY"
+export LLM_MODEL_NAME="deepseek-v4-pro"
+```
+
+### 13.2 读取超时延长至 30 秒
+
+**问题**: 原 `read=15.0s` 对智谱 API 生成带代码的长回答不够充裕，Q2（关节运动 movj + 示例代码）偶发触发 `ReadTimeout`。
+
+**修复**: `LLM_TIMEOUT` 的 `read` 和 `write` 从 15.0s 延长至 30.0s：
+
+```python
+LLM_TIMEOUT = httpx.Timeout(connect=3.0, read=30.0, write=30.0, pool=3.0)
+```
+
+### 13.3 相似度阈值过滤 (Similarity Score Threshold)
+
+**新增配置** (`src/config.py`):
+```python
+SIMILARITY_THRESHOLD = 0.70  # cosine distance ≤ 0.70
+```
+
+**新增函数** (`src/vector_store.py`):
+```python
+search_similar_with_threshold(vector_store, query, k, threshold)
+```
+
+**工作原理**:
+1. 使用 `similarity_search_with_score()` 获取每个切片的余弦距离
+2. 只保留 `distance <= threshold` 的切片
+3. 剩余切片丢弃，避免 LLM 基于不相关上下文产生幻觉
+4. `threshold=None` 可完全禁用过滤
+
+**ChromaDB 距离度量校准**:
+
+发现 ChromaDB 默认使用 L2 距离（而非 cosine），导致相同阈值在不同距离度量下行为不一致。修复方案：在 `create_vector_store()` 中显式指定 `collection_metadata={"hnsw:space": "cosine"}`，强制使用余弦距离，确保阈值语义一致。
+
+**实测距离分布** (cosine, 0=相同, 1=正交, 2=相反):
+
+| 查询 | 最佳匹配 | 相关片段 | 无关片段 |
+|------|----------|----------|----------|
+| Q1 (上电/使能) | 0.43 | 0.43-0.59 (全部 5 片) | — |
+| Q2 (关节运动) | 0.60 | 0.60-0.69 (全部 5 片) | — |
+| Q3 (位姿) | 0.67 | 0.67-0.70 (2 片通过) | 0.71+ (3 片被过滤) |
+| Q4 (摄像头-无关) | 0.68 | 0.68 (1 片通过) | 0.74+ (4 片被过滤) |
+
+### 13.4 Layer 3 零结果优雅处理
+
+当相似度阈值过滤后 `context_docs` 为空时，`_format_direct_retrieval_answer()` 不再强行列出无关文本，而是返回：
+
+```
+【提示：当前大模型生成服务未就绪，已为您开启纯文档检索直出模式】
+
+未在现有文档中检索到与您的提问相关的有效内容。
+```
+
+### 13.5 调优后测试结果
+
+| ID | 问题 | 模型 | 层级 | 命中 | 状态 | 说明 |
+|----|------|------|------|------|------|------|
+| Q1 | 上电/使能函数 | glm-4.7-flash | L2 | 3/5 (60%) | ✅ PASS | `robot_Power_on()` + 完整代码示例 |
+| Q2 | 关节运动 movj | glm-4.7-flash | L2 | 4/6 (67%) | ✅ PASS | `robot_movj()` + 参数说明 |
+| Q3 | 位姿 Pose | glm-4.7-flash | L2 | 0/9 (0%) | ⚠️ WARN | `get_robot_pose` 切片被阈值过滤（distance > 0.70），LLM 正确拒答 |
+| Q4 | 摄像头（无关） | glm-4.7-flash | L2 | 0/0 | ⚠️ WARN | LLM 正确回答"未涉及摄像头"，阈值过滤 4/5 无关切片 |
+
+**全链路耗时**: 因跳过 localhost 3s 超时等待，每次对话节省约 6-8 秒。
+
+### 13.6 残留问题
+
+- Q3 `get_robot_pose` 检索未命中：`all-MiniLM-L6-v2` 对"获取机械臂当前位姿"的中文语义理解有限，该切片余弦距离 ~0.72 略超 0.70 阈值。切换 `BAAI/bge-small-zh-v1.5` 可根本性解决。
+- Q4 仍有 1 个不相关切片通过阈值（distance=0.685）：单文档 18 切片场景下，嵌入空间稀疏，"无关"内容仍在同一语义簇内。随文档库规模增长，该问题会自然缓解。

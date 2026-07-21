@@ -41,7 +41,6 @@ from src.pdf_loader import load_pdfs_from_directory
 from src.vector_store import (
     create_vector_store,
     load_vector_store,
-    search_similar,
     get_vector_store_info,
 )
 from src.rag_chain import (
@@ -51,6 +50,8 @@ from src.rag_chain import (
     DIRECT_RETRIEVAL_K,
     FRIENDLY_ERROR_MSG,
 )
+from src.vector_store import search_similar_with_threshold
+from src.config import SIMILARITY_THRESHOLD
 
 # ============================================================
 # 日志配置
@@ -84,6 +85,13 @@ TEST_QUESTIONS = [
         "keywords": ["pose", "位姿", "robot_get_pose", "px", "py", "pz", "Rx", "Ry", "Rz"],
         "description": "验证：位姿获取函数 + Pose 结构体字段",
     },
+    {
+        "id": "Q4",
+        "question": "摄像头支持哪些分辨率和帧率？",
+        "keywords": [],  # 期望：所有文档切片被阈值过滤，无相关结果
+        "description": "验证：无关问题经相似度阈值过滤后 Layer 3 返回空结果提示",
+        "expect_empty": True,  # 标记：期望检索结果为空
+    },
 ]
 
 # ============================================================
@@ -113,7 +121,7 @@ def main():
     print(f"  测试时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  主 LLM 通道: {MODEL_NAME} (local vLLM)")
     print(f"  降级通道: {DEEPSEEK_MODEL} (智谱 GLM-4.7-Flash)")
-    print(f"  检索参数: Top-K={RETRIEVAL_K}, chunk_size={CHUNK_SIZE}")
+    print(f"  检索参数: Top-K={RETRIEVAL_K}, chunk_size={CHUNK_SIZE}, threshold={SIMILARITY_THRESHOLD}")
     print(f"  测试问题数: {len(TEST_QUESTIONS)}")
 
     # ================================================================
@@ -159,9 +167,11 @@ def main():
         print(f"  [{qid}] {question}")
         print(f"      预期关键词: {keywords}")
 
-        # 检索 Top-K 文档
-        context_docs = search_similar(vs, question, k=RETRIEVAL_K)
-        print(f"      检索到 {len(context_docs)} 个相关片段:")
+        # 检索 Top-K 文档（带相似度阈值过滤）
+        context_docs = search_similar_with_threshold(
+            vs, question, k=RETRIEVAL_K, threshold=SIMILARITY_THRESHOLD
+        )
+        print(f"      检索到 {len(context_docs)} 个相关片段（阈值过滤后）:")
 
         for i, doc in enumerate(context_docs, 1):
             source = doc.metadata.get("source", "?")
@@ -193,8 +203,10 @@ def main():
 
         # ---- 3a. 打印向量检索原文 ----
         print(f"  │")
-        print(f"  │  📖 ChromaDB 检索到的原始文档切片 (Context Chunks):")
-        context_docs = search_similar(vs, question, k=RETRIEVAL_K)
+        print(f"  │  📖 ChromaDB 检索到的原始文档切片 (Context Chunks, threshold={SIMILARITY_THRESHOLD}):")
+        context_docs = search_similar_with_threshold(
+            vs, question, k=RETRIEVAL_K, threshold=SIMILARITY_THRESHOLD
+        )
         for i, doc in enumerate(context_docs, 1):
             source = doc.metadata.get("source", "?")
             content = doc.page_content.strip()
@@ -236,8 +248,23 @@ def main():
 
             # ---- 3c. 回答质量检查 ----
             hits = count_keyword_hits(answer, keywords)
-            hit_rate = hits / len(keywords) * 100
+            if len(keywords) > 0:
+                hit_rate = hits / len(keywords) * 100
+            else:
+                hit_rate = 100.0  # 无关键词时（如 Q4 期望空结果），默认满分
             print(f"  │  📊 关键词命中: {hits}/{len(keywords)} ({hit_rate:.0f}%)")
+
+            # 判断状态：expect_empty 标记的问题使用特殊逻辑
+            is_empty_result = (
+                "未在现有文档中检索到" in answer
+                or len(context_docs) == 0
+            )
+            if tq.get("expect_empty"):
+                test_status = "PASS" if is_empty_result else "WARN"
+            elif hit_rate >= 30:
+                test_status = "PASS"
+            else:
+                test_status = "WARN"
 
             # 打印完整回答（截断显示）
             print(f"  │  ┌─ 完整回答 ({len(answer)} chars) ─")
@@ -272,7 +299,7 @@ def main():
                 "answer_length": len(answer),
                 "stream_length": len(streamed) if streamed else 0,
                 "sources": sources,
-                "status": "PASS" if hit_rate >= 30 else "WARN",
+                "status": test_status,
             })
 
         except Exception as e:

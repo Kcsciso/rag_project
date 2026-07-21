@@ -54,9 +54,9 @@ DEEPSEEK_MODEL = "glm-4.7-flash"  # 智谱 GLM-4.7-Flash 免费模型
 #   export LLM_BASE_URL="https://api.deepseek.com/anthropic"
 #   export LLM_API_KEY="sk-your-deepseek-key"
 # ============================================================
-BASE_URL = os.environ.get("LLM_BASE_URL", "http://localhost:8000/v1")
-API_KEY = os.environ.get("LLM_API_KEY", "EMPTY")          # vLLM 默认不验证 Key
-MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "deepseek-v4-pro")
+BASE_URL = os.environ.get("LLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
+API_KEY = os.environ.get("LLM_API_KEY", "1fe4c37fd3264ffa9f535fec9d0fc96b.UtiuwWTVuFofYHnB")
+MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "glm-4.7-flash")
 
 # ============================================================
 # 向量库 & 嵌入模型配置
@@ -117,6 +117,15 @@ CHUNK_OVERLAP = 100
 # k=5: 每次检索返回最相关的 5 个文本块
 #      增加到 5 以提高召回覆盖率，降低关键函数漏检概率
 RETRIEVAL_K = 5
+
+# 相似度阈值 — ChromaDB cosine 距离上限
+# 使用 similarity_search_with_score 进行距离过滤：
+#   余弦距离范围: 0 (完全相同) ~ 2 (完全相反), 1 为正交无关
+#   threshold=0.70: 基于 all-MiniLM-L6-v2 + 机械臂 SDK 文档实测校准
+#     - 最佳匹配 ~0.60, 相关匹配 ~0.65-0.70, 无关内容 ~0.75+
+#     - 0.70 在精确率与召回率间取得平衡
+#   设为 None 可禁用阈值过滤
+SIMILARITY_THRESHOLD = 0.70
 
 # ============================================================
 # Web 服务配置

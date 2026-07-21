@@ -65,10 +65,10 @@ import httpx
 from openai import OpenAI, APITimeoutError, APIConnectionError
 
 from .config import (
-    BASE_URL, API_KEY, MODEL_NAME, RETRIEVAL_K,
+    BASE_URL, API_KEY, MODEL_NAME, RETRIEVAL_K, SIMILARITY_THRESHOLD,
     DEEPSEEK_BASE_URL, DEEPSEEK_API_KEY, DEEPSEEK_MODEL,
 )
-from .vector_store import search_similar
+from .vector_store import search_similar_with_threshold
 
 logger = logging.getLogger(__name__)
 
@@ -80,10 +80,10 @@ logger = logging.getLogger(__name__)
 # 系统陷入无限等待。默认 openai 库的 read timeout 为 600s，对用户不可接受。
 #
 # - connect=3.0s : TCP 连接建立超时（vLLM 未启动 → 3 秒内快速失败）
-# - read=15.0s   : 读取超时（vLLM 假死/GPU 卡死 → 15 秒内切断并降级）
-# - write=15.0s  : 写入超时
+# - read=30.0s   : 读取超时（智谱 API 生成代码响应较慢，30s 提供宽裕时间）
+# - write=30.0s  : 写入超时
 # - pool=3.0s    : 连接池获取超时
-LLM_TIMEOUT = httpx.Timeout(connect=3.0, read=15.0, write=15.0, pool=3.0)
+LLM_TIMEOUT = httpx.Timeout(connect=3.0, read=30.0, write=30.0, pool=3.0)
 
 # ============================================================
 # 用户友好错误提示
@@ -243,6 +243,11 @@ DIRECT_RETRIEVAL_HEADER = (
     "根据比邻星技术文档，找到以下相关内容：\n\n"
 )
 
+DIRECT_RETRIEVAL_EMPTY = (
+    "【提示：当前大模型生成服务未就绪，已为您开启纯文档检索直出模式】\n\n"
+    "未在现有文档中检索到与您的提问相关的有效内容。"
+)
+
 DIRECT_RETRIEVAL_FOOTER = (
     "\n---\n"
     "💡 以上为文档原文检索结果。如需更深入的分析与总结，请等待大模型服务恢复后重试。"
@@ -253,12 +258,18 @@ def _format_direct_retrieval_answer(context_docs: List) -> str:
     """
     将检索到的文档片段格式化为用户可读的纯文本回答。
 
+    当 context_docs 为空（相似度阈值过滤后无相关切片）时，
+    返回优雅的无结果提示而非强行列出无关文本。
+
     Args:
-        context_docs: 检索到的 LangChain Document 列表
+        context_docs: 检索到的 LangChain Document 列表（可能为空）
 
     Returns:
         格式化的纯文本回答字符串
     """
+    if not context_docs:
+        return DIRECT_RETRIEVAL_EMPTY
+
     parts = []
     for i, doc in enumerate(context_docs, start=1):
         source = doc.metadata.get("source", "未知来源")
@@ -458,8 +469,15 @@ def rag_chat(
     Raises:
         LLMServiceError: 四层全部失败时抛出（第 4 层兜底）
     """
-    # ---- ① 检索 (Retrieve) ----
-    context_docs = search_similar(vector_store, query, k=k)
+    # ---- ① 检索 (Retrieve) — 带相似度阈值过滤 ----
+    context_docs = search_similar_with_threshold(
+        vector_store, query, k=k, threshold=SIMILARITY_THRESHOLD
+    )
+    if not context_docs:
+        logger.info(
+            f"🔍 相似度阈值过滤后无相关切片 (threshold={SIMILARITY_THRESHOLD})，"
+            f"将以空上下文调用 LLM"
+        )
 
     # ---- ② 增强 (Augment) ----
     messages = _build_messages(query, context_docs, chat_history)
@@ -562,8 +580,15 @@ def rag_chat_stream(
     Raises:
         LLMServiceError: 四层全部失败时抛出（第 4 层兜底）
     """
-    # ---- ① 检索 ----
-    context_docs = search_similar(vector_store, query, k=k)
+    # ---- ① 检索 — 带相似度阈值过滤 ----
+    context_docs = search_similar_with_threshold(
+        vector_store, query, k=k, threshold=SIMILARITY_THRESHOLD
+    )
+    if not context_docs:
+        logger.info(
+            f"🔍 相似度阈值过滤后无相关切片 (threshold={SIMILARITY_THRESHOLD})，"
+            f"将以空上下文调用 LLM"
+        )
 
     # ---- ② 增强 ----
     messages = _build_messages(query, context_docs, chat_history)
