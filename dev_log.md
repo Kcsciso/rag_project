@@ -568,3 +568,70 @@ search_similar_with_threshold(vector_store, query, k, threshold)
 
 - Q3 `get_robot_pose` 检索未命中：`all-MiniLM-L6-v2` 对"获取机械臂当前位姿"的中文语义理解有限，该切片余弦距离 ~0.72 略超 0.70 阈值。切换 `BAAI/bge-small-zh-v1.5` 可根本性解决。
 - Q4 仍有 1 个不相关切片通过阈值（distance=0.685）：单文档 18 切片场景下，嵌入空间稀疏，"无关"内容仍在同一语义簇内。随文档库规模增长，该问题会自然缓解。
+
+---
+
+## 十四、本地 vLLM 部署尝试与阈值 0.75 校准
+
+> **日期**: 2026-07-21  
+> **变更范围**: `src/config.py`  
+> **目标**: (1) 部署 Qwen2.5-7B-Instruct 作为 Layer 1；(2) 校准阈值修复 Q3 召回
+
+### 14.1 本地 vLLM 部署尝试
+
+**环境状况**:
+- GPU 0 (A100-40GB): 8+ 进程共享，~38GB/40GB 已占用，仅 ~16MB 空闲
+- GPU 1 (A100-40GB): ~31GB/40GB 已占用
+- 端口 8000 被非 vLLM 的 FastAPI 进程占用
+
+**部署参数**:
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 -m vllm.entrypoints.openai.api_server \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --port 8001 \
+    --gpu-memory-utilization 0.45 \
+    --max-model-len 4096 \
+    --trust-remote-code \
+    --enforce-eager
+```
+
+**结果**: ❌ CUDA OOM — 16MB 空闲不足以分配 28MB tensor。GPU 0 已被其他用户占满，无法容纳额外的 7B 模型实例。
+
+**结论**: 
+- 多人共享服务器场景下，本地 vLLM 部署受 GPU 资源可用性限制
+- 4 层容灾架构的价值在此场景下凸显：Layer 1 不可用时自动滑落至 Layer 2（云端 API）→ Layer 3（纯检索）→ Layer 4（友好错误）
+- 当 GPU 资源恢复可用时，通过环境变量即可切换回本地 vLLM：
+
+```bash
+export LLM_BASE_URL="http://localhost:8000/v1"
+export LLM_API_KEY="EMPTY"
+export LLM_MODEL_NAME="Qwen/Qwen2.5-7B-Instruct"
+```
+
+### 14.2 阈值 0.70 → 0.75 校准
+
+**问题**: Q3 `get_robot_pose` 切片余弦距离 0.72，0.70 阈值误杀该相关切片。
+
+**修复**: `SIMILARITY_THRESHOLD` 从 0.70 调整至 0.75。
+
+**校准依据** (cosine distance, hnsw:space=cosine):
+
+| 查询 | 最佳匹配 | 相关切片范围 | 无关切片范围 | 推荐阈值 |
+|------|----------|-------------|-------------|----------|
+| Q1 (上电) | 0.43 | 0.43-0.59 | — | ≥0.60 |
+| Q2 (movj) | 0.60 | 0.60-0.69 | — | ≥0.70 |
+| Q3 (pose) ⚠️ | 0.67 | 0.67-**0.72** | — | ≥0.73 |
+| Q4 (摄像头) | 0.68 | — | 0.68-0.76 | ≤0.67 (理想) |
+
+**权衡**: 0.75 能召回 Q3 的 `get_robot_pose`，但也会让 Q4 的 2 个不相关切片通过。在单文档 18 切片的小规模知识库中，这是可接受的折中——宁可多召回让 LLM/用户自行判断，也不应漏掉关键信息。
+
+### 14.3 调优后测试结果（阈值 0.75）
+
+| ID | 问题 | 关键词命中 | 状态 | 说明 |
+|----|------|-----------|------|------|
+| Q1 | 上电/使能 | 3/5 (60%) | ✅ PASS | `robot_Power_on()` + 示例代码 |
+| Q2 | 关节运动 | 4/6 (67%) | ✅ PASS | `robot_movj()` + 完整参数 |
+| Q3 | 位姿 Pose | **8/9 (89%)** | ✅ PASS | **`get_robot_pose` 成功召回！** 阈值修复生效 |
+| Q4 | 摄像头 | 0/0 | ⚠️ WARN | 2 个不相关切片通过阈值，但系统仍返回机械臂文档原文 |
+
+> **注意**: 测试期间智谱 API 触发频率限制 (429 Too Many Requests)，Q2-Q4 由 Layer 3（纯检索直出）完成。Q1 成功通过 Layer 2（智谱）返回 LLM 生成的完整回答。系统 4 层容灾架构正确运作。

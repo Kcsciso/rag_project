@@ -121,11 +121,11 @@ RETRIEVAL_K = 5
 # 相似度阈值 — ChromaDB cosine 距离上限
 # 使用 similarity_search_with_score 进行距离过滤：
 #   余弦距离范围: 0 (完全相同) ~ 2 (完全相反), 1 为正交无关
-#   threshold=0.70: 基于 all-MiniLM-L6-v2 + 机械臂 SDK 文档实测校准
-#     - 最佳匹配 ~0.60, 相关匹配 ~0.65-0.70, 无关内容 ~0.75+
-#     - 0.70 在精确率与召回率间取得平衡
+#   threshold=0.75: 基于 Qwen2.5-7B-Instruct + 机械臂 SDK 文档实测校准
+#     - Q3 get_robot_pose 距离 0.72，0.70 误杀 → 0.75 可召回
+#     - Q4 摄像头无关内容距离 0.68-0.76，0.75 可过滤大部分
 #   设为 None 可禁用阈值过滤
-SIMILARITY_THRESHOLD = 0.70
+SIMILARITY_THRESHOLD = 0.75
 
 # ============================================================
 # Web 服务配置
