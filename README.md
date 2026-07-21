@@ -7,25 +7,24 @@
 ## 🚀 核心特性
 
 ### 🤖 智能推理引擎
-- **四层金字塔容灾**：本地 vLLM（Layer 1）→ 智谱 GLM-4.7-Flash 云端 API（Layer 2）→ 智能结构化纯检索直出（Layer 3）→ 优雅错误提示（Layer 4），极端故障下仍可服务。
-- **显卡智能自适应部署**：`start_services.sh` 通过 `nvidia-smi` 实时扫描所有 GPU 空闲显存，自动绑定剩余空间最大的 GPU（`CUDA_VISIBLE_DEVICES`），避免硬编码导致的 OOM 崩溃。
-- **毫秒级流式秒回**：FastAPI SSE 异步非阻塞线程池隔离 + 前端 50ms 节流渲染（Throttle），LLM 读取超时激进缩短至 12s（最坏等待降 60%）。
+- **四层金字塔容灾**：本地 vLLM → 智谱 GLM-4.7-Flash 云端 API → 智能结构化纯检索直出（行级归一化去重）→ 优雅错误提示，极端故障下仍可服务。
+- **显卡智能自适应部署**：`start_services.sh` 通过 `nvidia-smi` 实时扫描所有 GPU 空闲显存，自动绑定剩余空间最大的 GPU，避免硬编码导致的 OOM 崩溃。`detect_best_gpu()` 函数的 stdout/stderr 已严格隔离，杜绝日志污染变量。
+- **毫秒级流式秒回**：FastAPI SSE 异步非阻塞线程池隔离 + 前端 50ms 节流渲染，LLM 读取超时激进缩短至 12s。
 
-### 📄 比邻星文档深度解析
-- 多份 PDF 技术文档的批量加载，递归字符级文本分块（`chunk_size=600 / chunk_overlap=100`），API 规范切片不失真。
-- Layer 3 降级时自动进行**行级归一化去重**（`_normalize_code_line` + 全局 `_global_seen_lines`），彻底消除 chunk_overlap 导致的代码块重复输出。
+### 🔍 智能检索优化
+- **Query 预处理**（`_preprocess_query`）：多层迭代剥离口语化噪音（"那个啥"、"你给我整一个"、"呗"等 25+ 模式），提取核心检索实体。
+- **混合检索**（`_hybrid_retrieve`）：向量召回 4 倍候选池 → 相似度阈值 0.78 过滤 → 43 个中文领域操作词 + 20 个 SDK 函数名三层加权重排序 → 返回精准 Top-K。
+- **行级归一化去重**：Layer 3 降级时自动归一化代码行指纹，全局集合 `_global_seen_lines` 彻底消除 chunk_overlap 导致的代码块重复。
 
 ### 🔒 企业级安全与稳定性
 - **全栈输入防御**：防路径遍历（`sanitize_filename`）、Null 字节与控制字符清洗（`sanitize_query`）、Prompt 注入过滤（`_contains_injection_pattern`）、历史消息角色白名单（`validate_chat_history`）。
 - **滑动窗口记忆**：多轮对话最多保留 3 轮历史，防止上下文超出 4096 Token 限制。
-- **全链路异常自动降级**：OOM、超时、限流等异常自动跌落至纯检索直出，覆盖 8 种故障场景。
-- **SSE 断连优雅清理**：客户端断开时线程池生成器自动退出，`asyncio.Queue` 限界防内存耗尽（`maxsize=256`）。
+- **全链路异常自动降级**：覆盖 9 种故障场景（含 SSE 客户端断开），OOM/超时/限流自动跌落至纯检索直出。
 - **资源泄露防范**：`shutdown_clients()` 释放 LLM 连接池 + `cleanup_vector_store()` 释放嵌入模型显存，FastAPI `shutdown` 事件自动触发。
 
 ### 🎨 现代化 Web 体验
 - **NewsPage** 科技蓝深色主题，双栏布局（对话 + 上传/状态面板）。
 - SSE 流式打字机效果 + Markdown 实时渲染 + `highlight.js` 代码高亮。
-- PDF 拖拽上传、一键重建知识库、实时状态指示器。
 
 ---
 
@@ -37,7 +36,7 @@ rag_project/
 │   ├── config.py              # 全局配置中心 + GPU 智能探测 API
 │   ├── pdf_loader.py          # PDF 解析与递归字符级文本分块
 │   ├── vector_store.py        # ChromaDB 向量库（HF→ONNX 双轨嵌入）
-│   └── rag_chain.py           # RAG 四层容灾管线 + 安全防御 + 资源清理
+│   └── rag_chain.py           # RAG 四层容灾 + 混合检索 + 口语化预处理 + 安全防御
 ├── templates/
 │   └── index.html             # NewsPage 聊天与文档交互主页面
 ├── static/
@@ -48,10 +47,11 @@ rag_project/
 ├── app.py                     # FastAPI 异步应用入口（含安全中间件）
 ├── tunnel.py                  # ngrok 公网穿透脚本
 ├── check_status.py            # 统一服务健康检查（GPU 实时监测）
-├── start_services.sh          # 一键自适应启动脚本
+├── start_services.sh          # 一键自适应启动脚本（GPU 智能选择）
 ├── test_robot_rag.py          # 核心 RAG 功能自动化回归测试
 ├── test_stability.py          # 多轮对话 + 并发 + 异常降级压力测试
-├── dev_log.md                 # 完整开发与迭代演进日志
+├── test_human_simulation.py   # 全场景人类模拟测试（14 用例 × 5 类别）
+├── dev_log.md                 # 完整开发与迭代演进日志（20 章）
 ├── CLAUDE.md                  # AI 协同开发规范与系统红线
 └── README.md                  # 本文件
 ```
@@ -62,12 +62,13 @@ rag_project/
 
 | 项目 | 说明 |
 |------|------|
-| **硬件底座** | 2 × NVIDIA A100-PCIE-40GB（CUDA 12.4），支持多卡隔离 |
+| **硬件底座** | 2 × NVIDIA A100-PCIE-40GB（CUDA 12.4） |
 | **环境管理器** | Conda（`rag_agent`，Python 3.10） |
 | **推理引擎** | vLLM 0.16.0（OpenAI 兼容 API，端口 **8001**） |
-| **默认模型** | `Qwen/Qwen2.5-1.5B-Instruct`（约 3.7 GB 显存，GPU 自适应部署） |
+| **默认模型** | `Qwen/Qwen2.5-1.5B-Instruct`（~3.7 GB，GPU 自适应部署） |
 | **云端降级** | 智谱 GLM-4.7-Flash（免费模型，`open.bigmodel.cn`） |
 | **嵌入模型** | `all-MiniLM-L6-v2`（384 维）→ ONNX 自动回退 |
+| **相似度阈值** | 0.78（cosine distance，含 5% 混合检索放宽） |
 | **Web 框架** | FastAPI + Jinja2（端口 **8000**） |
 
 **🔴 核心锁定依赖（严禁升级）**：
@@ -101,8 +102,6 @@ chmod +x start_services.sh
 ./start_services.sh --gpu 0
 ```
 
-脚本自动完成：Conda 环境激活 → GPU 空闲显存扫描 → 端口占用检测 → vLLM 后台拉起 → 就绪轮询 → FastAPI 启动 → `Ctrl+C` 优雅退出。
-
 ### 3. 手动启动（终端 A + B）
 
 **终端 A — vLLM 推理服务**：
@@ -120,8 +119,6 @@ CUDA_VISIBLE_DEVICES=1 python -m vllm.entrypoints.openai.api_server \
     --enforce-eager
 ```
 
-> 💡 使用 `start_services.sh` 可自动选择空闲最大的 GPU，无需手工指定 `CUDA_VISIBLE_DEVICES`。
-
 **终端 B — NewsPage FastAPI 后端**：
 ```bash
 conda activate rag_agent
@@ -129,51 +126,42 @@ export HF_ENDPOINT=https://hf-mirror.com
 python app.py
 ```
 
-服务启动后访问：**`http://localhost:8000`**（页面标题：**NewsPage**）  
-API 文档：`http://localhost:8000/docs`
+访问：**`http://localhost:8000`**（页面标题：**NewsPage**）｜API 文档：`http://localhost:8000/docs`
 
-### 4. 系统健康检查
+### 4. 一键停止所有服务
+
+```bash
+# 快速停止所有 NewsPage 相关进程
+pkill -f "app.py" 2>/dev/null
+pkill -f "vllm.entrypoints" 2>/dev/null
+# 或定义快捷别名:
+alias stoprag='pkill -f "app.py"; pkill -f "vllm.entrypoints"; echo \"NewsPage 已停止\"'
+```
+
+### 5. 系统健康检查
 
 ```bash
 python check_status.py                # 一次性完整报告
 python check_status.py --watch 10     # 每 10 秒自动刷新
 ```
 
-报告覆盖：vLLM 在线状态 + 模型名 + 部署 GPU、NewsPage 后端状态 + 向量库文档数、GPU 0/1 实时显存/温度/功率、四层容灾可用性。
-
-### 5. 环境变量覆盖
+### 6. 环境变量覆盖
 
 ```bash
-# 切回本地 vLLM（默认）
-export LLM_BASE_URL="http://localhost:8001/v1"
+export LLM_BASE_URL="http://localhost:8001/v1"           # 本地 vLLM
 export LLM_MODEL_NAME="Qwen/Qwen2.5-1.5B-Instruct"
-
-# 主通道直连智谱云端 API
-export LLM_BASE_URL="https://open.bigmodel.cn/api/paas/v4"
-export LLM_API_KEY="<your-zhipu-key>"
-export LLM_MODEL_NAME="glm-4.7-flash"
-
-# 手动指定 vLLM GPU
-export VLLM_GPU_ID=0
-```
-
-### 6. 公网隧道（可选）
-
-```bash
-conda run -n rag_agent python tunnel.py --token <YOUR_NGROK_AUTHTOKEN>
+export VLLM_GPU_ID=0                                      # 手动指定 GPU
 ```
 
 ---
 
-## 🛠️ 运维工具清单
+## 🧪 自动化测试
 
-| 文件 | 用途 |
-|------|------|
-| `check_status.py` | 统一服务健康检查 — vLLM、FastAPI、GPU 实时显存、四层容灾可用性 |
-| `start_services.sh` | 一键自适应启动 — GPU 智能选择、端口检测、vLLM 后台拉起、优雅退出 |
-| `test_robot_rag.py` | 核心 RAG 功能回归测试（4 题 × 流式/非流式双模式） |
-| `test_stability.py` | 稳定性压力测试（多轮对话、并发保护、7 种异常降级场景） |
-| `tunnel.py` | ngrok 公网穿透，支持 authtoken 认证 |
+| 脚本 | 覆盖范围 | 命令 |
+|------|---------|------|
+| `test_human_simulation.py` | 5 类 14 用例（口语噪音、错别字、多轮指代、长文本组合、边界攻击） | `python test_human_simulation.py` |
+| `test_robot_rag.py` | 核心 RAG 功能回归（4 题 × 双模式） | `conda run -n rag_agent python test_robot_rag.py` |
+| `test_stability.py` | 多轮对话 + 并发保护 + 7 种异常降级 | `conda run -n rag_agent python test_stability.py` |
 
 ---
 
@@ -182,7 +170,7 @@ conda run -n rag_agent python tunnel.py --token <YOUR_NGROK_AUTHTOKEN>
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | `GET` | `/` | 渲染 **NewsPage** 主页面 |
-| `POST` | `/api/chat` | RAG 对话（支持 SSE 流式输出）。参数：`query`（必填）、`history`（可选 JSON）、`stream`（默认 true） |
+| `POST` | `/api/chat` | RAG 对话（SSE 流式）。参数：`query`（必填）、`history`（可选 JSON）、`stream`（默认 true） |
 | `POST` | `/api/upload` | 上传 PDF 并自动重建向量库 |
 | `GET` | `/api/status` | 返回向量库就绪状态与已索引文档片段数 |
 
@@ -190,4 +178,4 @@ conda run -n rag_agent python tunnel.py --token <YOUR_NGROK_AUTHTOKEN>
 
 ## 📝 开发与排错日志
 
-有关环境排查、兼容补丁、四层容灾、GPU 自适应、安全加固等 19 个章节的详细开发记录与架构决策（ADR），请参阅 [dev_log.md](./dev_log.md)。
+有关环境排查、兼容补丁、四层容灾、GPU 自适应、安全加固、混合检索、人类模拟测试等 20 个章节的详细开发记录与架构决策（ADR），请参阅 [dev_log.md](./dev_log.md)。

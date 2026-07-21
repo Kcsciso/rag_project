@@ -136,13 +136,14 @@ conda run -n rag_agent python tunnel.py --token <YOUR_NGROK_AUTHTOKEN>
 | `src/config.py` | **全局配置中心** — 双通道 LLM（vLLM :8001 / 智谱 GLM-4.7-Flash）、GPU 智能探测 API（`detect_best_gpu` / `get_all_gpu_info` / `VLLM_GPU_ID`）、ChromaDB 路径、嵌入模型双轨回退、检索参数（600/100/5/0.75） |
 | `src/pdf_loader.py` | **PDF 加载** — pypdf 逐页提取 → RecursiveCharacterTextSplitter 13 级递归分块 |
 | `src/vector_store.py` | **向量知识库** — HuggingFaceEmbeddings（优先）+ ONNXMiniLM_L6_V2（回退）双轨嵌入；`search_similar_with_threshold()` 阈值过滤；`cleanup_vector_store()` 资源释放 |
-| `src/rag_chain.py` | **RAG 核心管线** — 四层金字塔容灾（vLLM → 智谱 → 纯检索直出 → 优雅错误）；Prompt 注入防御（role 白名单 + 注入检测）；Layer 3 行级归一化去重；`shutdown_clients()`；超时 2s/12s |
+| `src/rag_chain.py` | **RAG 核心管线** — 四层金字塔容灾；`_preprocess_query` 口语化噪音多层迭代剥离（25+ 模式）；`_hybrid_retrieve` 混合检索（向量召回 4×→关键词重排序）；`_score_chunk_for_query` 三层加权打分（43 领域词 + 20 SDK 函数名）；Prompt 注入防御；Layer 3 行级归一化去重；`shutdown_clients()` |
 | `app.py` | **FastAPI 主入口** — 4 条路由 + 安全中间件（`sanitize_query` / `sanitize_filename` / `validate_chat_history`）；SSE 防泄露（`cancelled` + `CancelledError` + 限界队列）；`shutdown` 事件 |
 | `check_status.py` | **健康检查** — vLLM + FastAPI + GPU 显存/温度/功率 + 四层容灾可用性 + vLLM 部署 GPU 识别 |
-| `start_services.sh` | **一键启动** — GPU 智能选择 + 端口检测 + vLLM 后台拉起 + FastAPI 启动 + 优雅退出 |
+| `start_services.sh` | **一键启动** — GPU 智能选择（`detect_best_gpu` stdout/stderr 严格隔离）+ 端口检测 + vLLM 后台拉起 + FastAPI 启动 + 优雅退出 |
 | `tunnel.py` | **ngrok 隧道** — 公网穿透，authtoken 认证 |
 | `test_robot_rag.py` | **功能回归测试** — 4 题 × 流式/非流式双模式 |
 | `test_stability.py` | **稳定性压力测试** — 多轮对话 + 并发 + 7 种异常降级场景 |
+| `test_human_simulation.py` | **人类模拟测试** — 5 类 14 用例：口语噪音、错别字、多轮指代、长文本组合、边界攻击 |
 
 ## 四层金字塔容灾架构（ADR-5）
 
@@ -150,7 +151,7 @@ conda run -n rag_agent python tunnel.py --token <YOUR_NGROK_AUTHTOKEN>
 用户提问
   │
   ▼
-ChromaDB 向量检索（相似度阈值 0.75 过滤）
+ChromaDB 混合检索（Query 预处理 + 向量召回 4× + 关键词重排序 + 阈值 0.78）
   │
   ├── Layer 1: 本地 vLLM (Qwen2.5-1.5B-Instruct, GPU 自适应, :8001)
   │     • 超时: connect=2s / read=12s
@@ -162,7 +163,7 @@ ChromaDB 向量检索（相似度阈值 0.75 过滤）
   │     └── 失败 → Layer 3
   │
   ├── Layer 3: 纯向量检索智能直出 (CPU-only, 零显存/零API)
-  │     • 行级归一化去重 → 函数/描述/参数/返回值/代码提取
+  │     • Query 预处理 → 混合检索 → 行级归一化去重 → 结构化输出
   │     • 流式: ~15 字符/块分段 yield 模拟打字机
   │     └── 失败 → Layer 4
   │
@@ -211,13 +212,22 @@ ChromaDB 向量检索（相似度阈值 0.75 过滤）
 # 🔧 运维与诊断
 
 ```bash
+# 一键启动
+./start_services.sh                         # 智能 GPU 检测 → vLLM → FastAPI
+./start_services.sh --vllm-only             # 仅启动 vLLM
+./start_services.sh --fastapi-only          # 仅启动 FastAPI
+
+# 一键停止
+pkill -f "app.py"; pkill -f "vllm.entrypoints"   # 或定义: alias stoprag='pkill -f app.py; pkill -f vllm'
+
 # 健康检查
-python check_status.py                # 一次性完整报告
-python check_status.py --watch 10     # 每 10 秒刷新
+python check_status.py                      # 一次性完整报告
+python check_status.py --watch 10           # 每 10 秒刷新
 
 # 自动化测试
-conda run -n rag_agent python test_robot_rag.py      # RAG 功能回归
-conda run -n rag_agent python test_stability.py       # 稳定性压力测试
+python test_human_simulation.py             # 全场景人类模拟（14 用例 × 5 类别）
+conda run -n rag_agent python test_robot_rag.py      # RAG 功能回归（4 题 × 双模式）
+conda run -n rag_agent python test_stability.py       # 稳定性压力测试（多轮 + 并发）
 ```
 
 ---
@@ -240,7 +250,7 @@ LLM_TIMEOUT = httpx.Timeout(connect=2.0, read=12.0, write=12.0, pool=2.0)
 CHUNK_SIZE           = 600
 CHUNK_OVERLAP        = 100
 RETRIEVAL_K          = 5
-SIMILARITY_THRESHOLD = 0.75
+SIMILARITY_THRESHOLD = 0.78
 DIRECT_RETRIEVAL_K   = 2
 
 # Web 服务

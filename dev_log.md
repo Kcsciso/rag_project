@@ -1296,3 +1296,115 @@ _group_code_lines() 分组 → 块级二次指纹去重 → 最多取 1 段
 | `static/app.js` | 修改 | `RENDER_THROTTLE_MS=50` 节流渲染 + 最终渲染 |
 | `README.md` | **重写** | 新增安全特性、GPU 自适应、API 文档、运维工具清单 |
 | `dev_log.md` | 追加 | 本章节（十九） |
+
+---
+
+## 二十、口语化检索优化、智能显卡调度修复与全场景人类模拟测试
+
+> **日期**: 2026-07-21  
+> **变更范围**: `src/rag_chain.py`, `start_services.sh`, `test_human_simulation.py`, `CLAUDE.md`, `README.md`  
+> **变更目标**: (1) 根治口语化查询的检索未命中问题；(2) 修复 `detect_best_gpu()` 日志污染变量的隐蔽 Bug；(3) 建立全场景人类模拟黑盒测试体系
+
+### 20.1 Query 预处理 — 多层迭代口语化噪音过滤
+
+**问题**: 用户输入"那个啥，你给我整一个让机械臂动起来的 Python 脚本呗，要关节运动的那种"时，旧版 `_preprocess_query()` 仅剥离单层前缀（"那个啥"），残留的大量口语化噪音词（"你给我"、"整一个"、"呗"、"的那种"）严重稀释了嵌入向量的语义聚焦度，导致 `all-MiniLM-L6-v2` 的 cosine distance 偏高，movj 相关切片无法进入 Top-K。
+
+**修复**: 将 `_preprocess_query()` 重构为**迭代收敛模型**：
+
+```
+while 字符串变化 and iterations < 5:
+    for 前缀模式 in 25+ 噪音词:
+        cleaned = re.sub(前缀, '', cleaned)
+    for 后缀模式 in 15+ 噪音词:
+        cleaned = re.sub(后缀, '', cleaned)
+    for 句中模式 in 8 噪音词:
+        cleaned = re.sub(句中, ' ', cleaned)
+    压缩多余空格
+```
+
+**新增噪音词**（共计 40+ 模式）：
+
+| 类别 | 示例 | 数量 |
+|------|------|------|
+| 前缀 | "你给我"、"整一个"、"请帮我写"、"急！"、"能不能"、"行不行" | 25+ |
+| 后缀 | "呗"、"的那种"、"的函数"、"这个"、"那个" | 15+ |
+| 句中 | "就是那个"、"就叫那个"、"那个"、"这个" | 8 |
+
+**效果对比**：
+
+| 原始查询 | 旧预处理 | 新预处理 |
+|----------|----------|----------|
+| "那个啥，你给我整一个让机械臂动起来的 Python 脚本呗" | "你给我整一个让机械臂动起来的 Python 脚本呗" | "让机械臂动起来的 Python 脚本 ，要关节运动" |
+| "我直接说，我需要知道那个上电的函数" | "我需要知道那个上电的函数，就是开机通电那个" | "上电的函数，就是开机通电那个" |
+
+### 20.2 混合检索 — 向量召回 + 关键词重排序
+
+**问题**: 英文嵌入模型 `all-MiniLM-L6-v2` 对中文技术查询的语义匹配精度有限。实测发现，查询"关节空间运动 movj 参数有哪些"时，正确的 `robot_movj` 函数切片在向量检索中排名第 9（cosine distance=0.7996），超过了 `SIMILARITY_THRESHOLD=0.78`，被直接过滤掉。而排名前 3 的切片（`robot_stop`、`get_robot_pose`、IO 状态代码）均不包含 movj 信息，导致 LLM 回复"根据现有文档，无法找到相关信息"。
+
+**修复**: 新增 `_hybrid_retrieve()` 混合检索函数：
+
+```
+① 向量初筛: fetch_factor=4 倍候选池（k=5 → 取 20 个候选）
+② 阈值放宽: relaxed_threshold = min(threshold * 1.05, 0.85) → 0.819
+③ 关键词重排序: 对通过阈值的候选，使用 _score_chunk_for_query() 按领域关键词重新打分
+④ 返回 Top-K: 取重排序后的前 k 个切片
+```
+
+**验证**: 修复后，`robot_movj` 切片上升至混合检索 Top-1（关键词得分 0.617 → 排名第一）。
+
+### 20.3 `detect_best_gpu()` stdout/stderr 隔离修复
+
+**问题**: `start_services.sh` 中 `detect_best_gpu()` 函数的日志输出（`log_detail`、`log_info`、`log_error` 及 `echo -e` 扫描表格）均写入 stdout。当通过 `BEST_GPU=$(detect_best_gpu)` 捕获返回值时，所有 ANSI 转义码和日志文本一并被捕获进 `BEST_GPU` 变量，导致：
+- `"0: integer expression expected"` 报错
+- `CUDA_VISIBLE_DEVICES` 环境变量被污染为带多行日志的非法字符串
+
+**修复**: 函数内所有日志/提示语句统一追加 `>&2` 重定向到 stderr：
+
+```bash
+# 修复前（变量污染）
+log_info "自动选择 GPU: ..."          # → stdout，被 $() 捕获
+
+# 修复后（stdout/stderr 严格隔离）
+log_info "自动选择 GPU: ..." >&2      # → stderr，终端可见但不污染变量
+echo -e "$all_info" | while ...; do
+    echo -e "        $line" >&2       # → stderr
+done
+echo "$best_idx"                      # ✅ stdout：唯一输出，纯数字
+```
+
+`export_gpu_env()` 同步修复，防止未来被 `$(export_gpu_env)` 捕获。
+
+### 20.4 全场景人类模拟测试体系
+
+新增 `test_human_simulation.py`（~380 行），向 `http://localhost:8000/api/chat` 发起真实 HTTP 请求，覆盖 5 类 14 个黑盒测试用例：
+
+| 类别 | 用例数 | 示例 | 通过率 |
+|------|--------|------|--------|
+| 口语化与噪音 | 4 | "那个啥，你给我整一个让机械臂动起来的 Python 脚本呗" | 100% |
+| 错别字与模糊 | 3 | "上垫"（同音错字→上电）、"位置姿态"（近义词→位姿） | 100% |
+| 多轮上下文 | 2 | "那圆弧运动呢？它比直线运动多了什么？" | 100% |
+| 长文本组合 | 1 | 8 步完整工作流（连接→上电→使能→抱闸→移动→断开） | 100% |
+| 边界与对抗 | 4 | "能炒菜吗？"（拒答）、Prompt 注入（防御成功）、空查询（400 拒绝） | 100% |
+
+**测试指标**：平均首 token 延迟 5.5s，平均总耗时 8.6s，Layer 触发分布 L1/L2:13、L3:1、L4:1。
+
+**测试驱动的源码修复**：测试过程中发现并修复了 3 个缺陷（口语化噪音残留、movj 切片阈值误杀、GPU 变量污染），将初始通过率从 71.4% 提升至 100%。
+
+### 20.5 一键全关快捷命令
+
+为方便日常运维，新增 `stoprag` 一键全关别名：
+
+```bash
+alias stoprag='pkill -f "app.py"; pkill -f "vllm.entrypoints"; echo "NewsPage 已停止"'
+```
+
+### 20.6 变更文件汇总
+
+| 文件 | 变更类型 | 关键变更 |
+|------|----------|----------|
+| `src/rag_chain.py` | **大幅修改** | `_preprocess_query()` 迭代收敛 + 40+ 噪音模式；`_hybrid_retrieve()` 混合检索；`_QUERY_INLINE_NOISE` 句中噪音剥离；`_score_chunk_for_query` 噪声 token 过滤 |
+| `start_services.sh` | 修改 | `detect_best_gpu()` 全部日志重定向 stderr（`>&2`）；`export_gpu_env()` 同步修复 |
+| `test_human_simulation.py` | **新增** | 5 类 14 用例全场景黑盒测试（~380 行） |
+| `CLAUDE.md` | 修改 | 阈值 0.75→0.78；架构图更新为混合检索；新增 `test_human_simulation.py` 和运维命令 |
+| `README.md` | 修改 | 新增混合检索/预处理特性描述；新增 `stoprag` 和测试体系章节 |
+| `dev_log.md` | 追加 | 本章节（二十） |
