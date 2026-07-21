@@ -47,7 +47,7 @@
 
 import os
 import logging
-from typing import List, Optional, Any
+from typing import List, Optional, Any, Tuple
 
 from langchain_core.documents import Document
 from langchain_chroma import Chroma

@@ -234,7 +234,8 @@ def _stream_llm(
 # ============================================================
 
 # 纯检索模式使用的 Top-K 值（可独立于常规 RAG 的 RETRIEVAL_K 调整）
-DIRECT_RETRIEVAL_K = 3
+# 纯检索模式使用的 Top-K 值（与 RETRIEVAL_K 保持一致，确保 Layer 3 输出完整召回）
+DIRECT_RETRIEVAL_K = 5
 
 # 纯检索模式的提示文本模板
 DIRECT_RETRIEVAL_HEADER = (

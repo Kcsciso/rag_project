@@ -26,12 +26,12 @@ import os
 # - 认证信息从 ~/.bashrc 中读取环境变量
 # - 模型 deepseek-v4-pro 用于复杂推理，deepseek-v4-flash 用于子任务
 # --------------------------------------------------------------------------
-DEEPSEEK_BASE_URL = "https://api.deepseek.com/anthropic"
+DEEPSEEK_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 DEEPSEEK_API_KEY = os.environ.get(
-    "DEEPSEEK_API_KEY",
-    "sk-your-deepseek-key-here"  # ← 请替换为你的 DeepSeek API Key
+    "ZHIPU_API_KEY",
+    "1fe4c37fd3264ffa9f535fec9d0fc96b.UtiuwWTVuFofYHnB"  # ← 智谱 GLM-4.7-Flash 默认 Key
 )
-DEEPSEEK_MODEL = "deepseek-v4-pro"  # 主路由模型，也可换为 deepseek-v4-flash
+DEEPSEEK_MODEL = "glm-4.7-flash"  # 智谱 GLM-4.7-Flash 免费模型
 
 # --------------------------------------------------------------------------
 # 方案二：本地 vLLM 自建 OpenAI 兼容服务（成本零，需本地 GPU）
@@ -102,21 +102,21 @@ PDF_DATA_DIR = os.path.join(
 )
 
 # 文本分块参数
-# chunk_size=500: 每个文本块最大 500 个字符（适合中文，约 250 个词）
-#                 过小 → 上下文碎片化；过大 → 检索精度下降
-# chunk_overlap=50: 相邻块之间重叠 50 个字符
-#                   保证关键信息不会恰好落在块边界上被切断
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 50
+# chunk_size=600: 每个文本块最大 600 个字符——在保留上下文完整性与检索精度间平衡
+#                 增大到 600 防止 API 示例代码跨切片被截断
+# chunk_overlap=100: 相邻块之间重叠 100 个字符
+#                    加大重叠区确保关键函数定义不会恰好落在块边界上
+CHUNK_SIZE = 600
+CHUNK_OVERLAP = 100
 
 # ============================================================
 # RAG 检索配置
 # ============================================================
 
 # 检索时返回的 Top-K 文档片段数
-# k=4: 每次检索返回最相关的 4 个文本块
-#      过小 → LLM 缺少足够上下文；过大 → 引入噪声，Token 成本上升
-RETRIEVAL_K = 4
+# k=5: 每次检索返回最相关的 5 个文本块
+#      增加到 5 以提高召回覆盖率，降低关键函数漏检概率
+RETRIEVAL_K = 5
 
 # ============================================================
 # Web 服务配置

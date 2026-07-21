@@ -85,21 +85,18 @@ async def startup_event():
     global vector_store
     logger.info("🚀 NewsPage — 湖南比邻星科技文档智能问答系统 正在启动...")
 
-    # ---- 配置校验：DeepSeek API Key 降级通道可用性 ----
+    # ---- 配置校验：智谱 GLM-4.7-Flash API Key 降级通道可用性 ----
     from src.config import DEEPSEEK_API_KEY, BASE_URL
-    if DEEPSEEK_API_KEY == "sk-your-deepseek-key-here":
-        logger.warning(
-            "⚠️  DEEPSEEK_API_KEY 仍为默认占位符 'sk-your-deepseek-key-here'，"
-            "DeepSeek 降级通道（第 2 层容灾）将不可用！"
+    if DEEPSEEK_API_KEY == "1fe4c37fd3264ffa9f535fec9d0fc96b.UtiuwWTVuFofYHnB":
+        logger.info(
+            "✅ 智谱 GLM-4.7-Flash API Key 已使用默认值，"
+            "第 2 层智谱降级通道可用 (glm-4.7-flash)"
         )
-        logger.warning(
-            "   请设置环境变量: export DEEPSEEK_API_KEY=<your-deepseek-key>"
-        )
-        logger.warning(
-            "   获取 Key: https://platform.deepseek.com/api_keys"
+        logger.info(
+            "   如需自定义 Key，请设置环境变量: export ZHIPU_API_KEY=<your-key>"
         )
     else:
-        logger.info("✅ DEEPSEEK_API_KEY 已配置，第 2 层 DeepSeek 降级通道可用")
+        logger.info("✅ ZHIPU_API_KEY 已从环境变量加载，第 2 层智谱降级通道可用")
 
     if BASE_URL == "http://localhost:8000/v1":
         logger.info("📋 当前主 LLM 通道: 本地 vLLM (http://localhost:8000/v1)")
