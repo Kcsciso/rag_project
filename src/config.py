@@ -54,9 +54,9 @@ DEEPSEEK_MODEL = "glm-4.7-flash"  # 智谱 GLM-4.7-Flash 免费模型
 #   export LLM_BASE_URL="https://api.deepseek.com/anthropic"
 #   export LLM_API_KEY="sk-your-deepseek-key"
 # ============================================================
-BASE_URL = os.environ.get("LLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
-API_KEY = os.environ.get("LLM_API_KEY", "1fe4c37fd3264ffa9f535fec9d0fc96b.UtiuwWTVuFofYHnB")
-MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "glm-4.7-flash")
+BASE_URL = os.environ.get("LLM_BASE_URL", "http://localhost:8001/v1")
+API_KEY = os.environ.get("LLM_API_KEY", "EMPTY")
+MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "Qwen/Qwen2.5-1.5B-Instruct")
 
 # ============================================================
 # 向量库 & 嵌入模型配置
