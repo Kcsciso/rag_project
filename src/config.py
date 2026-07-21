@@ -84,12 +84,18 @@ FALLBACK_TO_ONNX = True
 # 默认使用国内镜像 hf-mirror.com，避免访问 huggingface.co 超时
 # 如需使用官方源，设置环境变量: HF_ENDPOINT=https://huggingface.co
 HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com")
-# 显式注入 os.environ，确保底层库 (transformers, huggingface_hub) 生效
-os.environ.setdefault("HF_ENDPOINT", HF_ENDPOINT)
+# 强制执行，覆盖系统中可能存在的官方源地址
+os.environ["HF_ENDPOINT"] = HF_ENDPOINT
 # 注意：不启用 HF_HUB_ENABLE_HF_TRANSFER，避免因缺少 hf_transfer 包导致下载失败
 
 # 嵌入向量设备：优先 GPU，不可用时回退 CPU
-EMBEDDING_DEVICE = "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu"
+# 注意：使用 torch.cuda.is_available() 做实际可用性检查，
+# 而非仅依赖 CUDA_VISIBLE_DEVICES 环境变量（可能指向不可用 GPU）
+try:
+    import torch
+    EMBEDDING_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+except ImportError:
+    EMBEDDING_DEVICE = "cpu"
 
 # ============================================================
 # PDF 文档处理配置
@@ -136,3 +142,147 @@ PORT = 8000
 
 # 最大上传文件大小（字节），默认 50MB
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024
+
+# ============================================================
+# GPU 智能自适应部署 — Dynamic GPU Detection
+# ============================================================
+#
+# 通过 nvidia-smi 实时探测所有 GPU 的空闲显存，
+# 自动选择剩余显存最大的 GPU 作为 vLLM 推理目标。
+#
+# 优先级：
+#   1. 环境变量 VLLM_GPU_ID（手动覆盖，最高优先级）
+#   2. nvidia-smi 自动探测（空闲显存最大者胜出）
+#   3. 默认回退 GPU 0（nvidia-smi 不可用时）
+#
+# 使用方式：
+#   from src.config import get_best_gpu, get_all_gpu_info
+#   gpu_id = get_best_gpu()
+#   gpus = get_all_gpu_info()
+
+import logging
+import subprocess
+from typing import List, Dict, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+# 最小需要的 GPU 空闲显存（MiB），低于此值认为该 GPU 不可用
+MIN_FREE_MEMORY_MIB = 5120  # 5 GB — 1.5B 模型约需 3.7 GB
+
+# 当前选定的 vLLM GPU（优先读环境变量，否则自动探测）
+_VLLM_GPU_ID_FROM_ENV = os.environ.get("VLLM_GPU_ID")
+
+
+def _parse_nvidia_smi() -> List[Dict[str, any]]:
+    """
+    调用 nvidia-smi 并解析为结构化 GPU 信息列表。
+
+    每项包含:
+        index, name, memory_used_mib, memory_total_mib, memory_free_mib,
+        temperature, power_w, utilization_pct
+    """
+    try:
+        output = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,name,memory.used,memory.total,memory.free,"
+                "temperature.gpu,power.draw,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            timeout=10,
+        ).strip()
+
+        if not output:
+            return []
+
+        gpus = []
+        for line in output.split("\n"):
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 7:
+                continue
+            gpus.append({
+                "index": int(parts[0]),
+                "name": parts[1],
+                "memory_used_mib": float(parts[2]),
+                "memory_total_mib": float(parts[3]),
+                "memory_free_mib": float(parts[4]),
+                "temperature": parts[5] if parts[5] else "N/A",
+                "power_w": parts[6] if parts[6] else "N/A",
+                "utilization_pct": parts[7] if len(parts) > 7 and parts[7] else "N/A",
+            })
+        return gpus
+
+    except FileNotFoundError:
+        logger.warning("nvidia-smi 未找到，无法探测 GPU 状态")
+        return []
+    except Exception as e:
+        logger.warning(f"nvidia-smi 调用失败: {e}")
+        return []
+
+
+def get_all_gpu_info() -> List[Dict[str, any]]:
+    """返回所有 GPU 的结构化信息列表（供 check_status.py 等工具使用）。"""
+    return _parse_nvidia_smi()
+
+
+def detect_best_gpu(min_free_mib: int = MIN_FREE_MEMORY_MIB) -> int:
+    """
+    在所有 GPU 中查找空闲显存最大的那一张。
+
+    算法：
+      1. nvidia-smi 查询每张 GPU 的 memory.free
+      2. 过滤空闲显存 < min_free_mib 的 GPU
+      3. 按空闲降序，返回第一名
+
+    Args:
+        min_free_mib: 最低空闲显存门槛（MiB），低于此值的 GPU 被排除
+
+    Returns:
+        GPU 索引（int），无可用的 GPU 时返回 -1
+    """
+    gpus = _parse_nvidia_smi()
+    if not gpus:
+        return 0  # nvidia-smi 不可用时回退 GPU 0
+
+    best_idx = -1
+    best_free = -1
+
+    for gpu in gpus:
+        free_mib = gpu["memory_free_mib"]
+        if free_mib >= min_free_mib and free_mib > best_free:
+            best_free = free_mib
+            best_idx = gpu["index"]
+
+    if best_idx >= 0:
+        logger.info(
+            f"🖥️ 智能 GPU 选择: GPU {best_idx} "
+            f"(空闲 {best_free:.0f} MiB / {best_free/1024:.1f} GB)"
+        )
+    else:
+        logger.warning(
+            f"⚠️  所有 GPU 空闲显存均不足 {min_free_mib} MiB，"
+            f"vLLM 部署可能失败"
+        )
+
+    return best_idx if best_idx >= 0 else 0  # 无可用的 GPU 时回退 0
+
+
+def get_best_gpu() -> int:
+    """
+    获取当前应使用的 GPU 索引。
+
+    优先级: 环境变量 VLLM_GPU_ID > nvidia-smi 自动探测 > 默认 0
+    """
+    if _VLLM_GPU_ID_FROM_ENV is not None:
+        try:
+            gpu_id = int(_VLLM_GPU_ID_FROM_ENV)
+            logger.info(f"🖥️ 使用环境变量指定的 GPU: {gpu_id} (VLLM_GPU_ID)")
+            return gpu_id
+        except ValueError:
+            logger.warning(f"VLLM_GPU_ID 值无效 '{_VLLM_GPU_ID_FROM_ENV}'，回退自动探测")
+    return detect_best_gpu()
+
+
+# 模块级常量：当前选定的 vLLM GPU（首次 import 时自动探测）
+VLLM_GPU_ID = get_best_gpu()

@@ -139,6 +139,8 @@ async function sendMessage() {
         const decoder = new TextDecoder();
         let fullText  = "";
         let buffer    = "";
+        let renderPending = false;
+        const RENDER_THROTTLE_MS = 50;  // 最多每 50ms 刷新一次渲染（20fps）
 
         removeTypingIndicator(contentEl);
 
@@ -161,13 +163,23 @@ async function sendMessage() {
                     }
                     if (data.delta) {
                         fullText += data.delta;
-                        // 用 marked 实时渲染 Markdown
-                        contentEl.innerHTML = renderMarkdown(fullText);
-                        chatMessages.scrollTop = chatMessages.scrollHeight;
+                        // 节流渲染：避免每个 token 都触发完整 Markdown 重渲染
+                        if (!renderPending) {
+                            renderPending = true;
+                            setTimeout(() => {
+                                contentEl.innerHTML = renderMarkdown(fullText);
+                                chatMessages.scrollTop = chatMessages.scrollHeight;
+                                renderPending = false;
+                            }, RENDER_THROTTLE_MS);
+                        }
                     }
                 } catch (_) { /* 忽略不完整 JSON */ }
             }
         }
+
+        // 确保最后一次渲染
+        contentEl.innerHTML = renderMarkdown(fullText);
+        chatMessages.scrollTop = chatMessages.scrollHeight;
 
         chatHistory.push({ role: "assistant", content: fullText });
 

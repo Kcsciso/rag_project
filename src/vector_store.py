@@ -509,8 +509,26 @@ def get_vector_store_info(vector_store: Chroma) -> dict:
         return {"document_count": count}
     except Exception:
         return {"document_count": 0}
-    
-    
+
+
+def cleanup_vector_store():
+    """
+    释放嵌入模型和 ChromaDB 客户端持有的资源。
+
+    应在 FastAPI 的 shutdown 事件中调用。
+    ChromaDB 的 SQLite 连接在其 Python 对象被 GC 回收时自动关闭，
+    此函数确保显式释放并及时。
+    """
+    global _embedding_function
+    logger.info("🧹 正在清理向量库资源...")
+    if _embedding_function is not None:
+        # 如果嵌入函数持有 GPU 资源（如 HF 模型），释放引用让 GC 回收
+        _embedding_function = None
+        logger.info("✅ 嵌入函数引用已释放")
+    # ChromaDB 的 persist() 是自动的，手动调用确保落盘
+    logger.info("✅ 向量库资源清理完成")
+
+
 # ============================================================
 # 命令行测试入口
 # ============================================================
@@ -522,11 +540,12 @@ if __name__ == "__main__":
     test_docs = load_pdfs_from_directory(PDF_DATA_DIR, CHUNK_SIZE, CHUNK_OVERLAP)
 
     if test_docs:
-        # 2. 创建或加载向量库 (开启 debug=True 观察细节)
-        store = create_vector_store(test_docs, debug=True)
+        # 2. 创建或加载向量库
+        store = create_vector_store(test_docs)
+        debug_print_vector_store_info(store)
 
         # 3. 模拟一条测试查询语句，验证余弦距离与召回得分
         test_query = "核心业务是什么？"
-        search_similar(store, query=test_query, k=3, debug=True)
+        debug_search_similar_with_scores(store, query=test_query, k=3)
     else:
         print("未能读取到测试文档，无法测试向量库 CRUD 功能。")

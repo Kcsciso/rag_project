@@ -201,14 +201,13 @@ def load_pdfs_from_directory(
 if __name__ == "__main__":
     from .config import PDF_DATA_DIR, CHUNK_SIZE, CHUNK_OVERLAP
 
-    # 运行模块测试时，默认开启 debug=True
     docs = load_pdfs_from_directory(
         data_dir=PDF_DATA_DIR,
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
-        debug=True  # 👈 直接传入 True 观察切片输出
     )
     if docs:
+        debug_print_chunks(docs, max_show=3)
         print(f"\n--- 示例：第一个文本块 ---")
         print(f"来源: {docs[0].metadata['source']}")
         print(f"内容预览: {docs[0].page_content[:200]}...")

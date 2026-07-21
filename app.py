@@ -18,11 +18,12 @@ API 路由一览：
 =============================================================================
 """
 
+import asyncio
 import json
 import logging
 import os
-import shutil
-from typing import List, Optional
+import re
+from typing import Optional
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Form
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
@@ -43,10 +44,9 @@ from src.pdf_loader import load_pdfs_from_directory
 from src.vector_store import (
     create_vector_store,
     load_vector_store,
-    search_similar,
     get_vector_store_info,
 )
-from src.rag_chain import rag_chat, rag_chat_stream, LLMServiceError
+from src.rag_chain import rag_chat, rag_chat_stream, LLMServiceError, shutdown_clients
 
 # ============================================================
 # 日志配置
@@ -56,6 +56,95 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("app")
+
+# ============================================================
+# 输入安全 — 查询与文件名清洗
+# ============================================================
+
+# 查询长度上限（字符）
+MAX_QUERY_LENGTH = 2000
+# 对话历史最大条数（防 JSON 深度炸弹）
+MAX_HISTORY_ITEMS = 100
+# SSE 队列最大容量（防内存耗尽）
+SSE_QUEUE_MAXSIZE = 256
+# 允许的聊天角色
+ALLOWED_CHAT_ROLES = {"user", "assistant"}
+
+# null 字节和控制字符的正则（禁止出现在查询和文件名中）
+_NULL_OR_CONTROL_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
+
+
+def sanitize_query(query: str) -> str:
+    """
+    清洗用户查询字符串。
+
+    处理：
+      - 删除 null 字节（\x00）→ 防止 SQLite/chroma 截断
+      - 删除控制字符（\x01-\x1f 除 \t \n）→ 防止日志/终端注入
+      - 规范化换行：\r\n → \n
+      - 去首尾空白
+    """
+    query = _NULL_OR_CONTROL_RE.sub('', query)
+    query = query.replace('\r\n', '\n').replace('\r', '\n')
+    return query.strip()
+
+
+def sanitize_filename(filename: str) -> str:
+    """
+    清洗上传文件名 — 防路径遍历 + 防 null 字节注入。
+
+    处理：
+      1. os.path.basename() → 去除 ../../ 等路径遍历
+      2. 删除 null 字节和控制字符
+      3. 如果清洗后为空，返回安全的默认名称
+    """
+    filename = os.path.basename(filename)
+    filename = _NULL_OR_CONTROL_RE.sub('', filename)
+    filename = filename.strip()
+    if not filename:
+        filename = "uploaded_document.pdf"
+    return filename
+
+
+def validate_chat_history(history: list) -> list:
+    """
+    校验并清洗对话历史。
+
+    校验规则：
+      - 必须是 list 类型
+      - 最多允许 MAX_HISTORY_ITEMS 条记录
+      - 每条记录中的 role 必须是 "user" 或 "assistant"
+      - 每条 content 不能为空
+      - 每条 content 长度上限 4000 字符
+    """
+    if not isinstance(history, list):
+        raise HTTPException(status_code=400, detail="history 必须是 JSON 数组")
+
+    if len(history) > MAX_HISTORY_ITEMS:
+        # 截断 + 警告（而非直接拒绝）
+        logger.warning(
+            f"对话历史过长 ({len(history)} 条)，截断至最近 {MAX_HISTORY_ITEMS} 条"
+        )
+        history = history[-MAX_HISTORY_ITEMS:]
+
+    cleaned = []
+    for i, item in enumerate(history):
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail=f"history[{i}] 必须是对象")
+        role = item.get("role", "")
+        content = item.get("content", "")
+        if role not in ALLOWED_CHAT_ROLES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"history[{i}] 角色无效: '{role}'，仅允许 user/assistant"
+            )
+        if not content or not isinstance(content, str):
+            raise HTTPException(status_code=400, detail=f"history[{i}] content 不能为空")
+        if len(content) > 4000:
+            content = content[:4000]
+        cleaned.append({"role": role, "content": sanitize_query(content)})
+    return cleaned
+
 
 # ============================================================
 # FastAPI 应用初始化
@@ -98,10 +187,10 @@ async def startup_event():
     else:
         logger.info("✅ ZHIPU_API_KEY 已从环境变量加载，第 2 层智谱降级通道可用")
 
-    if BASE_URL == "http://localhost:8000/v1":
-        logger.info("📋 当前主 LLM 通道: 本地 vLLM (http://localhost:8000/v1)")
+    if "localhost" in BASE_URL or "127.0.0.1" in BASE_URL:
+        logger.info(f"📋 当前主 LLM 通道: 本地 vLLM ({BASE_URL})")
     else:
-        logger.info(f"📋 当前主 LLM 通道: {BASE_URL}")
+        logger.info(f"📋 当前主 LLM 通道: 云端 API ({BASE_URL})")
 
     # ---- 加载向量库 ----
     vector_store = load_vector_store(CHROMA_PERSIST_DIR)
@@ -110,6 +199,17 @@ async def startup_event():
         logger.info(f"📚 已加载向量库：{info['document_count']} 个文档片段")
     else:
         logger.info("📭 向量库为空，请通过 WebUI 上传 PDF 文件")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """应用关闭时：释放 LLM 客户端连接池等资源"""
+    logger.info("🛑 NewsPage 正在关闭...")
+    try:
+        shutdown_clients()
+        logger.info("✅ LLM 客户端连接池已释放")
+    except Exception as e:
+        logger.warning(f"关闭 LLM 客户端时出错: {e}")
 
 
 # ============================================================
@@ -140,6 +240,11 @@ async def chat(
     """
     RAG 对话接口 — POST /api/chat
 
+    【安全措施】
+      - query 清洗：删除 null 字节、控制字符
+      - history 校验：仅允许 user/assistant 角色、截断超长内容
+      - 长度上限：query ≤ 2000 字符
+
     【请求参数（表单格式）】
     - query (必填): 用户输入的问题
     - history (可选): JSON 字符串，格式 [{"role":"user","content":"..."}, ...]
@@ -160,35 +265,83 @@ async def chat(
             detail="向量库尚未初始化，请先上传 PDF 文件。"
         )
 
-    # 解析历史对话
+    # ---- 查询清洗 ----
+    query = sanitize_query(query)
+    if not query:
+        raise HTTPException(status_code=400, detail="query 不能为空")
+
+    if len(query) > MAX_QUERY_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"查询内容过长，请控制在 {MAX_QUERY_LENGTH} 字符以内"
+        )
+
+    # ---- 历史对话校验 ----
     chat_history = None
     if history:
         try:
-            chat_history = json.loads(history)
+            raw_history = json.loads(history)
+            chat_history = validate_chat_history(raw_history)
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="history 参数 JSON 格式无效")
-
-    if not query or not query.strip():
-        raise HTTPException(status_code=400, detail="query 不能为空")
+        except HTTPException:
+            raise  # 透传 validate_chat_history 中的 HTTPException
+        except Exception as e:
+            logger.warning(f"history 校验异常: {e}")
+            raise HTTPException(status_code=400, detail=f"history 参数无效: {e}")
 
     # ---- 流式 SSE 响应 ----
     if stream:
         async def generate_sse():
-            """生成 SSE 事件流"""
+            """
+            异步 SSE 事件生成器 — 防泄露增强版。
+
+            安全特性：
+              - bounded queue (maxsize=SSE_QUEUE_MAXSIZE)：防止内存耗尽
+              - asyncio.CancelledError 捕获：客户端断开时停止消费
+              - 线程池 Future 追踪：可取消阻塞调用
+            """
+            loop = asyncio.get_event_loop()
+            queue: asyncio.Queue = asyncio.Queue(maxsize=SSE_QUEUE_MAXSIZE)
+            cancelled = False
+
+            def _run_blocking_stream():
+                """在线程池中运行阻塞的 rag_chat_stream 生成器"""
+                try:
+                    for token in rag_chat_stream(
+                        vector_store, query, chat_history, k=RETRIEVAL_K
+                    ):
+                        if cancelled:
+                            # 客户端已断开 → 不再往队列投递，退出生成循环
+                            break
+                        loop.call_soon_threadsafe(queue.put_nowait, ("delta", token))
+                    if not cancelled:
+                        loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
+                except Exception as exc:
+                    logger.error(f"流式对话错误: {exc}")
+                    if not cancelled:
+                        loop.call_soon_threadsafe(queue.put_nowait, ("error", str(exc)))
+
+            # 将阻塞调用卸载到默认线程池
+            loop.run_in_executor(None, _run_blocking_stream)
+
             try:
-                # rag_chat_stream 返回一个生成器，逐 token 产出
-                for token in rag_chat_stream(
-                    vector_store, query, chat_history, k=RETRIEVAL_K
-                ):
-                    # SSE 格式: "data: <json>\n\n"
-                    yield f"data: {json.dumps({'delta': token}, ensure_ascii=False)}\n\n"
-
-                # 流式结束后发送完成信号
-                yield f"data: {json.dumps({'done': True}, ensure_ascii=False)}\n\n"
-
-            except Exception as e:
-                logger.error(f"流式对话错误: {e}")
-                yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+                while True:
+                    msg_type, payload = await queue.get()
+                    if msg_type == "delta":
+                        yield f"data: {json.dumps({'delta': payload}, ensure_ascii=False)}\n\n"
+                    elif msg_type == "done":
+                        yield f"data: {json.dumps({'done': True}, ensure_ascii=False)}\n\n"
+                        break
+                    elif msg_type == "error":
+                        yield f"data: {json.dumps({'error': payload}, ensure_ascii=False)}\n\n"
+                        break
+            except asyncio.CancelledError:
+                # 客户端断开连接（关闭浏览器 / 网络中断）
+                # 设置取消标志 → 线程池中的生成器在下一个 token 时退出
+                cancelled = True
+                logger.info("🔌 SSE 连接已断开（客户端取消），生成器将退出")
+                # 不再 yield — 优雅退出
 
         return StreamingResponse(
             generate_sse(),
@@ -196,7 +349,7 @@ async def chat(
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",  # 禁用 Nginx 缓冲（如果有反向代理）
+                "X-Accel-Buffering": "no",
             },
         )
 
@@ -206,7 +359,6 @@ async def chat(
             result = rag_chat(vector_store, query, chat_history, k=RETRIEVAL_K)
             return JSONResponse(content=result)
         except LLMServiceError as e:
-            # 第 4 层兜底：返回 503 + 结构化中文错误
             logger.error(f"LLM 服务不可用（四层容灾已耗尽）: {e}")
             return JSONResponse(
                 status_code=503,
@@ -245,8 +397,13 @@ async def upload_pdf(file: UploadFile = File(..., description="PDF 文件")):
     global vector_store
 
     # ---- 校验 ----
-    if not file.filename.lower().endswith(".pdf"):
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="仅支持 PDF 文件格式")
+
+    # 🔴 文件名清洗：防路径遍历 (../../etc/passwd) + 防 null 字节注入
+    safe_filename = sanitize_filename(file.filename)
+    if not safe_filename.lower().endswith(".pdf"):
+        safe_filename += ".pdf"
 
     # 读取文件内容并检查大小
     content = await file.read()
@@ -258,7 +415,7 @@ async def upload_pdf(file: UploadFile = File(..., description="PDF 文件")):
 
     # ---- 保存文件 ----
     os.makedirs(PDF_DATA_DIR, exist_ok=True)
-    save_path = os.path.join(PDF_DATA_DIR, file.filename)
+    save_path = os.path.join(PDF_DATA_DIR, safe_filename)
 
     with open(save_path, "wb") as f:
         f.write(content)
@@ -273,7 +430,7 @@ async def upload_pdf(file: UploadFile = File(..., description="PDF 文件")):
         if not documents:
             return JSONResponse({
                 "success": True,
-                "message": f"文件 {file.filename} 已保存，但未提取到有效文本。",
+                "message": f"文件 {safe_filename} 已保存，但未提取到有效文本。",
                 "document_count": 0,
             })
 
@@ -282,9 +439,9 @@ async def upload_pdf(file: UploadFile = File(..., description="PDF 文件")):
 
         return JSONResponse({
             "success": True,
-            "message": f"文件 {file.filename} 已上传，向量库已重建",
+            "message": f"文件 {safe_filename} 已上传，向量库已重建",
             "document_count": info["document_count"],
-            "file_name": file.filename,
+            "file_name": safe_filename,
         })
 
     except Exception as e:

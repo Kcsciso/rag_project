@@ -935,3 +935,179 @@ finally:
 conda activate rag_agent
 python test_stability.py
 ```
+
+---
+
+## 十八、显卡智能自适应与统一运维工具链
+
+> **日期**: 2026-07-21  
+> **变更范围**: `start_services.sh`, `src/config.py`, `check_status.py`, `CLAUDE.md`, `README.md`, `app.py`, `src/rag_chain.py`, `src/pdf_loader.py`, `src/vector_store.py`  
+> **变更目标**: (1) 实现 GPU 智能自适应部署；(2) 引入统一运维管理工具；(3) 修复全项目致命 Bug；(4) 同步 CLAUDE.md 与项目现状
+
+### 18.1 GPU 智能自适应部署（Dynamic GPU Detection）
+
+**问题**: 
+- 原先 `start_services.sh` 和 `src/config.py` 中 GPU 选择硬编码为 `CUDA_VISIBLE_DEVICES=1`
+- 当 GPU 1 被其他用户占满（95%+ 显存）时，vLLM 必然 OOM 崩溃
+- GPU 0 可能有大量空闲显存，但系统无法自动感知和切换
+- 多人共享 A100 服务器场景下，GPU 空闲状态动态变化，手工切换不切实际
+
+**修复方案**: 在三个关键层面引入智能 GPU 探测：
+
+#### (1) Shell 层 — `start_services.sh`
+
+新增 `detect_best_gpu()` 函数：
+
+```
+算法流程:
+  nvidia-smi --query-gpu=index,memory.free
+    │
+    ├── 过滤: 空闲显存 < MIN_FREE_MEMORY_MIB (5 GB) 的 GPU 被排除
+    │
+    ├── 排序: 按空闲显存降序排列
+    │
+    └── 输出: 空闲最大的 GPU 索引 + 实时扫描报告
+```
+
+**新增参数**：
+- `--gpu <id>`: 手动覆盖 GPU 选择（绕过自动检测）
+- 环境变量 `VLLM_GPU_ID`: 同上（优先级高于自动检测）
+- `MIN_FREE_MEMORY_MIB=5120`: 最低空闲显存门槛（MiB）
+
+**启动时输出示例**：
+```
+[STEP]  智能 GPU 检测：扫描所有 GPU 空闲显存...
+        GPU 空闲显存扫描结果:
+          ✓ GPU 0: 23.0 GB 空闲 (可用)
+          ✗ GPU 1: 8.6 GB 空闲 (不足 5120 MiB)
+[INFO]  自动选择 GPU: 0（空闲 23.0 GB，所有候选 GPU 中最大）
+```
+
+#### (2) Python 配置层 — `src/config.py`
+
+新增三个公开 API：
+
+| 函数 | 返回值 | 用途 |
+|------|--------|------|
+| `detect_best_gpu(min_free_mib)` | `int` | 在所有 GPU 中查找空闲显存最大者 |
+| `get_all_gpu_info()` | `List[Dict]` | 返回所有 GPU 的结构化信息（供运维工具使用） |
+| `get_best_gpu()` | `int` | 优先级合并：`VLLM_GPU_ID` 环境变量 > 自动探测 > 默认 0 |
+
+模块级常量 `VLLM_GPU_ID` 在首次 `import src.config` 时自动探测并锁定。
+
+#### (3) 健康检查层 — `check_status.py`
+
+- 新增 `_detect_vllm_process_gpu()`：通过 `ss -tlnp` 定位 vLLM 进程 PID → 读取 `/proc/<pid>/environ` 中的 `CUDA_VISIBLE_DEVICES` → 确定 vLLM 实际绑定到哪张 GPU
+- 服务状态区新增 **"部署 GPU"** 行：`GPU 1 (NVIDIA A100-PCIE-40GB)`
+- GPU 资源状态区新增 **`◀ vLLM`** 标记：直观标识推理服务所在 GPU
+- 综合评估区 GPU 建议改为动态检查所有 GPU（不再硬编码索引 1）
+
+### 18.2 统一运维管理工具
+
+为彻底解决日常对本地服务状态不透明的痛点，引入两个全新运维脚本：
+
+#### `check_status.py` — 统一服务健康检查
+
+```bash
+python check_status.py              # 一次性完整报告
+python check_status.py --watch 10   # 每 10 秒自动刷新
+```
+
+检查项目：
+| 检查项 | 数据来源 | 示例输出 |
+|--------|---------|---------|
+| vLLM 在线状态 + 模型名称 | `GET :8001/v1/models` | `● 在线 — Qwen/Qwen2.5-1.5B-Instruct` |
+| vLLM 部署 GPU | 进程 `/proc/<pid>/environ` | `GPU 1 (NVIDIA A100-PCIE-40GB)` |
+| NewsPage 后端状态 | `GET :8000/api/status` | `● 在线 — 18 个文档片段` |
+| GPU 显存占用 | `nvidia-smi` | `16.4/40.0 GB [███░░░░░] 41%` |
+| GPU 温度/功率 | `nvidia-smi` | `46°C / 86W` |
+| 四层容灾可用性 | 综合判断 | `✗ L1 ✓ L2 ✓ L3 ✓ L4` |
+| 综合评估 + GPU 建议 | 自动推理 | `⚠️ 降级运行中` |
+
+#### `start_services.sh` — 自动化启动脚本
+
+```bash
+./start_services.sh                  # 完整启动 vLLM + FastAPI
+./start_services.sh --vllm-only      # 仅启动 vLLM
+./start_services.sh --fastapi-only   # 仅启动 FastAPI
+./start_services.sh --gpu 0          # 手动指定 GPU 0
+VLLM_GPU_ID=1 ./start_services.sh    # 环境变量指定
+```
+
+关键特性：
+- **启动前端口占用检测** — 显示占用进程名和 PID
+- **智能 GPU 选择** — 自动绑定空闲显存最大的 GPU
+- **vLLM 就绪轮询** — 后台拉起后轮询 `/v1/models`（最长 120s）
+- **优雅退出** — `Ctrl+C` 自动清理 vLLM 后台进程（`trap` 信号处理）
+- **日志自动落盘** — vLLM 输出保存到 `/tmp/vllm_newspage_<timestamp>.log`
+
+### 18.3 致命 Bug 修复（全项目代码审查）
+
+审查发现并修复了 7 个致命/严重 Bug：
+
+| 编号 | 文件:行 | 严重度 | 问题 | 修复 |
+|------|---------|--------|------|------|
+| B1 | `src/config.py:92` | 🔴 致命 | `EMBEDDING_DEVICE` 仅检查环境变量 `CUDA_VISIBLE_DEVICES` 而非 `torch.cuda.is_available()`，GPU 不可用时嵌入模型加载崩溃 | 改用 `torch.cuda.is_available()` |
+| B2 | `src/pdf_loader.py:209` | 🔴 致命 | 命令行入口传入了不存在的 `debug=True` 参数 → `TypeError` | 移除无效参数，改用已有的 `debug_print_chunks()` 函数 |
+| B3 | `src/vector_store.py:527-529` | 🔴 致命 | 同样传入不存在的 `debug=True` 参数 | 改用 `debug_print_vector_store_info()` + `debug_search_similar_with_scores()` |
+| B4 | `app.py:101` | 🟠 严重 | 端口检查硬编码 `localhost:8000/v1`，实际 vLLM 在 8001 —— 启动日志永远不显示"本地 vLLM"通道 | 改为通用的 `localhost` / `127.0.0.1` 检测 |
+| B5 | `src/config.py:88` | 🟠 严重 | `os.environ.setdefault` 不会覆盖已有环境变量 —— 若系统中已设 `HF_ENDPOINT` 为官方源，镜像配置无效 | 改为 `os.environ["HF_ENDPOINT"] = HF_ENDPOINT` 强制执行 |
+| B6 | `src/rag_chain.py:757` | 🟡 中等 | 相似度阈值过滤后 `context_docs=[]` 空上下文仍进入 LLM 调用（浪费推理资源） | 空上下文时跳过 Layer 1/2，直接跳转 Layer 3 纯检索直出 |
+| B7 | `app.py:172` | 🟡 中等 | 无查询长度上限校验，超长输入可导致向量检索/LLM 异常 | 添加 `MAX_QUERY_LENGTH=2000` 校验 |
+
+### 18.4 CLAUDE.md 全面重写
+
+基于实际代码库完整审查，重新编写了 `CLAUDE.md`（详见该文件）。关键修正：
+
+| 项目 | 旧 CLAUDE.md | 新 CLAUDE.md | 修正依据 |
+|------|-------------|-------------|----------|
+| vLLM 端口 | `8000` | **8001** | `src/config.py:57` |
+| 默认模型 | `Qwen/Qwen2.5-7B-Instruct` | **Qwen2.5-1.5B-Instruct** | `src/config.py:59` |
+| GPU 显存利用率 | `0.8` | **0.20** | 实际 vLLM 启动参数 |
+| 上下文长度 | `8192` | **4096** | `--max-model-len` 参数 |
+| 云端降级 | DeepSeek (`deepseek-v4-pro`) | **智谱 GLM-4.7-Flash** (`glm-4.7-flash`) | `src/config.py:29-34` |
+| pyairports 位置 | 项目根目录 | **site-packages**（Conda 环境） | 实际文件系统 |
+| 启动命令 | 端口/模型/参数均不匹配 | **完全对齐实际配置** | 逐项验证 |
+
+新增内容：四层容灾架构图、全链路异常降级覆盖矩阵（8 种故障场景）、GPU 升级路径指南、当前生产配置摘要表。
+
+### 18.5 README.md 同步更新
+
+- 新增"一键启动"章节（`start_services.sh`）
+- 新增"系统健康检查"章节（`check_status.py`）
+- 新增"运维工具清单"汇总表
+- 修正 `dev_log.md` 链接（从 Google 搜索 URL 改为相对路径）
+
+### 18.6 新增/变更文件清单
+
+| 文件 | 变更类型 | 说明 |
+|------|----------|------|
+| `check_status.py` | **新增** | 统一服务健康检查脚本（~530 行） |
+| `start_services.sh` | **新增** | 自动化启动脚本（~390 行） |
+| `src/config.py` | 修改 | 新增 GPU 探测 API（`detect_best_gpu`, `get_all_gpu_info`, `get_best_gpu`, `VLLM_GPU_ID`）；修正 `EMBEDDING_DEVICE` 检测；修正 `HF_ENDPOINT` 强制覆盖 |
+| `src/pdf_loader.py` | 修改 | 修复 CLI 入口 `debug=True` TypeError |
+| `src/vector_store.py` | 修改 | 修复 CLI 入口 `debug=True` TypeError |
+| `src/rag_chain.py` | 修改 | 空上下文短路 Layer 3（流式+非流式双路径）；查询长度上限校验 |
+| `app.py` | 修改 | 端口检查逻辑修正；查询长度上限校验 |
+| `CLAUDE.md` | **重写** | 全面对齐实际代码库配置与架构 |
+| `README.md` | 修改 | 新增运维工具章节与清单 |
+| `dev_log.md` | 追加 | 本章节（十八） |
+
+### 18.7 系统当前健康状态
+
+执行 `python check_status.py` 的真实输出（2026-07-21 14:15）：
+
+```
+vLLM 推理服务        ● 在线      (44ms)
+  └ 已加载模型    Qwen/Qwen2.5-1.5B-Instruct
+  └ 部署 GPU      GPU 1 (NVIDIA A100-PCIE-40GB)
+
+GPU 资源状态:
+  [0]  NVIDIA A100-PCIE-40GB  15.8/40.0 GB [███░░░░░] 39%  ◀ 推荐部署
+  [1]  NVIDIA A100-PCIE-40GB  38.0/40.0 GB [███████░] 95%  ◀ vLLM
+
+四层容灾:  ✓ L1 (vLLM) ✓ L2 (智谱) ✓ L3 (直出) ✓ L4 (错误)
+综合评估:  ✅ 系统完全健康 — vLLM 就绪 (GPU 1)，向量库已加载
+```
+
+> **注意**: GPU 1 显存 95% 占用，vLLM 1.5B 模型仍能运行（~3.7 GB），但剩余空间仅 ~2 GB。若后续需要更大模型或上下文窗口，应通过 `VLLM_GPU_ID=0` 手动切换到空闲空间更大的 GPU 0。
