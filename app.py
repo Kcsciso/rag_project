@@ -46,7 +46,7 @@ from src.vector_store import (
     search_similar,
     get_vector_store_info,
 )
-from src.rag_chain import rag_chat, rag_chat_stream
+from src.rag_chain import rag_chat, rag_chat_stream, LLMServiceError
 
 # ============================================================
 # 日志配置
@@ -81,9 +81,32 @@ vector_store = None
 
 @app.on_event("startup")
 async def startup_event():
-    """应用启动时：加载已有向量库"""
+    """应用启动时：加载已有向量库，并进行配置校验"""
     global vector_store
     logger.info("🚀 NewsPage — 湖南比邻星科技文档智能问答系统 正在启动...")
+
+    # ---- 配置校验：DeepSeek API Key 降级通道可用性 ----
+    from src.config import DEEPSEEK_API_KEY, BASE_URL
+    if DEEPSEEK_API_KEY == "sk-your-deepseek-key-here":
+        logger.warning(
+            "⚠️  DEEPSEEK_API_KEY 仍为默认占位符 'sk-your-deepseek-key-here'，"
+            "DeepSeek 降级通道（第 2 层容灾）将不可用！"
+        )
+        logger.warning(
+            "   请设置环境变量: export DEEPSEEK_API_KEY=<your-deepseek-key>"
+        )
+        logger.warning(
+            "   获取 Key: https://platform.deepseek.com/api_keys"
+        )
+    else:
+        logger.info("✅ DEEPSEEK_API_KEY 已配置，第 2 层 DeepSeek 降级通道可用")
+
+    if BASE_URL == "http://localhost:8000/v1":
+        logger.info("📋 当前主 LLM 通道: 本地 vLLM (http://localhost:8000/v1)")
+    else:
+        logger.info(f"📋 当前主 LLM 通道: {BASE_URL}")
+
+    # ---- 加载向量库 ----
     vector_store = load_vector_store(CHROMA_PERSIST_DIR)
     if vector_store:
         info = get_vector_store_info(vector_store)
@@ -185,6 +208,18 @@ async def chat(
         try:
             result = rag_chat(vector_store, query, chat_history, k=RETRIEVAL_K)
             return JSONResponse(content=result)
+        except LLMServiceError as e:
+            # 第 4 层兜底：返回 503 + 结构化中文错误
+            logger.error(f"LLM 服务不可用（四层容灾已耗尽）: {e}")
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": str(e),
+                    "error_type": "llm_unavailable",
+                    "message": "所有大模型通道（本地 vLLM / 云端 API）当前均不可用，"
+                               "纯文档检索模式也无法完成。请检查服务状态后重试。",
+                },
+            )
         except Exception as e:
             logger.error(f"对话错误: {e}")
             raise HTTPException(status_code=500, detail=str(e))
