@@ -101,8 +101,10 @@ detect_best_gpu() {
     #   2. 过滤空闲显存 < MIN_FREE_MEMORY_MIB 的 GPU（无法容纳模型）
     #   3. 按空闲显存降序排序，取第一名
     #
-    # 输出（stdout）：选中的 GPU 索引（整数）
-    # 返回值：0=成功 / 1=无可用的 GPU / 2=nvidia-smi 不可用
+    # 🔴 输出规范（关键）：
+    #   - stdout（可被 $() 捕获）：有且仅有纯数字 GPU 索引（如 0、1）
+    #   - stderr（终端可见但不污染变量）：所有日志、提示、扫描结果
+    #   - 返回值：0=成功 / 1=无可用的 GPU / 2=nvidia-smi 不可用
     # =================================================================
     if ! command -v nvidia-smi &>/dev/null; then
         echo "-1"
@@ -145,21 +147,22 @@ detect_best_gpu() {
         fi
     done <<< "$gpu_data"
 
-    # 打印扫描结果
-    log_detail "GPU 空闲显存扫描结果:"
+    # 🔴 以下所有日志/提示均重定向到 stderr（>&2），确保 stdout 只有纯数字返回值
+    log_detail "GPU 空闲显存扫描结果:" >&2
     echo -e "$all_info" | while IFS= read -r line; do
-        [ -n "$line" ] && echo -e "        $line"
+        [ -n "$line" ] && echo -e "        $line" >&2
     done
 
     if [ "$best_idx" -ge 0 ]; then
         local best_gb
         best_gb=$(awk "BEGIN {printf \"%.1f\", $best_free / 1024}")
-        log_info "自动选择 GPU: ${BOLD}${best_idx}${NC}（空闲 ${GREEN}${best_gb} GB${NC}，所有候选 GPU 中最大）"
+        log_info "自动选择 GPU: ${BOLD}${best_idx}${NC}（空闲 ${GREEN}${best_gb} GB${NC}，所有候选 GPU 中最大）" >&2
+        # ✅ 唯一的 stdout 输出：纯数字 GPU 索引
         echo "$best_idx"
         return 0
     fi
 
-    log_error "所有 GPU 空闲显存均不足 ${MIN_FREE_MEMORY_MIB} MiB，无法部署 vLLM"
+    log_error "所有 GPU 空闲显存均不足 ${MIN_FREE_MEMORY_MIB} MiB，无法部署 vLLM" >&2
     echo "-1"
     return 1
 }
@@ -169,7 +172,8 @@ export_gpu_env() {
     local gpu_id=$1
     export VLLM_GPU_ID="$gpu_id"
     export CUDA_VISIBLE_DEVICES="$gpu_id"
-    log_detail "已设置: CUDA_VISIBLE_DEVICES=${gpu_id}, VLLM_GPU_ID=${gpu_id}"
+    # 日志输出到 stderr，避免在 $(export_gpu_env) 捕获场景下污染 stdout
+    log_detail "已设置: CUDA_VISIBLE_DEVICES=${gpu_id}, VLLM_GPU_ID=${gpu_id}" >&2
 }
 
 wait_for_vllm() {

@@ -304,18 +304,154 @@ DIRECT_RETRIEVAL_FOOTER = (
 )
 
 
+# ============================================================
+# Query 预处理 — 口语化噪音过滤
+# ============================================================
+
+# 口语化噪音前缀/后缀模式（正则）
+_QUERY_NOISE_PATTERNS = [
+    # 前缀噪音（按长度降序排列，确保长匹配优先）
+    r'^(?:我直接说|我需要知道|我想知道|请帮我写一个|请帮我写|请帮我|请给我写|请给我|请告诉我|我想问下|我想问一下|我想问|我问一下|我问下|我问|我问问|我想了解|我要查|我查一下|我查下|帮我查一下|帮我查下|帮我查|请问一下|请问|麻烦问下|麻烦问一下|麻烦问|那个啥|那个|就是说|就是|我想|我要|给我|帮我|帮忙|来讲一下|来说说|讲一下|说说|请问下|想问下|你给我|你给|整一个|整点|来个|来一个|能不能|可以不可以|可不可以|好不好|行不行|一下|写一个|写个|给一个|给我个|急[！!]?|着急)\s*[，,，、]?\s*',
+    # 后缀噪音
+    r'\s*[，,，、]?\s*(?:相关代码|的代码|怎么写|如何实现|怎么实现|怎么用|如何用|怎么操作|如何操作|是什么意思|是什么|相关的内容|相关的文档|相关的资料|相关的信息|这块|这方面|这个东西|呗|不|吗|呢|啊|吧|的那种|这种|的函数|函数是哪个|函数是什么|的文档|那|那个)[？?！!。.]?\s*$',
+]
+
+# 句中噪音词（可在任何位置匹配并移除）
+_QUERY_INLINE_NOISE = [
+    r'\s*呗[？?！!。.]?\s*',
+    r'\s*就是那个\s*',
+    r'\s*就说那个\s*',
+    r'\s*就那个\s*',
+    r'\s*叫那个\s*',
+    r'\s*那个\s*',
+    r'\s*这个\s*',
+]
+
+# 机械臂领域核心操作词权重表（用于检索加分）
+_DOMAIN_KEYWORD_WEIGHTS = {
+    # ---- 中文核心操作词（高权重） ----
+    "上电":       0.45,
+    "使能":       0.45,
+    "下电":       0.45,
+    "断电":       0.45,
+    "抱闸":       0.45,
+    "松闸":       0.45,
+    "复位":       0.40,
+    "回零":       0.40,
+    "急停":       0.45,
+    "停止":       0.35,
+    "暂停":       0.35,
+    "启动":       0.30,
+    "初始化":     0.35,
+    "连接":       0.25,
+    "断开":       0.30,
+    # ---- 机械臂本体词汇（中权重） ----
+    "机械臂":     0.25,
+    "机器人":     0.20,
+    "关节":       0.30,
+    "位姿":       0.35,
+    "姿态":       0.30,
+    "位置":       0.25,
+    "运动":       0.25,
+    "控制":       0.20,
+    "轨迹":       0.25,
+    "速度":       0.20,
+    "加速度":     0.20,
+    "坐标系":     0.25,
+    "末端":       0.20,
+    "工具":       0.15,
+    # ---- 状态/数据词（低权重） ----
+    "IO":         0.25,
+    "输入":       0.15,
+    "输出":       0.15,
+    "状态":       0.15,
+    "报错":       0.20,
+    "错误":       0.15,
+    "异常":       0.20,
+    "日志":       0.10,
+    "参数":       0.15,
+    "返回值":     0.20,
+    "示例":       0.10,
+    "代码":       0.10,
+    "函数":       0.15,
+    "接口":       0.15,
+}
+
+# 机械臂 SDK 核心函数名（高权重精确匹配）
+_DOMAIN_FUNCTION_NAMES = {
+    # 上电/使能/基础控制
+    "robot_power_on", "robot_power_off", "robot_enable", "robot_disable",
+    "robot_motor_enable", "robot_motor_disable",
+    # 运动控制
+    "robot_movj", "robot_movl", "robot_movec", "robot_stop",
+    # 位姿
+    "get_robot_pose", "robot_get_pose", "get_robot_state",
+    # IO
+    "get_robot_iostate", "robot_get_iostate",
+    # 其他
+    "robot_reset", "robot_home", "robot_socket_start",
+    "robot_set_speed", "robot_get_speed",
+}
+
+
+def _preprocess_query(query: str) -> str:
+    """
+    对用户查询进行口语化噪音过滤，提取核心检索实体。
+
+    处理步骤（迭代执行直到收敛）：
+      1. 剥离噪音前缀（如 "我需要知道"、"请告诉我"、"那个啥"）
+      2. 剥离噪音后缀（如 "相关代码"、"怎么写"、"呗"）
+      3. 剥离句中噪音词（如 "就是那个"、"就那个"）
+      4. 去首尾空白 + 标点
+      5. 如果清洗后为空，返回原始 query（避免过度清洗）
+
+    🔄 迭代策略：多次应用前缀/后缀模式直到字符串不再变化，
+    以处理多层嵌套噪音（如 "我直接说，帮我查一下..."）。
+
+    Args:
+        query: 原始用户输入
+
+    Returns:
+        清洗后的核心查询字符串（用于向量检索）
+    """
+    cleaned = query.strip()
+
+    # 🔄 迭代剥离前缀和后缀，直到收敛
+    max_iterations = 5
+    for _ in range(max_iterations):
+        prev = cleaned
+        for pattern in _QUERY_NOISE_PATTERNS:
+            cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE).strip()
+        # 剥离句中噪音词
+        for inline_pattern in _QUERY_INLINE_NOISE:
+            cleaned = re.sub(inline_pattern, ' ', cleaned, flags=re.IGNORECASE).strip()
+        # 压缩多余空格
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        if cleaned == prev:
+            break  # 收敛
+
+    # 如果清洗后为空或过短，返回原始 query
+    if len(cleaned) < 2:
+        return query.strip()
+
+    logger.debug(f"🔍 Query 预处理: '{query[:60]}...' → '{cleaned[:60]}'")
+    return cleaned
+
+
 def _score_chunk_for_query(chunk_text: str, query: str) -> float:
     """
     对切片内容进行关键词匹配打分，用于按相关性排序。
 
-    支持中英文混合查询：
-      - 提取英文单词/函数名（如 robot_Power_on、movj）
-      - 提取中文关键词（如 上电、使能、位姿）
-      - 对命中函数名的切片给予额外加分
+    【增强版】三层打分机制：
+      ① 基础层：通用 token 命中率（中英文滑动窗口）
+      ② 领域层：机械臂 SDK 核心操作词加权匹配（上电/使能/movj/pose...）
+      ③ 函数层：SDK 函数名精确匹配高额加分
+
+    支持中英文混合查询，对口语化噪音已有 _preprocess_query() 预处理。
 
     Args:
         chunk_text: 文档切片文本
-        query: 用户查询
+        query: 用户查询（建议已通过 _preprocess_query() 清洗）
 
     Returns:
         0.0 ~ 1.0 的相关性得分
@@ -323,53 +459,115 @@ def _score_chunk_for_query(chunk_text: str, query: str) -> float:
     query_lower = query.lower()
     chunk_lower = chunk_text.lower()
 
-    # ---- 提取英文/函数名 tokens ----
+    # ================================================================
+    # 第 ① 层：通用 token 命中率
+    # ================================================================
+    # 提取英文/函数名 tokens
     en_tokens = set()
     for match in re.finditer(r'[a-zA-Z_]\w+', query_lower):
         token = match.group()
-        if len(token) >= 3 and token not in ('请', '给出', '如何', '怎么', '什么', '哪些'):
+        if len(token) >= 2 and token not in ('请', '给出', '如何', '怎么', '什么', '哪些'):
             en_tokens.add(token)
 
-    # ---- 提取中文关键词（2-6 字序列） — ReDoS 防护版 ----
-    zh_tokens = set()
-    # 移除英文和标点，提取纯中文连续序列
+    # 提取中文关键词（2-4 字滑动窗口） — ReDoS 防护 + 噪声过滤
+    zh_tokens_raw = set()
     zh_only = re.sub(r'[a-zA-Z0-9\s\(\)\?\.\？\。\，\、\：\；\（\）\“\”\‘\’\！\!\#\#\$\￥\%\%\……\&\*\-\+\=\[\]\{\}\|\/\\\@\~\`\^]', '', query)
-    # 🔴 ReDoS 防护：限制滑动窗口的输入长度
     MAX_ZH_LENGTH = 200
     if len(zh_only) > MAX_ZH_LENGTH:
         zh_only = zh_only[:MAX_ZH_LENGTH]
-    # 2-4 字的中文滑动窗口
     for size in [2, 3, 4]:
         for i in range(len(zh_only) - size + 1):
             seg = zh_only[i:i+size]
             if seg.strip():
-                zh_tokens.add(seg)
+                zh_tokens_raw.add(seg)
+
+    # 🔍 噪声过滤：移除作为更长 token 子串的短 token
+    # 例如 "机械臂上电" 产生 "机械"、"械臂"、"机械臂"
+    # → "机械"和"械臂"是"机械臂"的子串，属于噪声，移除
+    # 但领域关键词（如"上电"）即使被包含也保留
+    zh_tokens = set()
+    for token in zh_tokens_raw:
+        is_substring = False
+        for other in zh_tokens_raw:
+            if token != other and len(token) < len(other) and token in other:
+                if token not in _DOMAIN_KEYWORD_WEIGHTS:
+                    is_substring = True
+                    break
+        if not is_substring:
+            zh_tokens.add(token)
 
     all_tokens = en_tokens | zh_tokens
     if not all_tokens:
         return 0.5
 
-    # ---- 统计命中 ----
+    # 统计基础命中
     hits = 0
     matched_funcs = set()
     for t in all_tokens:
         if t in chunk_lower:
             hits += 1
-            # 记录命中的函数名（英文大写字母开头或包含下划线）
             if re.match(r'^[a-zA-Z_]\w+$', t) and ('_' in t or any(c.isupper() for c in t[1:])):
                 matched_funcs.add(t)
 
     base_score = hits / len(all_tokens)
 
-    # ---- 函数名命中加分：切片包含查询中提到的函数名 ----
-    func_bonus = 0.0
-    for func_name in matched_funcs:
-        # 检查该函数名是否是切片的核心内容（出现在"函数名称"附近）
-        if f'函数名称 {func_name}' in chunk_text or f'{func_name}(' in chunk_text:
-            func_bonus += 0.3
+    # ================================================================
+    # 第 ② 层：机械臂领域核心操作词加权匹配
+    # ================================================================
+    domain_bonus = 0.0
+    matched_domain_keywords = set()
 
-    # 上限 1.0
-    return min(base_score + func_bonus, 1.0)
+    for keyword, weight in _DOMAIN_KEYWORD_WEIGHTS.items():
+        kw_lower = keyword.lower()
+        # 检查查询中是否包含该领域词
+        if kw_lower in query_lower:
+            # 检查切片中是否也包含（确保是真正的命中，而非查询单方面包含）
+            if kw_lower in chunk_lower:
+                domain_bonus += weight
+                matched_domain_keywords.add(keyword)
+
+    # 领域加分上限 1.0（防止堆积过多低权重词过度抬高分数）
+    domain_bonus = min(domain_bonus, 1.0)
+
+    # ================================================================
+    # 第 ③ 层：SDK 函数名精确匹配高额加分
+    # ================================================================
+    func_bonus = 0.0
+    matched_func_names = set()
+
+    for func_name in _DOMAIN_FUNCTION_NAMES:
+        fn_lower = func_name.lower()
+        if fn_lower in query_lower or fn_lower.replace('robot_', '') in query_lower:
+            # 查询提到了这个函数 → 检查切片中是否包含
+            if fn_lower in chunk_lower or f'函数名称 {fn_lower}' in chunk_lower:
+                func_bonus += 0.50  # SDK 函数名精确命中 → 高额加分
+                matched_func_names.add(func_name)
+            elif fn_lower.replace('_', '') in chunk_lower.replace('_', ''):
+                # 部分匹配（如 robotpoweron vs robot_Power_on）
+                func_bonus += 0.25
+                matched_func_names.add(func_name + "(部分)")
+
+    # 通用函数名加分（保持原有的逻辑作为补充）
+    for func_name in matched_funcs:
+        if func_name not in matched_func_names:
+            if f'函数名称 {func_name}' in chunk_text or f'{func_name}(' in chunk_text:
+                func_bonus += 0.30
+
+    # 函数名加分上限 1.0
+    func_bonus = min(func_bonus, 1.0)
+
+    # ================================================================
+    # 综合得分 = 基础分 + 领域分 + 函数分（上限 1.0）
+    #
+    # 设计原则：采用加法模型。领域词和函数名命中直接叠加到基础分上，
+    # 确保核心操作词（如"上电"domain_bonus=0.45）能独立"拯救"
+    # 一个不含泛词（如"机械臂"）的技术函数切片。
+    # 乘法模型的问题：低 base_score × 高 bonus = 仍低，无法纠正。
+    # ================================================================
+    final_score = base_score + domain_bonus + func_bonus
+    final_score = min(final_score, 1.0)
+
+    return final_score
 
 
 def _extract_structured_content(context_docs: List, query: str) -> str:
@@ -854,6 +1052,75 @@ def _build_messages(
 
 
 # ============================================================
+# 混合检索 — 向量搜索 + 关键词重排序
+# ============================================================
+
+def _hybrid_retrieve(
+    vector_store,
+    query: str,
+    k: int = RETRIEVAL_K,
+    threshold: float = SIMILARITY_THRESHOLD,
+    fetch_factor: int = 3,
+) -> List:
+    """
+    混合检索：向量相似度初筛 + 领域关键词重排序。
+
+    【为什么需要混合检索？】
+
+    all-MiniLM-L6-v2 是英文优化嵌入模型，对中文技术查询的语义匹配
+    精度有限。例如 "关节空间运动 movj 参数" 的向量可能把 robot_stop
+    切片排在 movj 切片前面。单纯依赖向量 Top-K 极易漏掉正确答案。
+
+    混合检索策略：
+      1. 向量搜索：取 fetch_factor × k 个候选切片（扩大召回池）
+      2. 相似度阈值：过滤 distance > threshold 的候选
+      3. 关键词重排序：对通过阈值的候选，使用 _score_chunk_for_query
+         按领域关键词命中率重新打分
+      4. 返回 Top-K：取重排序后的前 k 个切片
+
+    Args:
+        vector_store: ChromaDB 实例
+        query: 清洗后的查询字符串
+        k: 最终返回的切片数量
+        threshold: 相似度阈值
+        fetch_factor: 候选池放大倍数
+
+    Returns:
+        Top-K 个重排序后的 Document 列表
+    """
+    try:
+        # 第 1 步：向量搜索 — 扩大候选池（阈值略微放宽 5%，避免边缘相关切片被误杀）
+        fetch_k = k * fetch_factor
+        relaxed_threshold = min(threshold * 1.05, 0.85) if threshold else None
+        results_with_scores = search_similar_with_threshold(
+            vector_store, query, k=fetch_k, threshold=relaxed_threshold
+        )
+
+        if not results_with_scores:
+            return []
+
+        # 第 2 步：关键词重排序
+        scored = []
+        for doc in results_with_scores:
+            keyword_score = _score_chunk_for_query(doc.page_content, query)
+            scored.append((keyword_score, doc))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        # 第 3 步：返回 Top-K
+        top_docs = [doc for _, doc in scored[:k]]
+        logger.info(
+            f"🔀 混合检索: 向量召回 {len(results_with_scores)} → "
+            f"关键词重排 → 输出 Top-{len(top_docs)}"
+        )
+        return top_docs
+
+    except Exception as e:
+        logger.error(f"❌ 混合检索失败: {type(e).__name__}: {e}")
+        return []
+
+
+# ============================================================
 # 核心 API：RAG 对话（非流式）— 四层金字塔容灾
 # ============================================================
 
@@ -900,14 +1167,14 @@ def rag_chat(
     Raises:
         LLMServiceError: 四层全部失败时抛出（第 4 层兜底）
     """
-    # ---- ① 检索 (Retrieve) — 带相似度阈值过滤 ----
-    try:
-        context_docs = search_similar_with_threshold(
-            vector_store, query, k=k, threshold=SIMILARITY_THRESHOLD
-        )
-    except Exception as e:
-        logger.error(f"❌ 向量检索失败: {type(e).__name__}: {e}")
-        context_docs = []  # 检索失败时使用空上下文，让 Layer 3 优雅处理
+    # ---- ① 检索 (Retrieve) — Query 预处理 + 混合检索 ----
+    # 🔍 口语化噪音剥离：提升向量检索命中率
+    search_query = _preprocess_query(query)
+    context_docs = _hybrid_retrieve(
+        vector_store, search_query, k=k,
+        threshold=SIMILARITY_THRESHOLD,
+        fetch_factor=4,  # 多取 4 倍候选，用关键词评分重排序
+    )
 
     if not context_docs:
         logger.info(
@@ -1033,14 +1300,14 @@ def rag_chat_stream(
     Raises:
         LLMServiceError: 四层全部失败时抛出（第 4 层兜底）
     """
-    # ---- ① 检索 — 带相似度阈值过滤 ----
-    try:
-        context_docs = search_similar_with_threshold(
-            vector_store, query, k=k, threshold=SIMILARITY_THRESHOLD
-        )
-    except Exception as e:
-        logger.error(f"❌ 向量检索失败: {type(e).__name__}: {e}")
-        context_docs = []  # 检索失败时使用空上下文
+    # ---- ① 检索 — Query 预处理 + 混合检索 ----
+    # 🔍 口语化噪音剥离 + 向量检索 + 关键词重排序
+    search_query = _preprocess_query(query)
+    context_docs = _hybrid_retrieve(
+        vector_store, search_query, k=k,
+        threshold=SIMILARITY_THRESHOLD,
+        fetch_factor=3,
+    )
 
     if not context_docs:
         logger.info(
