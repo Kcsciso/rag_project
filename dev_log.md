@@ -1886,3 +1886,37 @@ def _autocut_knee(rrf_scores):
 |------|------|
 | `frontend_server.py` | 前端 UI 独立服务（端口 8501） |
 | `test_rag_eval.py` | 防过拟合自动化评测（8 用例） |
+
+---
+
+## 二十五、阶段二：多模态文档解析架构升级
+
+> **日期**: 2026-07-22  
+> **变更范围**: `src/multimodal_loader.py` (新建), `src/config.py`, `app.py`  
+> **新增依赖**: PyMuPDF, pdfplumber  
+> **新增文档**: JAKA Zu APP 使用手册 (11MB, 524 嵌入图片, 607 chunks)
+
+### 25.1 多模态解析器
+
+新建 `src/multimodal_loader.py`：
+
+| 能力 | 依赖 | 输出 |
+|------|------|------|
+| 表格提取 | pdfplumber | Markdown 表格 |
+| 图片检测+Caption | PyMuPDF | `[Image: caption]` 标签 |
+| 增强文本 | pdfplumber+pypdf | 结构化 Markdown |
+
+**智能路由**: `app.py` 上传端点自动检测 PDF 含表格/图片→增强解析，纯文本→标准 pypdf。
+
+### 25.2 JAKA 产品接入
+
+- 新增产品规则: `JAKA/Zu/MiniCab/节卡`
+- JAKA 手册: 520 chunks, 190 图片 Caption 注入
+- 特征查询验证: MiniCab VBrake 公式 ✅ / TCP 四点设置 ✅ / 视觉套件 ⚠️ (文档未涉及)
+
+### 25.3 评测
+
+| 阶段 | chunks | 通过率 |
+|------|--------|--------|
+| 纯 SDK | 87 | 88% (7/8) |
+| SDK + JAKA | 607 | 75% (6/8) |

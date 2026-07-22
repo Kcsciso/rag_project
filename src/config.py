@@ -171,6 +171,11 @@ PRODUCT_MAPPING_RULES = [
         "filename_patterns": ["OpenC3", "openc3", "六轴机械臂", "collrob", "六轴"],
         "content_keywords": ["六轴", "collrob", "OpenC3", "机械臂"],
     },
+    {
+        "product_id": "JAKA",
+        "filename_patterns": ["JAKA", "jaka", "Zu", "MiniCab", "节卡"],
+        "content_keywords": ["JAKA", "Zu", "MiniCab", "Modbus", "Profinet", "节卡"],
+    },
 ]
 
 # ---- 产品意图路由规则（查询阶段：用户 query → product_id） ----
@@ -192,6 +197,14 @@ PRODUCT_ROUTER_RULES = [
         "keywords": [
             "OpenC3", "openc3", "collrob", "六轴",
             "六轴机械臂", "OpenC3六轴",
+        ],
+        "priority": 10,
+    },
+    {
+        "product_id": "JAKA",
+        "keywords": [
+            "JAKA", "jaka", "Zu", "MiniCab", "节卡", "Zu APP",
+            "JAKA Zu", "Modbus", "Profinet",
         ],
         "priority": 10,
     },

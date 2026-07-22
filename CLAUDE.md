@@ -138,6 +138,7 @@ conda run -n rag_agent python tunnel.py --token <YOUR_NGROK_AUTHTOKEN>
 | `src/vector_store.py` | **向量知识库** — bge-small-zh-v1.5 (512维) + ONNX 回退双轨嵌入；**BM25 稀疏检索**（jieba 分词 + 正则标识符保护 + 自定义 SDK 函数词典）；`search_similar_with_threshold()` 阈值过滤；`cleanup_vector_store()` 资源释放 |
 | `src/rag_chain.py` | **RAG 核心管线** — 四层金字塔容灾；`_preprocess_query` 口语噪音剥离；`_hybrid_retrieve` **BM25+向量 RRF 融合 + Autocut 动态截断**；`_score_chunk_for_query` 三层加权打分；`_resolve_vllm_model()` 动态模型解析；防退化采样参数；Prompt 注入防御；`shutdown_clients()` |
 | `app.py` | **FastAPI 主入口 (7860)** — 5 条路由 + 安全中间件；SSE 防泄露；`shutdown` 事件；产品路由（`product_id` + `GET /api/products`） |
+| `src/multimodal_loader.py` | **多模态解析** — PyMuPDF + pdfplumber 表格→Markdown、图片→Caption 注入、智能路由（纯文本→标准 pypdf） |
 | `frontend_server.py` | **前端 UI 服务 (8501)** — Jinja2 模板渲染 + `/api/*` 反向代理到 7860 后端 |
 | `check_status.py` | **健康检查** — vLLM + FastAPI + GPU 显存/温度/功率 + 四层容灾可用性 + vLLM 部署 GPU 识别 |
 | `start_services.sh` | **一键启动** — GPU 智能选择（`detect_best_gpu` stdout/stderr 严格隔离）+ 端口检测 + vLLM 后台拉起 + FastAPI 启动 + 优雅退出 |
