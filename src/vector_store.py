@@ -46,6 +46,7 @@
 """
 
 import os
+import re
 import logging
 from typing import List, Optional, Any, Tuple
 
@@ -59,6 +60,7 @@ from .config import (
     RETRIEVAL_K,
     SIMILARITY_THRESHOLD,
     FALLBACK_TO_ONNX,
+    PRODUCT_MAPPING_RULES,
 )
 
 logger = logging.getLogger(__name__)
@@ -328,7 +330,158 @@ def create_vector_store(
     )
 
     logger.info(f"✅ 向量库创建完成，持久化目录: {persist_dir}")
+
+    # 🔴 同步构建 BM25 索引（零显存开销，精确关键词匹配）
+    build_bm25_index(documents, persist_dir)
+
     return vector_store
+
+
+def clear_vector_store(persist_dir: str = CHROMA_PERSIST_DIR) -> bool:
+    """
+    彻底清空 ChromaDB 向量数据库。
+
+    操作步骤：
+      1. 加载现有 Collection
+      2. 删除 Collection 中所有记录（保留 Collection 元数据/索引结构）
+      3. 返回是否成功
+
+    注意：此操作不可逆！所有已索引的文档片段将被永久删除。
+
+    Args:
+        persist_dir: ChromaDB 持久化目录路径
+
+    Returns:
+        True 如果清空成功，False 如果向量库不存在或清空失败
+    """
+    import shutil
+
+    logger.warning("🧹 正在清空 ChromaDB 向量数据库...")
+
+    try:
+        # 方案 A：如果向量库已加载，直接通过 Collection API 删除所有记录
+        embedding_fn = get_embedding_function()
+        vector_store = Chroma(
+            persist_directory=persist_dir,
+            embedding_function=embedding_fn,
+            collection_name="rag_documents",
+        )
+        count = vector_store._collection.count()
+        if count > 0:
+            # 获取所有记录 ID 并批量删除
+            all_ids = vector_store._collection.get()["ids"]
+            if all_ids:
+                vector_store._collection.delete(ids=all_ids)
+                logger.info(f"✅ 已通过 Collection API 删除 {len(all_ids)} 条记录")
+        else:
+            logger.info("📭 向量库已为空，无需删除")
+
+        logger.info("✅ ChromaDB 向量数据库已清空")
+        return True
+
+    except Exception as e:
+        logger.warning(f"Collection API 删除失败，尝试物理删除目录: {e}")
+        # 方案 B：物理删除持久化目录（暴力但可靠）
+        try:
+            if os.path.exists(persist_dir):
+                shutil.rmtree(persist_dir)
+                os.makedirs(persist_dir, exist_ok=True)
+                logger.info("✅ 已通过物理删除清空向量库目录")
+                return True
+        except Exception as e2:
+            logger.error(f"❌ 物理删除向量库目录失败: {e2}")
+            return False
+
+    return True
+
+
+def resolve_product_id(filename: str) -> str:
+    """
+    根据文件名解析对应的产品标识。
+
+    使用 PRODUCT_MAPPING_RULES 中的 filename_patterns 进行匹配，
+    不区分大小写，任一模式命中即返回对应 product_id。
+
+    若多个规则同时匹配，返回第一个匹配的（规则列表顺序即优先级）。
+
+    Args:
+        filename: 上传的 PDF 文件名（已通过 sanitize_filename 清洗）
+
+    Returns:
+        product_id 字符串，如 "OpenR6"、"OpenC3"
+        若无法识别则返回 "unknown"
+    """
+    filename_lower = filename.lower()
+    for rule in PRODUCT_MAPPING_RULES:
+        for pattern in rule["filename_patterns"]:
+            if pattern.lower() in filename_lower:
+                logger.info(
+                    f"🏷️  产品识别: '{filename}' → product_id='{rule['product_id']}' "
+                    f"(命中模式: '{pattern}')"
+                )
+                return rule["product_id"]
+
+    logger.warning(f"⚠️  无法识别产品: '{filename}'，标记为 'unknown'")
+    return "unknown"
+
+
+def get_registered_products(
+    persist_dir: str = CHROMA_PERSIST_DIR,
+) -> List[str]:
+    """
+    获取当前向量库中已注册（已入库）的产品 ID 列表。
+
+    通过查询 ChromaDB Collection 中所有文档的 metadata，
+    提取去重后的 product_id 值。
+
+    Args:
+        persist_dir: ChromaDB 持久化目录路径
+
+    Returns:
+        已注册的产品 ID 列表（如 ["OpenR6", "OpenC3"]），
+        若向量库为空或不存在则返回空列表
+    """
+    if not os.path.exists(persist_dir):
+        return []
+
+    has_data = any(
+        f.endswith(".sqlite3") or f.endswith(".parquet")
+        for f in os.listdir(persist_dir)
+    )
+    if not has_data:
+        return []
+
+    try:
+        embedding_fn = get_embedding_function()
+        vector_store = Chroma(
+            persist_directory=persist_dir,
+            embedding_function=embedding_fn,
+            collection_name="rag_documents",
+        )
+
+        # 获取所有文档的 metadata
+        collection_data = vector_store._collection.get(include=["metadatas"])
+        metadatas = collection_data.get("metadatas", [])
+
+        if not metadatas:
+            return []
+
+        # 提取去重的 product_id（set 去重 + 过滤无效值）
+        products = set()
+        for meta in metadatas:
+            pid = (meta.get("product_id") or "").strip()
+            # 🔴 严格过滤：排除空值、unknown、纯空白
+            if pid and pid.lower() != "unknown":
+                products.add(pid)
+
+        # 🔴 保序去重：set 去重后按字母排序，确保每次返回结果一致
+        product_list = sorted(products)
+        logger.info(f"📋 已注册产品列表: {product_list}")
+        return product_list
+
+    except Exception as e:
+        logger.warning(f"获取已注册产品列表失败: {e}")
+        return []
 
 
 def load_vector_store(
@@ -424,9 +577,10 @@ def search_similar_with_threshold(
     query: str,
     k: int = RETRIEVAL_K,
     threshold: Optional[float] = SIMILARITY_THRESHOLD,
+    product_id: Optional[str] = None,
 ) -> List[Document]:
     """
-    带相似度阈值过滤的向量检索。
+    带相似度阈值过滤的向量检索（支持产品级物理隔离）。
 
     【为什么需要阈值过滤？】
 
@@ -439,6 +593,11 @@ def search_similar_with_threshold(
       1. 使用 similarity_search_with_score 获取 (Document, distance) 元组
       2. 只保留 distance <= threshold 的切片
       3. 如果没有任何切片通过阈值，返回空列表 → 上层优雅处理
+
+    【产品级物理隔离】
+
+    当指定 product_id 时，ChromaDB 查询会添加 where 过滤条件，
+    确保只检索该产品的切片，实现 100% 物理隔离（绝不跨库召回）。
 
     【ChromaDB 距离度量说明】
 
@@ -459,12 +618,37 @@ def search_similar_with_threshold(
         query: 用户查询字符串
         k: 检索候选数量
         threshold: 距离阈值，None 表示不过滤
+        product_id: 产品标识（如 "OpenR6"），None 表示不过滤产品
 
     Returns:
         通过阈值过滤的 Document 列表（可能为空列表）
     """
+    # 构建 ChromaDB where 过滤条件
+    chroma_filter = None
+    if product_id:
+        chroma_filter = {"product_id": product_id}
+
     # 使用 similarity_search_with_score 获取带距离分数的检索结果
-    results_with_scores = vector_store.similarity_search_with_score(query, k=k)
+    # langchain-chroma 支持 filter 参数，底层转换为 ChromaDB 的 where 条件
+    try:
+        if chroma_filter:
+            results_with_scores = vector_store.similarity_search_with_score(
+                query, k=k, filter=chroma_filter
+            )
+        else:
+            results_with_scores = vector_store.similarity_search_with_score(query, k=k)
+    except Exception as e:
+        logger.warning(
+            f"⚠️  similarity_search_with_score 不支持 filter 参数，"
+            f"降级为后置过滤: {e}"
+        )
+        # 回退：不使用 filter，在结果中手动过滤
+        results_with_scores = vector_store.similarity_search_with_score(query, k=k)
+        if product_id:
+            results_with_scores = [
+                (doc, score) for doc, score in results_with_scores
+                if doc.metadata.get("product_id") == product_id
+            ]
 
     if threshold is None:
         # 禁用阈值过滤，退化为普通 search_similar 行为
@@ -511,6 +695,148 @@ def get_vector_store_info(vector_store: Chroma) -> dict:
         return {"document_count": 0}
 
 
+# ============================================================
+# BM25 稀疏检索索引（精确关键词匹配，零显存开销）
+# ============================================================
+
+import jieba
+
+# 全局 BM25 索引：{product_id: BM25Okapi}
+_bm25_indexes: dict = {}
+
+# BM25 索引对应的文档文本列表：{product_id: [text1, text2, ...]}
+_bm25_corpus: dict = {}
+
+
+# ── jieba 自定义词典：将 SDK 函数名注册为不可分割的整词 ──
+_SDK_FUNCTION_NAMES = [
+    # OpenR6
+    "set_robot_power_on", "set_robot_power_off", "set_robot_arm_home",
+    "set_move_line", "set_robot_io_output", "set_robot_io_status",
+    "get_robot_joint_angle_all", "get_robot_pose", "robot_socket_start",
+    "set_joint_degree_by_number",
+    # OpenC3
+    "robot_Power_on", "robot_enable", "robot_disable",
+    "robot_movj", "robot_movl", "robot_movec", "robot_stop",
+    "robot_brkopen", "robot_brkclose", "robot_motor_enable", "robot_motor_disable",
+    "get_robot_joint_all", "get_robot_iostate", "robot_get_pose",
+]
+for _func in _SDK_FUNCTION_NAMES:
+    jieba.add_word(_func, freq=999, tag='eng')
+    # 也注册去除 robot_ 前缀的短名（用户可能直接搜索 "movl"）
+    if _func.startswith("robot_"):
+        short = _func[6:]  # "robot_movl" → "movl"
+        if len(short) >= 3:
+            jieba.add_word(short, freq=500, tag='eng')
+    if _func.startswith("set_"):
+        short = _func  # keep as-is for set_xxx functions
+jieba.add_word("py_dll", freq=999, tag='eng')
+jieba.add_word("collrob_sdk", freq=999, tag='eng')
+
+# ── 正则预分器：保留下划线连接的标识符作为原子 token ──
+_IDENTIFIER_RE = re.compile(r'[a-zA-Z_][a-zA-Z0-9_]*')
+
+
+def _tokenize_for_bm25(text: str) -> List[str]:
+    """
+    BM25 分词器：jieba 中文分词 + 英文标识符保护。
+
+    1. 先用正则提取所有英文标识符（如 set_move_line），防止 jieba 将
+       下划线连接的函数名切成碎片（set, _, move, _, line）。
+    2. 再从文本中移除已提取的标识符，剩余中文部分交给 jieba 分词。
+    3. 最终返回小写的 token 列表。
+    """
+    tokens = []
+
+    # 🔴 Step 1: 提取英文标识符作为不可分割的整词
+    identifiers = _IDENTIFIER_RE.findall(text)
+    for ident in identifiers:
+        ident_lower = ident.lower().strip('_')
+        if len(ident_lower) >= 2 and not ident_lower.startswith('0x'):
+            tokens.append(ident_lower)
+
+    # 🔴 Step 2: 移除标识符后再 jieba 分词中文部分
+    text_no_ident = _IDENTIFIER_RE.sub(' ', text)
+    for word in jieba.cut(text_no_ident):
+        word = word.strip()
+        if not word or word in (' ', '_', '.', ',', ':', ';'):
+            continue
+        tokens.append(word.lower())
+
+    return tokens
+
+
+def build_bm25_index(documents: list, persist_dir: str = CHROMA_PERSIST_DIR):
+    """
+    为每个产品构建独立的 BM25 索引。
+
+    遍历所有 Document，按 product_id 分组后分别构建 BM25Okapi 索引，
+    存入全局 `_bm25_indexes` 和 `_bm25_corpus` 字典。
+
+    Args:
+        documents: LangChain Document 列表（每个 doc.metadata 含 product_id）
+        persist_dir: 暂不使用（BM25 为内存索引，无需持久化）
+    """
+    global _bm25_indexes, _bm25_corpus
+    from rank_bm25 import BM25Okapi
+
+    # 按 product_id 分组
+    product_docs: Dict[str, list] = {}
+    for doc in documents:
+        pid = doc.metadata.get("product_id", "unknown")
+        if pid not in product_docs:
+            product_docs[pid] = []
+        product_docs[pid].append(doc)
+
+    for pid, docs in product_docs.items():
+        # 分词
+        tokenized = [_tokenize_for_bm25(doc.page_content) for doc in docs]
+        if not tokenized:
+            continue
+        _bm25_indexes[pid] = BM25Okapi(tokenized)
+        _bm25_corpus[pid] = docs
+        logger.info(f"📊 BM25 索引已构建: product_id='{pid}', {len(docs)} 个文档片段")
+
+    total = sum(len(v) for v in _bm25_corpus.values())
+    logger.info(f"✅ BM25 混合检索就绪: {len(_bm25_indexes)} 个产品索引, 共 {total} 个片段")
+
+
+def bm25_search(
+    query: str,
+    product_id: str,
+    k: int = 5,
+) -> list:
+    """
+    对指定产品的 BM25 索引执行关键词检索。
+
+    Args:
+        query: 查询字符串
+        product_id: 产品标识
+        k: 返回的文档数量
+
+    Returns:
+        [(Document, bm25_score), ...] 按 BM25 得分降序排列
+    """
+    if product_id not in _bm25_indexes:
+        return []
+
+    bm25 = _bm25_indexes[product_id]
+    corpus = _bm25_corpus[product_id]
+    tokenized_query = _tokenize_for_bm25(query)
+
+    scores = bm25.get_scores(tokenized_query)
+    # 配对 (index, score) 并排序
+    indexed_scores = list(enumerate(scores))
+    indexed_scores.sort(key=lambda x: x[1], reverse=True)
+
+    results = []
+    for idx, score in indexed_scores[:k]:
+        if score > 0:  # 只保留有正得分的文档
+            results.append((corpus[idx], float(score)))
+
+    return results
+
+
 def cleanup_vector_store():
     """
     释放嵌入模型和 ChromaDB 客户端持有的资源。
@@ -519,13 +845,15 @@ def cleanup_vector_store():
     ChromaDB 的 SQLite 连接在其 Python 对象被 GC 回收时自动关闭，
     此函数确保显式释放并及时。
     """
-    global _embedding_function
+    global _embedding_function, _bm25_indexes, _bm25_corpus
     logger.info("🧹 正在清理向量库资源...")
     if _embedding_function is not None:
-        # 如果嵌入函数持有 GPU 资源（如 HF 模型），释放引用让 GC 回收
         _embedding_function = None
         logger.info("✅ 嵌入函数引用已释放")
-    # ChromaDB 的 persist() 是自动的，手动调用确保落盘
+    # 清空 BM25 索引
+    _bm25_indexes.clear()
+    _bm25_corpus.clear()
+    logger.info("✅ BM25 索引已清空")
     logger.info("✅ 向量库资源清理完成")
 
 

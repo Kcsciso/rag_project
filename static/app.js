@@ -47,18 +47,27 @@ const kbReady        = document.getElementById("kbReady");
 const kbCount        = document.getElementById("kbCount");
 const refreshStatusBtn = document.getElementById("refreshStatus");
 
+// 产品标签栏（嵌入右侧边栏"知识库状态"卡片内）
+const productTagsSection   = document.getElementById("productTagsSection");
+const productTagsContainer = document.getElementById("productTagsContainer");
+
 // ============================================================
 // 状态
 // ============================================================
-let chatHistory = [];
-let isWaiting   = false;
+let chatHistory        = [];
+let isWaiting          = false;
+let selectedProductId  = null;  // 🏷️ 当前选中的产品 ID（null=未筛选）
 
 // ============================================================
-// 初始化
+// 初始化 — 自执行（script 在 </body> 前，DOM 已完全解析）
 // ============================================================
-document.addEventListener("DOMContentLoaded", () => {
+// 不使用 DOMContentLoaded 事件监听，因为 script 位于 <body> 末尾时
+// DOM 已解析完毕，DOMContentLoaded 可能已错过或存在竞态。
+// 直接自执行初始化，100% 可靠。
+(function initApp() {
     checkStatus();
-});
+    loadProducts();
+})();
 
 // ============================================================
 // 知识库状态
@@ -79,6 +88,74 @@ async function checkStatus() {
     } catch (_) {
         statusText.textContent = "状态查询失败";
         kbReady.textContent   = "❌ 连接失败";
+    }
+}
+
+// ============================================================
+// 产品知识库标签
+// ============================================================
+async function loadProducts() {
+    // 🔴 防御：DOM 元素可能因浏览器缓存旧版 HTML 而不存在
+    if (!productTagsSection || !productTagsContainer) {
+        console.warn("产品标签栏 DOM 元素未就绪，跳过加载");
+        return;
+    }
+    try {
+        const resp = await fetch("/api/products");
+        const data = await resp.json();
+
+        // 🔴 前后端双重去重：Set 去重 + 过滤空值，防止重复标签
+        const uniqueProducts = [...new Set((data.products || []).filter(p => p && p !== "unknown"))];
+
+        if (uniqueProducts.length === 0) {
+            productTagsSection.style.display = "none";
+            return;
+        }
+
+        productTagsSection.style.display = "block";
+        // 🔴 渲染前强制清空容器，防止多次调用时累积重复
+        productTagsContainer.innerHTML = "";
+
+        uniqueProducts.forEach((pid) => {
+            const tag = document.createElement("span");
+            tag.className = "product-tag";
+            tag.dataset.productId = pid;
+            tag.innerHTML = `<span class="tag-dot"></span>${escapeHtml(pid)}`;
+            tag.title = `点击仅检索 ${pid} 的知识库`;
+            tag.addEventListener("click", () => toggleProductTag(pid, tag));
+            productTagsContainer.appendChild(tag);
+        });
+
+        // 如果之前已选中产品但该产品已不在列表中，清除选中
+        if (selectedProductId && !uniqueProducts.includes(selectedProductId)) {
+            selectedProductId = null;
+        }
+
+        // 恢复选中状态
+        if (selectedProductId) {
+            const activeTag = productTagsContainer.querySelector(`[data-product-id="${selectedProductId}"]`);
+            if (activeTag) activeTag.classList.add("active");
+        }
+    } catch (e) {
+        console.error("加载产品列表失败:", e);
+        if (productTagsSection) productTagsSection.style.display = "none";
+    }
+}
+
+function toggleProductTag(productId, tagEl) {
+    if (selectedProductId === productId) {
+        // 取消选中 → 恢复全设备检索
+        selectedProductId = null;
+        if (productTagsContainer) {
+            productTagsContainer.querySelectorAll(".product-tag").forEach(t => t.classList.remove("active"));
+        }
+    } else {
+        // 选中新产品
+        selectedProductId = productId;
+        if (productTagsContainer) {
+            productTagsContainer.querySelectorAll(".product-tag").forEach(t => t.classList.remove("active"));
+        }
+        tagEl.classList.add("active");
     }
 }
 
@@ -128,6 +205,9 @@ async function sendMessage() {
         fd.append("query", query);
         fd.append("history", JSON.stringify(chatHistory.slice(0, -1)));
         fd.append("stream", "true");
+        if (selectedProductId) {
+            fd.append("product_id", selectedProductId);
+        }
 
         const resp = await fetch("/api/chat", { method: "POST", body: fd });
         if (!resp.ok) {
@@ -290,6 +370,7 @@ async function uploadFile(file) {
             progressText.textContent = "完成！";
             showUploadResult(`✅ ${data.message}（${data.document_count} 个片段）`, "success");
             await checkStatus();
+            await loadProducts();  // 刷新产品标签
         } else {
             throw new Error(data.detail || data.message || "上传失败");
         }

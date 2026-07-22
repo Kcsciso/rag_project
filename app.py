@@ -45,6 +45,8 @@ from src.vector_store import (
     create_vector_store,
     load_vector_store,
     get_vector_store_info,
+    clear_vector_store,
+    get_registered_products,
 )
 from src.rag_chain import rag_chat, rag_chat_stream, LLMServiceError, shutdown_clients
 
@@ -236,6 +238,7 @@ async def chat(
     query: str = Form(..., description="用户问题"),
     history: Optional[str] = Form(None, description="JSON 格式的对话历史"),
     stream: bool = Form(True, description="是否使用流式输出"),
+    product_id: Optional[str] = Form(None, description="产品标识（如 OpenR6 / OpenC3），可选，不传则自动识别"),
 ):
     """
     RAG 对话接口 — POST /api/chat
@@ -245,17 +248,25 @@ async def chat(
       - history 校验：仅允许 user/assistant 角色、截断超长内容
       - 长度上限：query ≤ 2000 字符
 
+    【产品路由 — 新增】
+      - product_id 参数：前端可通过下拉框强指定产品范围
+      - 若未提供 product_id，后端自动运行 Product Router 识别
+      - 若无法识别产品，返回主动澄清反问（needs_clarification=True）
+
     【请求参数（表单格式）】
     - query (必填): 用户输入的问题
     - history (可选): JSON 字符串，格式 [{"role":"user","content":"..."}, ...]
     - stream (可选): 是否流式输出，默认 True
+    - product_id (可选): 产品标识，如 "OpenR6" 或 "OpenC3"
 
     【响应格式】
     - 流式 (stream=true): SSE (Server-Sent Events) 事件流
         格式: data: {"delta": "文本增量"}\n\n
         结束: data: {"sources": [...], "done": true}\n\n
+        澄清: data: {"delta": "请问您询问的是..."}\n\n (needs_clarification=true)
     - 非流式 (stream=false): JSON
-        格式: {"answer": "完整回答", "sources": [...], "model": "..."}
+        格式: {"answer": "完整回答", "sources": [...], "model": "...",
+                "needs_clarification": true/false}
     """
     global vector_store
 
@@ -275,6 +286,12 @@ async def chat(
             status_code=400,
             detail=f"查询内容过长，请控制在 {MAX_QUERY_LENGTH} 字符以内"
         )
+
+    # ---- product_id 清洗 ----
+    if product_id is not None:
+        product_id = sanitize_query(product_id)
+        if not product_id:
+            product_id = None
 
     # ---- 历史对话校验 ----
     chat_history = None
@@ -309,7 +326,8 @@ async def chat(
                 """在线程池中运行阻塞的 rag_chat_stream 生成器"""
                 try:
                     for token in rag_chat_stream(
-                        vector_store, query, chat_history, k=RETRIEVAL_K
+                        vector_store, query, chat_history, k=RETRIEVAL_K,
+                        product_id=product_id,
                     ):
                         if cancelled:
                             # 客户端已断开 → 不再往队列投递，退出生成循环
@@ -356,7 +374,8 @@ async def chat(
     # ---- 非流式 JSON 响应 ----
     else:
         try:
-            result = rag_chat(vector_store, query, chat_history, k=RETRIEVAL_K)
+            result = rag_chat(vector_store, query, chat_history, k=RETRIEVAL_K,
+                             product_id=product_id)
             return JSONResponse(content=result)
         except LLMServiceError as e:
             logger.error(f"LLM 服务不可用（四层容灾已耗尽）: {e}")
@@ -422,9 +441,12 @@ async def upload_pdf(file: UploadFile = File(..., description="PDF 文件")):
 
     logger.info(f"📄 已保存 PDF: {save_path} ({len(content)} 字节)")
 
-    # ---- 重建向量库 ----
+    # ---- 重建向量库（先清空旧数据，再入库新产品切片） ----
     try:
-        # 如果存在旧向量库，先清空（ChromaDB 的 from_documents 会自动覆盖）
+        # 🔴 清空旧向量库：确保不同产品的旧切片不会与新切片混合
+        clear_vector_store(CHROMA_PERSIST_DIR)
+        logger.info("🧹 旧向量库已清空，开始重新索引...")
+
         documents = load_pdfs_from_directory(PDF_DATA_DIR, CHUNK_SIZE, CHUNK_OVERLAP)
 
         if not documents:
@@ -437,11 +459,19 @@ async def upload_pdf(file: UploadFile = File(..., description="PDF 文件")):
         vector_store = create_vector_store(documents, CHROMA_PERSIST_DIR)
         info = get_vector_store_info(vector_store)
 
+        # 统计各产品的切片数量
+        product_counts = {}
+        for doc in documents:
+            pid = doc.metadata.get("product_id", "unknown")
+            product_counts[pid] = product_counts.get(pid, 0) + 1
+
         return JSONResponse({
             "success": True,
             "message": f"文件 {safe_filename} 已上传，向量库已重建",
             "document_count": info["document_count"],
             "file_name": safe_filename,
+            "product_id": documents[0].metadata.get("product_id", "unknown") if documents else "unknown",
+            "product_distribution": product_counts,
         })
 
     except Exception as e:
@@ -465,6 +495,23 @@ async def status():
     return JSONResponse(content={
         "ready": vector_store is not None and info["document_count"] > 0,
         "document_count": info["document_count"],
+    })
+
+
+@app.get("/api/products")
+async def list_products():
+    """
+    获取已注册产品列表 — GET /api/products
+
+    返回当前向量库中已入库的产品 ID 列表，
+    供前端渲染产品选择下拉框。
+
+    若向量库为空，返回空列表。
+    """
+    products = get_registered_products()
+    return JSONResponse(content={
+        "products": products,
+        "count": len(products),
     })
 
 

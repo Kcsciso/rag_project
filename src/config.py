@@ -69,9 +69,9 @@ CHROMA_PERSIST_DIR = os.path.join(
 )
 
 # HuggingFace 嵌入模型名称
-# - all-MiniLM-L6-v2: 英文轻量模型，384维，速度快（默认）
-# - BAAI/bge-small-zh-v1.5: 中文专优模型，512维（中文场景推荐替换）
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+# - BAAI/bge-small-zh-v1.5: 中文专优模型，512维（当前默认 — 中文 SDK 文档场景最优）
+# - all-MiniLM-L6-v2: 英文轻量模型，384维（回退备选 — 英文场景更快）
+EMBEDDING_MODEL_NAME = "BAAI/bge-small-zh-v1.5"
 
 # 是否在 HuggingFaceEmbeddings 加载失败时，
 # 自动回退到 ChromaDB 内置的 ONNX 方案（ONNXMiniLM_L6_V2）
@@ -86,6 +86,9 @@ FALLBACK_TO_ONNX = True
 HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com")
 # 强制执行，覆盖系统中可能存在的官方源地址
 os.environ["HF_ENDPOINT"] = HF_ENDPOINT
+# 离线模式：禁止 sentence-transformers 在启动时尝试连接 huggingface.co 验证模型文件
+# bge-small-zh-v1.5 模型已完整缓存于 ~/.cache/huggingface/hub/
+os.environ["HF_HUB_OFFLINE"] = "1"
 # 注意：不启用 HF_HUB_ENABLE_HF_TRANSFER，避免因缺少 hf_transfer 包导致下载失败
 
 # 嵌入向量设备：优先 GPU，不可用时回退 CPU
@@ -108,12 +111,11 @@ PDF_DATA_DIR = os.path.join(
 )
 
 # 文本分块参数
-# chunk_size=600: 每个文本块最大 600 个字符——在保留上下文完整性与检索精度间平衡
-#                 增大到 600 防止 API 示例代码跨切片被截断
-# chunk_overlap=100: 相邻块之间重叠 100 个字符
-#                    加大重叠区确保关键函数定义不会恰好落在块边界上
-CHUNK_SIZE = 600
-CHUNK_OVERLAP = 100
+# chunk_size=300: 细粒度切片，每个 SDK 函数定义+示例约 200-400 字符，
+#                 300 确保单个函数不会被跨切片截断，同时减少噪声信息混入
+# chunk_overlap=50: 相邻块之间重叠 50 个字符 (~17%)，保证函数边界不丢失
+CHUNK_SIZE = 300
+CHUNK_OVERLAP = 50
 
 # ============================================================
 # RAG 检索配置
@@ -122,26 +124,95 @@ CHUNK_OVERLAP = 100
 # 检索时返回的 Top-K 文档片段数
 # k=5: 每次检索返回最相关的 5 个文本块
 #      增加到 5 以提高召回覆盖率，降低关键函数漏检概率
-RETRIEVAL_K = 5
+RETRIEVAL_K = 8
 
 # 相似度阈值 — ChromaDB cosine 距离上限
 # 使用 similarity_search_with_score 进行距离过滤：
 #   余弦距离范围: 0 (完全相同) ~ 2 (完全相反), 1 为正交无关
-#   threshold=0.78: 在 0.75 基础上适度放宽 0.03，应对口语化查询（如
-#     "我需要知道机械臂上电相关代码"）中噪音词对向量语义的稀释效应。
-#     实测数据：
-#     - Q3 get_robot_pose 距离 0.72→0.78 可召回
-#     - Q1 robot_Power_on 距离 0.43→0.78 可召回（口语化前缀稀释后 ~0.55）
-#     - Q4 摄像头无关内容距离 0.68-0.76→0.78 阈值可将 0.76 以下的无关项过滤
+#   threshold=0.68: 在 0.78 基础上大幅放宽 0.10，解决复合查询（如"上电+回零"）
+#     中多关键词导致的语义稀释问题。实测数据：
+#     - OpenR6 set_robot_power_on + set_robot_arm_home 距离 ~0.65-0.72
+#       在 0.68 阈值下可完整召回（0.78 会将 ~0.72 的切片误杀）
+#     - Q3 get_robot_pose 距离 0.72→0.68 可召回
+#     - Q1 robot_Power_on 距离 0.43→0.68 可召回
 #   设为 None 可禁用阈值过滤
-SIMILARITY_THRESHOLD = 0.78
+SIMILARITY_THRESHOLD = 0.68
+
+# ============================================================
+# 产品线动态路由配置 — Product-Aware RAG Isolation
+# ============================================================
+#
+# 【设计目标】
+# 不同产品（如 OpenR6、OpenC3）的 SDK 文档在语义上存在重叠（如上电、使能
+# 等通用操作），但底层动态库、函数签名、参数结构完全不同。若将不同产品的
+# 切片混合检索，极易导致 LLM 张冠李戴——用 OpenR6 的 py_dll 函数回答
+# OpenC3 的六轴机械臂问题。
+#
+# 解决方案：入库时自动打标 product_id → 检索时物理隔离 → 未指定产品时
+# 主动反问澄清。
+#
+# 【扩展方式】
+# 新增产品线只需在 PRODUCT_MAPPING_RULES 和 PRODUCT_ROUTER_RULES 中
+# 各追加一条配置即可，无需修改任何核心逻辑代码。
+
+# ---- 产品识别打标规则（入库阶段：文件名 → product_id） ----
+# 每条规则包含:
+#   product_id:       产品唯一标识（存入 ChromaDB metadata）
+#   filename_patterns: 文件名关键词列表（任一命中即匹配，不区分大小写）
+#   content_keywords:  文档内容关键词（辅助确认，可选）
+PRODUCT_MAPPING_RULES = [
+    {
+        "product_id": "OpenR6",
+        "filename_patterns": ["OpenR6", "openr6", "R6", "windows系统"],
+        "content_keywords": ["py_dll", "Robot_.*", "robot_Power_on", "windows"],
+    },
+    {
+        "product_id": "OpenC3",
+        "filename_patterns": ["OpenC3", "openc3", "六轴机械臂", "collrob", "六轴"],
+        "content_keywords": ["六轴", "collrob", "OpenC3", "机械臂"],
+    },
+]
+
+# ---- 产品意图路由规则（查询阶段：用户 query → product_id） ----
+# 每条规则包含:
+#   product_id:    目标产品标识
+#   keywords:      命中关键词列表（任一命中即锁定产品，不区分大小写）
+#   priority:      优先级（数字越大越优先，用于解决关键词重叠冲突）
+PRODUCT_ROUTER_RULES = [
+    {
+        "product_id": "OpenR6",
+        "keywords": [
+            "OpenR6", "openr6", "py_dll", "R6", "windows",
+            "windows系统", "windows sdk",
+        ],
+        "priority": 10,
+    },
+    {
+        "product_id": "OpenC3",
+        "keywords": [
+            "OpenC3", "openc3", "collrob", "六轴",
+            "六轴机械臂", "OpenC3六轴",
+        ],
+        "priority": 10,
+    },
+]
+
+# 意图澄清回复模板（当用户未指定产品时使用）
+PRODUCT_CLARIFICATION_PROMPT = (
+    "请问您询问的是哪一款产品呢？（例如：{product_list}）\n"
+    "不同产品的 SDK 动态库与函数接口有所不同，"
+    "请告知具体型号以便为您提供准确的代码示例。"
+)
+
+# 主动澄清时的 HTTP 状态（200=正常返回让前端展示，非异常）
+PRODUCT_CLARIFICATION_HTTP_STATUS = 200
 
 # ============================================================
 # Web 服务配置
 # ============================================================
 
-HOST = "0.0.0.0"  # 0.0.0.0 允许外部访问（配合 ngrok 使用）
-PORT = 8000
+HOST = "0.0.0.0"  # 0.0.0.0 允许外部访问
+PORT = 7860
 
 # 最大上传文件大小（字节），默认 50MB
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024

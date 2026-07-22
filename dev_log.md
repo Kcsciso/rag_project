@@ -1408,3 +1408,481 @@ alias stoprag='pkill -f "app.py"; pkill -f "vllm.entrypoints"; echo "NewsPage �
 | `CLAUDE.md` | 修改 | 阈值 0.75→0.78；架构图更新为混合检索；新增 `test_human_simulation.py` 和运维命令 |
 | `README.md` | 修改 | 新增混合检索/预处理特性描述；新增 `stoprag` 和测试体系章节 |
 | `dev_log.md` | 追加 | 本章节（二十） |
+
+---
+
+## 二十一、产品级物理隔离 — 动态产品打标、意图路由与主动反问澄清
+
+> **日期**: 2026-07-22  
+> **变更范围**: `src/config.py`, `src/pdf_loader.py`, `src/vector_store.py`, `src/rag_chain.py`, `app.py`  
+> **变更目标**: 实现产品级知识库物理隔离，杜绝跨产品混合检索导致的函数张冠李戴问题
+
+### 21.1 动机
+
+**核心问题**: 当前系统将 OpenR6（Windows SDK，基于 py_dll）和 OpenC3（六轴机械臂 SDK，基于 collrob）两个完全不同产品的文档在同一个 ChromaDB Collection 中无差别混合存储和检索。当用户问"上电函数怎么写？"时，系统可能同时召回 OpenR6 的 `robot_Power_on`（py_dll）和 OpenC3 的 `robot_Power_on`（collrob），两个函数的底层动态库、参数结构、使用方式完全不同，但 LLM 无法从切片元数据中区分产品归属，极易输出错误的代码示例。
+
+**设计原则**: 
+- **入库时打标**：文件名自动识别产品 → 写入 ChromaDB metadata
+- **检索时隔离**：ChromaDB `where` 过滤条件实现 100% 物理隔离
+- **未指定时反问**：用户未指定产品 → 动态获取已注册产品列表 → 主动反问澄清
+
+### 21.2 配置层 — 产品映射规则与路由规则 (`src/config.py`)
+
+新增两个核心配置结构：
+
+#### `PRODUCT_MAPPING_RULES` (入库阶段 — 文件名 → product_id)
+
+```python
+PRODUCT_MAPPING_RULES = [
+    {
+        "product_id": "OpenR6",
+        "filename_patterns": ["OpenR6", "openr6", "R6", "windows系统"],
+        "content_keywords": ["py_dll", "Robot_.*", "robot_Power_on", "windows"],
+    },
+    {
+        "product_id": "OpenC3",
+        "filename_patterns": ["OpenC3", "openc3", "六轴机械臂", "collrob", "六轴"],
+        "content_keywords": ["六轴", "collrob", "OpenC3", "机械臂"],
+    },
+]
+```
+
+**动态扩展性**：新增产品（如 OpenR7）只需在 `PRODUCT_MAPPING_RULES` 和 `PRODUCT_ROUTER_RULES` 中各追加一条配置即可。
+
+#### `PRODUCT_ROUTER_RULES` (查询阶段 — query → product_id)
+
+```python
+PRODUCT_ROUTER_RULES = [
+    # OpenR6: py_dll, windows, OpenR6 等关键词
+    # OpenC3: collrob, 六轴, 六轴机械臂 等关键词
+]
+```
+
+每条规则包含 `priority` 字段（数字越大越优先），用于解决多产品关键词同时匹配时的冲突裁决。
+
+#### 主动澄清模板
+
+```python
+PRODUCT_CLARIFICATION_PROMPT = (
+    "请问您询问的是哪一款产品呢？（例如：{product_list}）\n"
+    "不同产品的 SDK 动态库与函数接口有所不同，"
+    "请告知具体型号以便为您提供准确的代码示例。"
+)
+```
+
+### 21.3 数据层 — 产品打标与向量库管理 (`src/pdf_loader.py`, `src/vector_store.py`)
+
+#### pdf_loader.py — 入库打标
+
+新增 `_resolve_product_id_from_filename()` 函数：
+- 根据 `PRODUCT_MAPPING_RULES` 中的 `filename_patterns` 匹配文件名
+- 不区分大小写，任一模式命中即返回对应 `product_id`
+- 无法识别时返回 `"unknown"` 并记录 WARNING
+
+`load_pdfs_from_directory()` 中每个 Document 的 metadata 新增 `product_id` 字段：
+```python
+doc = Document(
+    page_content=text,
+    metadata={
+        "source": pdf_file,
+        "product_id": product_id,  # 🏷️ 新增
+    }
+)
+```
+
+**实测结果**：
+| 文件名 | 命中规则 | product_id |
+|--------|---------|------------|
+| `windows系统OpenR6_sdk使用文档.pdf` | `"windows系统"` 命中 | `OpenR6` |
+| `六轴机械臂SDK说明文档_win.pdf` | `"六轴机械臂"` 命中 | `OpenC3` |
+
+#### vector_store.py — 三项新增
+
+**① `clear_vector_store()`** — 彻底清空向量库：
+- 优先通过 Collection API 删除所有记录（保留索引结构）
+- 回退方案：物理删除 `vector_db/` 目录（暴力但可靠）
+
+**② `resolve_product_id()`** — 公开的产品识别 API（供其他模块调用）
+
+**③ `get_registered_products()`** — 查询已入库的产品列表：
+- 遍历 ChromaDB 所有 metadata，提取去重的 `product_id` 值
+- 返回 `["OpenC3", "OpenR6"]` 格式列表
+- 供前端产品下拉框和主动反问模板使用
+
+**④ `search_similar_with_threshold()` 支持 `product_id` 过滤**：
+- 新增 `product_id` 参数
+- 传入 `product_id` 时，向 `similarity_search_with_score()` 传递 `filter={"product_id": product_id}`
+- 若 langchain-chroma 版本不支持 `filter` 参数，自动降级为后置过滤（Python 侧手动筛选 metadata）
+- 确保 100% 物理隔离检索，绝不跨产品召回
+
+### 21.4 路由层 — 动态产品意图识别 (`src/rag_chain.py`)
+
+#### 新增三个核心函数
+
+**① `_resolve_product_from_query(query)`** — 产品意图路由器：
+- 遍历 `PRODUCT_ROUTER_RULES`，匹配 query 中的关键词（不区分大小写）
+- 多产品同时匹配时按 `priority` 降序裁决
+- 无法识别时返回 `None`（触发主动反问）
+
+**意图识别示例**：
+| 用户 Query | 命中关键词 | product_id |
+|------------|-----------|------------|
+| "OpenR6 的上电函数怎么写？" | `"OpenR6"` | `OpenR6` |
+| "六轴机械臂的运动控制" | `"六轴"`, `"六轴机械臂"` | `OpenC3` |
+| "collrob 如何初始化连接？" | `"collrob"` | `OpenC3` |
+| "上电函数怎么写？" | *(无匹配)* | `None` → 反问澄清 |
+| "直线运动怎么控制？" | *(无匹配)* | `None` → 反问澄清 |
+
+**② `_build_clarification_response()`** — 非流式澄清回复
+
+**③ `_build_clarification_response_stream()`** — 流式澄清回复（15 字符/块模拟打字机）
+
+#### `_hybrid_retrieve()` 支持产品物理隔离
+
+新增 `product_id` 参数，透传至 `search_similar_with_threshold()`：
+```python
+context_docs = _hybrid_retrieve(
+    vector_store, search_query, k=k,
+    threshold=SIMILARITY_THRESHOLD,
+    fetch_factor=4,
+    product_id=product_id,  # 🔴 产品级物理隔离
+)
+```
+
+#### `rag_chat()` / `rag_chat_stream()` 产品路由集成
+
+在检索步骤前新增 **第 0 步：产品意图路由**：
+```
+① 若调用方提供了 product_id（前端下拉框强指定）→ 直接使用
+② 否则运行 _resolve_product_from_query() 动态识别
+   - 命中 → 锁定 product_id 进行单库检索
+   - 未命中 → 返回/流出 主动澄清反问（needs_clarification=True）
+③ 后续流程不变（四层容灾正常运作）
+```
+
+返回结构新增字段：
+```json
+{
+  "answer": "...",
+  "sources": [...],
+  "model": "product-clarification",
+  "needs_clarification": true  // 新增：前端据此展示产品选择器
+}
+```
+
+### 21.5 API 层 — 产品参数与接口 (`app.py`)
+
+#### `/api/chat` 新增 `product_id` 参数
+
+```python
+async def chat(
+    query: str = Form(...),
+    history: Optional[str] = Form(None),
+    stream: bool = Form(True),
+    product_id: Optional[str] = Form(None),  # 🏷️ 新增
+):
+```
+
+- 前端可通过下拉框切换设备直接强指定产品范围
+- 未提供时后端自动运行 Product Router
+- product_id 同样经过 `sanitize_query()` 安全清洗
+
+#### 新增 `/api/products` 接口
+
+```python
+@app.get("/api/products")
+async def list_products():
+```
+
+**响应示例**：
+```json
+{
+  "products": ["OpenC3", "OpenR6"],
+  "count": 2
+}
+```
+
+供前端动态渲染产品选择下拉框，无需硬编码产品列表。
+
+#### `/api/upload` 上传流程优化
+
+- 上传前先调用 `clear_vector_store()` 清空旧数据
+- 返回中包含 `product_id` 和 `product_distribution`（各产品切片数量）
+- 确保新上传的文档始终以正确的 product_id 入库
+
+### 21.6 架构图 — 产品路由流程
+
+```
+用户提问 ──────────────────────────────────────────────────┐
+  │                                                        │
+  ▼                                                        │
+┌──────────────────────────────────────┐                    │
+│ 第 0 步：产品意图路由 (Product Router) │                   │
+│                                      │                   │
+│  product_id 已提供？（前端强指定）     │                   │
+│    ├── 是 → 直接使用                  │                  │
+│    └── 否 → _resolve_product_from_query()              │
+│              ├── 命中 → 锁定 product_id                 │
+│              └── 未命中 → 反问澄清                     │
+│                    "请问您询问的是哪一款产品呢？"         │
+└──────────────────────────────────────┘                   │
+  │                                                        │
+  ▼ (product_id 已确定)                                    │
+┌──────────────────────────────────────┐                    │
+│ ChromaDB 混合检索（product_id 物理隔离）│                  │
+│   where={"product_id": "OpenR6"}      │  ← 100% 单库隔离 │
+│   向量召回 4× → 关键词重排序 → Top-K   │                   │
+└──────────────────────────────────────┘                    │
+  │                                                        │
+  ▼                                                        │
+  四层容灾 (Layer 1→2→3→4) ← 不变                         │
+```
+
+### 21.7 测试验证
+
+#### 产品路由准确性测试
+
+| # | 查询 | 预期 product_id | 实际路由结果 | 状态 |
+|---|------|----------------|-------------|------|
+| 1 | "OpenR6 的上电函数怎么写" | OpenR6 | OpenR6 (命中 "OpenR6") | ✅ |
+| 2 | "py_dll 怎么调用" | OpenR6 | OpenR6 (命中 "py_dll") | ✅ |
+| 3 | "六轴机械臂的使能函数" | OpenC3 | OpenC3 (命中 "六轴机械臂") | ✅ |
+| 4 | "collrob 初始化连接" | OpenC3 | OpenC3 (命中 "collrob") | ✅ |
+| 5 | "上电函数怎么写" | None | None → 澄清反问 | ✅ |
+| 6 | "直线运动怎么控制" | None | None → 澄清反问 | ✅ |
+
+#### 物理隔离验证
+
+- 传入 `product_id="OpenR6"` 时，检索结果中所有切片的 `metadata.product_id` 均为 `"OpenR6"`
+- 传入 `product_id="OpenC3"` 时，检索结果中所有切片的 `metadata.product_id` 均为 `"OpenC3"`
+- 未传入 `product_id` 但 query 明确提及产品时，行为等同上述
+
+#### 主动反问澄清验证
+
+- 请求 `{"query": "上电函数怎么写？"}` （无 product_id，query 无线索）
+  → 返回 `needs_clarification=True`，内容为产品澄清提示文本
+
+### 21.8 扩展性设计
+
+新增产品线仅需两步配置，无需修改核心逻辑代码：
+
+```python
+# 1. PRODUCT_MAPPING_RULES 追加（入库打标）
+{
+    "product_id": "OpenR7",
+    "filename_patterns": ["OpenR7", "R7"],
+    "content_keywords": ["OpenR7", "R7_sdk"],
+}
+
+# 2. PRODUCT_ROUTER_RULES 追加（意图路由）
+{
+    "product_id": "OpenR7",
+    "keywords": ["OpenR7", "R7", "openr7"],
+    "priority": 10,
+}
+```
+
+### 21.9 变更文件汇总
+
+| 文件 | 变更类型 | 关键变更 |
+|------|----------|----------|
+| `src/config.py` | **修改** | 新增 `PRODUCT_MAPPING_RULES`、`PRODUCT_ROUTER_RULES`、`PRODUCT_CLARIFICATION_PROMPT` |
+| `src/pdf_loader.py` | **修改** | 新增 `_resolve_product_id_from_filename()`；`load_pdfs_from_directory()` 中 Document metadata 附加 `product_id` |
+| `src/vector_store.py` | **大幅修改** | 新增 `clear_vector_store()`、`resolve_product_id()`、`get_registered_products()`；`search_similar_with_threshold()` 新增 `product_id` 过滤参数 |
+| `src/rag_chain.py` | **大幅修改** | 新增 `_resolve_product_from_query()`、`_build_clarification_response()`、`_build_clarification_response_stream()`；`_hybrid_retrieve()` 支持 `product_id`；`rag_chat()` / `rag_chat_stream()` 新增产品路由流程 |
+| `app.py` | **修改** | `/api/chat` 新增 `product_id` 参数；新增 `GET /api/products` 接口；`/api/upload` 上传前清空旧库 |
+| `CLAUDE.md` | **修改** | 更新产品隔离架构、API 规范、路由配置文档 |
+| `dev_log.md` | 追加 | 本章节（二十一） |
+
+---
+
+## 二十二、致命语义鸿沟修复 — 保底召回 + LLM 链路解封
+
+> **日期**: 2026-07-22  
+> **变更范围**: `src/rag_chain.py`  
+> **变更目标**: (1) 解决阈值过滤全量拦截导致的 0 召回问题；(2) 解除"0 切片跳过 LLM"的硬编码拦截器；(3) 恢复 vLLM Layer 1 在保底切片上的代码生成能力
+
+### 22.1 问题根因
+
+`check_status.py` 确认本地 vLLM (8001) 及 A100 GPU 均完美在线，但用户查询 `OpenC3 的上电函数怎么写？` 时系统日志输出：
+
+```
+相似度阈值过滤后无相关切片 (threshold=0.68)，
+跳过 LLM 调用，直接进入第 3 层纯检索直出模式
+```
+
+**三重致命缺陷**：
+
+| 层级 | 问题 | 影响 |
+|------|------|------|
+| 语义层 | `all-MiniLM-L6-v2` 无法理解"上电函数"与文档"上电指令"的等价关系，cosine distance ~0.69，被 `relaxed_threshold=0.70` 全部拦截 | 0/25 切片通过 |
+| 检索层 | `_hybrid_retrieve()` 在阈值过滤返回空后直接 `return []`，无任何保底机制 | 向量检索能力完全浪费 |
+| 调度层 | `rag_chat()` / `rag_chat_stream()` 检测到 `context_docs=[]` 后硬编码跳转 Layer 3 | A100 GPU + Qwen2.5 满血在线却被跳过 |
+
+**用户侧表现**: 系统提示"未在现有文档中检索到有效内容"，但文档中确实存在 `robot_Power_on`（OpenC3）和 `set_robot_power_on`（OpenR6）。
+
+### 22.2 保底召回机制 (`_hybrid_retrieve()`)
+
+**修复**: 在阈值过滤和噪声过滤两个层级各增加保底回退：
+
+#### (1) 阈值过滤后为空 → 原始向量 Top-3 保底
+
+```python
+if not results_with_scores:
+    logger.warning(
+        f"⚠️ 阈值过滤后 0 切片通过 (relaxed_threshold={relaxed_threshold})，"
+        f"触发保底召回 — 取原始向量 Top-3"
+    )
+    raw_fallback = search_similar_with_threshold(
+        vector_store, query, k=3, threshold=None,  # ← 完全不过滤
+        product_id=product_id,
+    )
+    if raw_fallback:
+        return raw_fallback  # 强制保留，交由 LLM 阅读理解
+```
+
+**日志输出示例**:
+```
+⚠️ 保底召回 Top-3（最高得分: 0.6921），已强行保留并交由 LLM 阅读理解
+```
+
+#### (2) 噪声过滤后为空 → 原始候选回退
+
+当 `results_with_scores` 非空但全部被 `_is_noise_chunk()` 拦截时，回退到原始向量搜索结果的前 k 个。
+
+### 22.3 解除 LLM 调度层拦截
+
+**修复前** (`rag_chat()`):
+```python
+if not context_docs:
+    # 跳过 LLM 调用，直接进入第 3 层纯检索直出模式
+    return _direct_retrieval_response(context_docs, query)
+```
+
+**修复后**:
+```python
+if not context_docs:
+    logger.warning(
+        f"⚠️ 检索结果为空，仍将尝试 LLM 生成"
+    )
+    # 不再跳转 Layer 3 — 继续走四层容灾正常流程
+```
+
+`rag_chat_stream()` 同步修改。
+
+**设计理由**: Qwen2.5-1.5B 拥有强大的阅读理解能力，即使保底切片的语义匹配度不高（cosine 0.69），模型仍能从中识别出正确的函数名和调用模式，生成可用的代码示例。
+
+### 22.4 实测验证
+
+**测试环境**: vLLM Qwen2.5-1.5B-Instruct @ GPU 1, FastAPI @ :8000, 66 个文档片段
+
+| 用例 | Query | 模型 | Layer | 耗时 | 含上电 | 含回零 | 状态 |
+|------|-------|------|-------|------|--------|--------|------|
+| 1 | `OpenC3 的上电函数怎么写？` | Qwen2.5-1.5B | **Layer 1** | 9.8s | ✅ `robot_Power_on` | — | ✅ |
+| 2 | `OpenR6 的上电和回零函数` | Qwen2.5-1.5B | **Layer 1** | 10.9s | ✅ `set_robot_power_on` | ✅ `set_robot_arm_home` | ✅ |
+
+**关键指标**: 
+- 两个用例均 100% 经由 Layer 1 (本地 vLLM) 完成，零降级
+- Qwen2.5-1.5B 在保底切片（cosine ~0.69）上成功识别并输出代码
+
+### 22.5 变更文件汇总
+
+| 文件 | 变更类型 | 关键变更 |
+|------|----------|----------|
+| `src/rag_chain.py` | **修改** | `_hybrid_retrieve()` 新增双层级保底召回（阈值拦截→原始Top-3，噪声拦截→原始回退）；`rag_chat()` / `rag_chat_stream()` 移除"0切片跳过LLM"拦截器 |
+| `CLAUDE.md` | **修改** | 更新检索参数说明，新增保底召回机制文档 |
+| `dev_log.md` | 追加 | 本章节（二十二） |
+
+---
+
+## 二十三、检索召回率硬伤攻坚 — BM25 分词修复 + Header Injection + Top-K 放大
+
+> **日期**: 2026-07-22  
+> **变更范围**: `src/vector_store.py`, `src/pdf_loader.py`, `src/config.py`  
+> **变更目标**: 彻底解决 CORE-3 (set_move_line) 和 CORE-4 (robot_brkopen/robot_enable) 的检索未命中
+
+### 23.1 BM25 分词器修复
+
+**问题**: jieba 将 `set_move_line` 切成 `['set', '_', 'move', '_', 'line']`，将 `robot_brkopen` 切成 `['robot', '_', 'brkopen']`。这些碎片 token 无法与查询中的完整函数名精确匹配，BM25 关键词检索完全失效。
+
+**修复** (`src/vector_store.py` — `_tokenize_for_bm25()`):
+
+1. **正则预提取**: 在 jieba 分词前，用 `\b[a-zA-Z_][a-zA-Z0-9_]*` 正则提取所有英文标识符（如 `set_move_line`）作为不可分割的整词 token，避免被 jieba 拆散。
+2. **jieba 自定义词典**: 注册 30+ 个 SDK 函数名（`set_robot_power_on`, `robot_movl` 等）为高频整词，确保 jieba 不会拆分。
+3. **两阶段分词**: 先提取英文标识符 → 从文本中移除 → jieba 分词剩余中文部分。
+
+**效果**: `set_move_line` 从 `['set','_','move','_','line']` → `['set_move_line']`，BM25 精确命中率 100%。
+
+### 23.2 C 函数 Header Injection
+
+**问题**: chunk 的 metadata 仅含 `source` 和 `product_id`，无函数名元数据。Dense 向量和 Sparse BM25 都难以通过查询 "画直线" 定位到含 `set_move_line` 的切片。
+
+**修复** (`src/pdf_loader.py` — `load_pdfs_from_directory()`):
+
+文本分块后，对每个 chunk 扫描 `snake_case(` 模式，提取所有 C 函数名，以 `[Functions: xxx, yyy]` 头部注入到 chunk 文本中。
+
+**效果**: 70/87 个 chunk 获得了函数名头部注入，向量和 BM25 检索敏感度大幅提升。
+
+### 23.3 RETRIEVAL_K 放大
+
+`RETRIEVAL_K` 从 5 提升至 8，为 RRF 融合和 Autocut 动态截断提供更宽的候选池。
+
+### 23.4 评测验证
+
+修改后 `python test_rag_eval.py` 实现 **8/8 = 100%** 首次满分通过。
+
+---
+
+## 二十四、端口外网映射 + Autocut 动态截断 + 防退化采样
+
+> **日期**: 2026-07-22  
+> **变更范围**: `src/config.py`, `src/rag_chain.py`, `app.py`, `frontend_server.py` (新建)  
+> **变更目标**: (1) 配置外网端口映射；(2) 引入 Autocut 动态自适应截断；(3) 防 LLM 退化
+
+### 24.1 外网端口映射
+
+| 服务 | 内部端口 | 外部映射 |
+|------|---------|---------|
+| FastAPI 后端 | 7860 | 50003 |
+| Frontend UI | 8501 | 50004 |
+| vLLM 推理 | 8001 | — |
+
+新建 `frontend_server.py`：轻量 FastAPI 服务，渲染 `templates/index.html` + 反向代理 `/api/*` 到 7860 后端。
+
+### 24.2 Autocut 动态自适应截断
+
+**问题**: 固定 Top-K=8 的硬截断导致简单问题带入低相关性噪音，复杂问题又受限。
+
+**修复** (`src/rag_chain.py` — `_autocut_knee()`):
+
+实现基于 RRF 融合分数断崖/跳变点检测的 Autocut 算法：
+
+```python
+def _autocut_knee(rrf_scores):
+    # 1. 计算相邻 RRF 分数差值
+    # 2. 寻找最大差值位置（Knee Point）——分数下降最剧烈处
+    # 3. 在 knee point 处截断
+    # 4. 钳制在 [_AUTOCUT_MIN_K=2, _AUTOCUT_MAX_K=8]
+```
+
+**日志输出**: `🔪 Autocut: N 个候选 → max_diff=0.XXXX @ pos=K → cut=N`
+
+### 24.3 防退化采样参数
+
+| 参数 | 旧值 | 新值 |
+|------|------|------|
+| `temperature` | 0.2 | **0.3** |
+| `repetition_penalty` | 1.15 | **1.2** |
+| `max_tokens` | 512 | **1024** |
+| System Prompt | — | 新增 🛑 严禁重复标点/感叹号硬约束 |
+
+### 24.4 vLLM 动态模型名解析
+
+新增 `_resolve_vllm_model()`：通过 GET `/v1/models` 动态获取 vLLM 实际模型 ID，缓存后用于所有 LLM 调用，彻底消除硬编码模型名与 vLLM 实际模型不一致的问题。
+
+### 24.5 新增文件
+
+| 文件 | 用途 |
+|------|------|
+| `frontend_server.py` | 前端 UI 独立服务（端口 8501） |
+| `test_rag_eval.py` | 防过拟合自动化评测（8 用例） |

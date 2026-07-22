@@ -24,24 +24,8 @@
 set -euo pipefail
 
 # ============================================================
-# 配置
+# 1. 终端颜色定义（优先最顶层声明，防止 set -u 找不到变量）
 # ============================================================
-CONDA_ENV="rag_agent"
-VLLM_PORT=8001
-FASTAPI_PORT=8000
-VLLM_MODEL="Qwen/Qwen2.5-1.5B-Instruct"
-VLLM_GPU_MEM=0.20
-VLLM_MAX_MODEL_LEN=4096
-VLLM_GPU_ID="${VLLM_GPU_ID:-}"  # 空 = 自动检测，非空 = 手动覆盖
-
-# vLLM 就绪等待参数
-VLLM_READY_TIMEOUT=120     # 最长等待时间（秒）
-VLLM_READY_INTERVAL=3      # 轮询间隔（秒）
-
-# GPU 自动检测：最小需要的空闲显存（MiB），低于此值跳过该 GPU
-MIN_FREE_MEMORY_MIB=5120   # 5 GB — 1.5B 模型约需 3.7 GB
-
-# 颜色
 GREEN='\033[92m'
 RED='\033[91m'
 YELLOW='\033[93m'
@@ -49,6 +33,29 @@ CYAN='\033[96m'
 BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m'
+
+# ============================================================
+# 2. 全局配置
+# ============================================================
+CONDA_ENV="rag_agent"
+VLLM_PORT=8001
+FASTAPI_PORT=8000
+VLLM_GPU_ID="${VLLM_GPU_ID:-}"  # 空 = 自动检测，非空 = 手动覆盖
+
+# ── 动态模型选择（启动时根据 GPU 空闲显存自动选择）──
+# > 18 GB → 7B 模型 (最强推理)
+# 10-18 GB → 3B 模型 (中等推理)
+# 5-10 GB → 1.5B 模型 (保底推理)
+# < 5 GB  → 报错退出
+# 模型候选池（专为共享 GPU 优化：仅需 ~6-8 GB 显存，避免锁死大块显存引发 OOM）
+MODEL_CANDIDATES=(
+    "Qwen/Qwen2.5-3B-Instruct|0.35|4096"   # 1.5B 保底：显存比例 0.25 (~10GB 预留上限)，上下文 4k
+)
+MIN_FREE_MEMORY_MIB=5120   # 5 GB — 最低门槛，低于此值无法部署任何模型
+
+# vLLM 就绪等待参数
+VLLM_READY_TIMEOUT=180     # 最长等待时间（秒）
+VLLM_READY_INTERVAL=3      # 轮询间隔（秒）
 
 # vLLM 后台 PID（用于清理）
 VLLM_PID=""
@@ -80,9 +87,13 @@ check_port() {
 
     # 使用 ss 或 netstat 检测端口是否被监听
     if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
-        local pid=$(ss -tlnp 2>/dev/null | grep ":${port} " | grep -oP 'pid=\K\d+' | head -1)
-        local proc_info=$(ps -p "$pid" -o comm= 2>/dev/null || echo "未知进程")
-        echo -e "  ${RED}✗${NC} 端口 ${BOLD}${port}${NC} 已被占用 → ${YELLOW}${proc_info} (PID: ${pid})${NC}"
+        local pid
+        pid=$(ss -tlnp 2>/dev/null | grep ":${port} " | grep -oP 'pid=\K\d+' | head -1 || echo "")
+        local proc_info="未知进程"
+        if [ -n "$pid" ]; then
+            proc_info=$(ps -p "$pid" -o comm= 2>/dev/null || echo "未知进程")
+        fi
+        echo -e "  ${RED}✗${NC} 端口 ${BOLD}${port}${NC} 已被占用 → ${YELLOW}${proc_info} (PID: ${pid:-?})${NC}"
         return 1
     else
         echo -e "  ${GREEN}✓${NC} 端口 ${BOLD}${port}${NC} 空闲"
@@ -93,19 +104,6 @@ check_port() {
 # ---- GPU 智能检测 ----
 
 detect_best_gpu() {
-    # =================================================================
-    # 通过 nvidia-smi 扫描所有 GPU 的空闲显存，返回空闲最大的 GPU 索引。
-    #
-    # 算法：
-    #   1. nvidia-smi 查询每个 GPU 的 index + memory.free (MiB)
-    #   2. 过滤空闲显存 < MIN_FREE_MEMORY_MIB 的 GPU（无法容纳模型）
-    #   3. 按空闲显存降序排序，取第一名
-    #
-    # 🔴 输出规范（关键）：
-    #   - stdout（可被 $() 捕获）：有且仅有纯数字 GPU 索引（如 0、1）
-    #   - stderr（终端可见但不污染变量）：所有日志、提示、扫描结果
-    #   - 返回值：0=成功 / 1=无可用的 GPU / 2=nvidia-smi 不可用
-    # =================================================================
     if ! command -v nvidia-smi &>/dev/null; then
         echo "-1"
         return 2
@@ -119,16 +117,14 @@ detect_best_gpu() {
         return 1
     fi
 
-    # 解析并排序：过滤低显存 → 按空闲降序 → 取第一
     local best_idx=-1
     local best_free=0
     local all_info=""
 
     while IFS=',' read -r idx free_mib; do
-        idx=$(echo "$idx" | xargs)        # trim whitespace
+        idx=$(echo "$idx" | xargs)
         free_mib=$(echo "$free_mib" | xargs)
 
-        # 跳过无数据的行
         if [ -z "$idx" ] || [ -z "$free_mib" ]; then
             continue
         fi
@@ -147,7 +143,6 @@ detect_best_gpu() {
         fi
     done <<< "$gpu_data"
 
-    # 🔴 以下所有日志/提示均重定向到 stderr（>&2），确保 stdout 只有纯数字返回值
     log_detail "GPU 空闲显存扫描结果:" >&2
     echo -e "$all_info" | while IFS= read -r line; do
         [ -n "$line" ] && echo -e "        $line" >&2
@@ -157,7 +152,6 @@ detect_best_gpu() {
         local best_gb
         best_gb=$(awk "BEGIN {printf \"%.1f\", $best_free / 1024}")
         log_info "自动选择 GPU: ${BOLD}${best_idx}${NC}（空闲 ${GREEN}${best_gb} GB${NC}，所有候选 GPU 中最大）" >&2
-        # ✅ 唯一的 stdout 输出：纯数字 GPU 索引
         echo "$best_idx"
         return 0
     fi
@@ -168,11 +162,9 @@ detect_best_gpu() {
 }
 
 export_gpu_env() {
-    # 将选定的 GPU 索引写入环境变量，供 config.py 感知
     local gpu_id=$1
     export VLLM_GPU_ID="$gpu_id"
     export CUDA_VISIBLE_DEVICES="$gpu_id"
-    # 日志输出到 stderr，避免在 $(export_gpu_env) 捕获场景下污染 stdout
     log_detail "已设置: CUDA_VISIBLE_DEVICES=${gpu_id}, VLLM_GPU_ID=${gpu_id}" >&2
 }
 
@@ -183,13 +175,11 @@ wait_for_vllm() {
     local url="http://localhost:${VLLM_PORT}/v1/models"
 
     while [ $elapsed -lt $VLLM_READY_TIMEOUT ]; do
-        # 检查进程是否还活着
         if [ -n "$VLLM_PID" ] && ! kill -0 "$VLLM_PID" 2>/dev/null; then
             log_error "vLLM 进程已意外退出（PID: $VLLM_PID）"
             return 1
         fi
 
-        # 尝试 HTTP 请求
         local http_code
         http_code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 2 "$url" 2>/dev/null || echo "000")
 
@@ -200,7 +190,6 @@ wait_for_vllm() {
             return 0
         fi
 
-        # 进度点
         if [ $((elapsed % 15)) -eq 0 ] && [ $elapsed -gt 0 ]; then
             log_detail "仍在等待... (${elapsed}s/${VLLM_READY_TIMEOUT}s)"
         fi
@@ -223,7 +212,6 @@ cleanup() {
         log_info "停止 vLLM 进程 (PID: $VLLM_PID)..."
         kill "$VLLM_PID" 2>/dev/null || true
         sleep 2
-        # 强制终止（如果仍存活）
         if kill -0 "$VLLM_PID" 2>/dev/null; then
             log_warn "vLLM 未响应，强制终止..."
             kill -9 "$VLLM_PID" 2>/dev/null || true
@@ -235,7 +223,6 @@ cleanup() {
     exit 0
 }
 
-# 注册信号处理
 trap cleanup SIGINT SIGTERM
 
 # ============================================================
@@ -245,10 +232,8 @@ trap cleanup SIGINT SIGTERM
 start_vllm() {
     log_step "第 1 步：启动本地 vLLM 推理服务"
 
-    # --- 端口检测 ---
     if ! check_port $VLLM_PORT "vLLM"; then
         log_warn "vLLM 服务可能已在运行，跳过启动"
-        # 验证是否真的是 vLLM
         local http_code
         http_code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 2 "http://localhost:${VLLM_PORT}/v1/models" 2>/dev/null || echo "000")
         if [ "$http_code" = "200" ]; then
@@ -260,20 +245,16 @@ start_vllm() {
         fi
     fi
 
-    # --- 检查 Conda 环境 ---
     if ! command -v conda &>/dev/null; then
         log_error "未找到 conda 命令，请先安装 Anaconda/Miniconda"
         return 1
     fi
 
-    # --- 智能 GPU 选择 ---
     local selected_gpu
     if [ -n "$VLLM_GPU_ID" ]; then
-        # 手动覆盖模式
         selected_gpu="$VLLM_GPU_ID"
         log_info "使用手动指定的 GPU: ${BOLD}${selected_gpu}${NC}"
     else
-        # 自动检测模式
         log_step "智能 GPU 检测：扫描所有 GPU 空闲显存..."
         selected_gpu=$(detect_best_gpu)
         local detect_rc=$?
@@ -286,37 +267,65 @@ start_vllm() {
     export_gpu_env "$selected_gpu"
     echo ""
 
-    # --- 激活环境 ---
     log_info "激活 Conda 环境: ${BOLD}${CONDA_ENV}${NC}"
     eval "$(conda shell.bash hook)"
     conda activate "$CONDA_ENV"
 
-    # --- 检查镜像配置 ---
-    if [ -z "${HF_ENDPOINT:-}" ]; then
-        export HF_ENDPOINT="https://hf-mirror.com"
-        log_detail "HF_ENDPOINT 未设置，默认使用国内镜像: ${HF_ENDPOINT}"
-    fi
-
+    # 设置网络镜像与离线模式
+    export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+    export HF_HUB_OFFLINE=1
     export PYTHONUNBUFFERED=1
 
-    # --- 启动 vLLM ---
+    # 动态模型选择：根据 GPU 空闲显存自动匹配最优模型
+    local free_mib
+    free_mib=$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2>/dev/null \
+        | grep "^${selected_gpu}," | cut -d',' -f2 | xargs)
+    local free_gb
+    free_gb=$(awk "BEGIN {printf \"%.1f\", ${free_mib:-0} / 1024}")
+
+    local selected_model="" selected_gpu_mem="" selected_max_len=""
+    for candidate in "${MODEL_CANDIDATES[@]}"; do
+        local model_name="${candidate%%|*}"
+        local rest="${candidate#*|}"
+        local gpu_mem="${rest%%|*}"
+        local max_len="${rest##*|}"
+        local min_free_mib=0
+        case "$model_name" in
+            *7B*) min_free_mib=18432 ;;   # > 18 GB
+            *3B*)  min_free_mib=10240 ;;   # > 10 GB
+            *1.5B*) min_free_mib=5120 ;;   # > 5 GB
+        esac
+        if [ "${free_mib:-0}" -ge "$min_free_mib" ]; then
+            selected_model="$model_name"
+            selected_gpu_mem="$gpu_mem"
+            selected_max_len="$max_len"
+            log_info "🎯 动态模型选择: ${BOLD}${selected_model}${NC} (空闲: ${free_gb} GB ≥ ${min_free_mib} MiB)"
+            break
+        fi
+    done
+
+    if [ -z "$selected_model" ]; then
+        log_error "GPU ${selected_gpu} 空闲显存不足 (${free_gb} GB < 5 GB)，无法部署任何模型"
+        return 1
+    fi
+
     log_info "启动 vLLM 推理服务..."
     log_detail "GPU:        CUDA_VISIBLE_DEVICES=${selected_gpu}"
-    log_detail "模型:       ${VLLM_MODEL}"
+    log_detail "空闲显存:   ${free_gb} GB"
+    log_detail "模型:       ${selected_model}"
     log_detail "端口:       ${VLLM_PORT}"
-    log_detail "显存限制:   ${VLLM_GPU_MEM} (gpu-memory-utilization)"
-    log_detail "上下文长度: ${VLLM_MAX_MODEL_LEN} (max-model-len)"
+    log_detail "显存限制:   ${selected_gpu_mem} (gpu-memory-utilization)"
+    log_detail "上下文长度: ${selected_max_len} (max-model-len)"
 
-    # vLLM 日志文件
     local vllm_log="/tmp/vllm_newspage_$(date +%Y%m%d_%H%M%S).log"
     log_detail "日志文件:   ${vllm_log}"
 
-    CUDA_VISIBLE_DEVICES=${selected_gpu} python -m vllm.entrypoints.openai.api_server \
-        --model "${VLLM_MODEL}" \
-        --served-model-name "${VLLM_MODEL}" \
-        --max-model-len ${VLLM_MAX_MODEL_LEN} \
-        --port ${VLLM_PORT} \
-        --gpu-memory-utilization ${VLLM_GPU_MEM} \
+    CUDA_VISIBLE_DEVICES=${selected_gpu} HF_HUB_OFFLINE=1 python -m vllm.entrypoints.openai.api_server \
+        --model "${selected_model}" \
+        --served-model-name "${selected_model}" \
+        --max-model-len "${selected_max_len}" \
+        --port "${VLLM_PORT}" \
+        --gpu-memory-utilization "${selected_gpu_mem}" \
         --trust-remote-code \
         --enforce-eager \
         > "$vllm_log" 2>&1 &
@@ -325,7 +334,6 @@ start_vllm() {
     log_info "vLLM 进程已启动 (PID: ${VLLM_PID})"
     log_detail "查看日志: tail -f ${vllm_log}"
 
-    # --- 等待就绪 ---
     if ! wait_for_vllm; then
         log_error "vLLM 启动失败"
         return 1
@@ -337,7 +345,6 @@ start_vllm() {
 start_fastapi() {
     log_step "第 2 步：启动 NewsPage FastAPI 后端"
 
-    # --- 端口检测 ---
     if ! check_port $FASTAPI_PORT "FastAPI"; then
         log_warn "端口 ${FASTAPI_PORT} 已被占用，后端可能已在运行"
         local http_code
@@ -351,21 +358,17 @@ start_fastapi() {
         return 0
     fi
 
-    # --- 激活环境 ---
     eval "$(conda shell.bash hook)"
     conda activate "$CONDA_ENV"
 
-    if [ -z "${HF_ENDPOINT:-}" ]; then
-        export HF_ENDPOINT="https://hf-mirror.com"
-    fi
+    export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+    export HF_HUB_OFFLINE=1
 
-    # --- 启动 ---
     log_info "启动 NewsPage FastAPI 应用..."
     log_detail "端口:       ${FASTAPI_PORT}"
     log_detail "访问:       ${CYAN}http://localhost:${FASTAPI_PORT}${NC}"
 
-    # 前台运行（方便看日志，Ctrl+C 退出）
-    python app.py
+    HF_HUB_OFFLINE=1 python app.py
 }
 
 # ============================================================
@@ -373,9 +376,8 @@ start_fastapi() {
 # ============================================================
 
 main() {
-    local mode="all"  # all | vllm-only | fastapi-only
+    local mode="all"
 
-    # ---- 参数解析 ----
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --vllm-only|--fastapi-only)
@@ -396,18 +398,16 @@ main() {
 
     banner
 
-    # --- 前置检查 ---
     log_step "前置检查：端口占用"
 
     if [ "$mode" = "all" ] || [ "$mode" = "--vllm-only" ]; then
-        check_port $VLLM_PORT "vLLM" || true  # 不阻塞，start_vllm 中会再次判断
+        check_port $VLLM_PORT "vLLM" || true
     fi
     if [ "$mode" = "all" ] || [ "$mode" = "--fastapi-only" ]; then
         check_port $FASTAPI_PORT "FastAPI" || true
     fi
     echo ""
 
-    # --- 执行启动 ---
     case "$mode" in
         all)
             start_vllm || { log_error "vLLM 启动失败，终止"; exit 1; }
@@ -418,7 +418,6 @@ main() {
             log_info "vLLM 将在后台运行，PID: ${VLLM_PID}"
             log_info "使用 ${BOLD}curl http://localhost:${VLLM_PORT}/v1/models${NC} 验证状态"
             log_info "按 Ctrl+C 停止 vLLM"
-            # 保持前台运行，等待 Ctrl+C
             wait "$VLLM_PID"
             ;;
         --fastapi-only)
@@ -432,7 +431,4 @@ main() {
     esac
 }
 
-# ============================================================
-# 入口（支持参数透传）
-# ============================================================
 main "$@"

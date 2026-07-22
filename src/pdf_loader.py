@@ -31,12 +31,44 @@ PDF 加载与文本分块模块
 =============================================================================
 """
 
+import logging
 import os
-from typing import List
+from typing import List, Optional
 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
+
+from .config import PRODUCT_MAPPING_RULES
+
+logger = logging.getLogger(__name__)
+
+
+def _resolve_product_id_from_filename(filename: str) -> str:
+    """
+    根据文件名解析对应的产品标识。
+
+    使用 PRODUCT_MAPPING_RULES 中的 filename_patterns 进行匹配，
+    不区分大小写，任一模式命中即返回对应 product_id。
+
+    Args:
+        filename: PDF 文件名
+
+    Returns:
+        product_id 字符串，若无法识别则返回 "unknown"
+    """
+    filename_lower = filename.lower()
+    for rule in PRODUCT_MAPPING_RULES:
+        for pattern in rule["filename_patterns"]:
+            if pattern.lower() in filename_lower:
+                logger.info(
+                    f"🏷️  产品识别: '{filename}' → product_id='{rule['product_id']}' "
+                    f"(命中模式: '{pattern}')"
+                )
+                return rule["product_id"]
+
+    logger.warning(f"⚠️  无法识别产品: '{filename}'，标记为 'unknown'")
+    return "unknown"
 
 
 def extract_text_from_pdf(file_path: str) -> str:
@@ -146,13 +178,18 @@ def load_pdfs_from_directory(
         try:
             text = extract_text_from_pdf(file_path)
             if text.strip():
-                # 创建一个 Document 对象，metadata 记录来源文件名
+                # 创建一个 Document 对象，metadata 记录来源文件名和产品标识
+                # 🏷️ 产品打标：根据文件名自动识别产品线（OpenR6 / OpenC3 / ...）
+                product_id = _resolve_product_id_from_filename(pdf_file)
                 doc = Document(
                     page_content=text,
-                    metadata={"source": pdf_file}
+                    metadata={
+                        "source": pdf_file,
+                        "product_id": product_id,
+                    }
                 )
                 all_documents.append(doc)
-                print(f"[pdf_loader]   ✅ {pdf_file}: {len(text)} 字符")
+                logger.info(f"   ✅ {pdf_file}: {len(text)} 字符 (product_id={product_id})")
             else:
                 print(f"[pdf_loader]   ⚠️  {pdf_file}: 未提取到有效文本（可能是扫描件）")
         except Exception as e:
@@ -189,8 +226,28 @@ def load_pdfs_from_directory(
     # split_documents 会将每个长 Document 拆分为多个短 Document
     chunks = text_splitter.split_documents(all_documents)
 
+    # 🔴 Header Injection: 为每个 chunk 提取 C 函数名并注入文本头部
+    # 极大增强 Dense Vector 和 Sparse BM25 对特定函数名的敏感度
+    import re as _re
+    _FUNC_RE = _re.compile(
+        r'\b([a-z_][a-z0-9_]*_[a-z0-9_]+)\s*\(',  # snake_case 函数名( → "set_move_line("
+        _re.IGNORECASE
+    )
+    for chunk in chunks:
+        funcs = set()
+        for m in _FUNC_RE.finditer(chunk.page_content):
+            fname = m.group(1).lower().strip('_')
+            # 过滤掉明显不是 SDK 函数的短名
+            if len(fname) >= 6 and ('_' in fname):
+                funcs.add(fname)
+        if funcs:
+            funcs_sorted = sorted(funcs)[:10]  # 最多 10 个，避免过长
+            header = f"[Functions: {', '.join(funcs_sorted)}]\n"
+            chunk.page_content = header + chunk.page_content
+
     print(f"[pdf_loader] ✅ 加载完成：{len(all_documents)} 个原始文档 → "
-          f"{len(chunks)} 个文本块（chunk_size={chunk_size}, overlap={chunk_overlap}）")
+          f"{len(chunks)} 个文本块（chunk_size={chunk_size}, overlap={chunk_overlap}）"
+          f" [Header Injection 已启用]")
 
     return chunks
 

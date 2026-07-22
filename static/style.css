@@ -290,6 +290,69 @@ body {
 
 .chat-form { width: 100%; }
 
+/* ---- 产品知识库标签（嵌入右侧边栏卡片） ---- */
+.product-tags-section {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--color-border);
+}
+
+.product-tags-label {
+    color: var(--color-text-muted);
+    font-size: 12px;
+    font-weight: 500;
+    margin-bottom: 8px;
+}
+
+.product-tags-container {
+    display: flex;
+    gap: 5px;
+    flex-wrap: wrap;
+}
+
+.product-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 10px;
+    background: var(--color-elevated);
+    border: 1px solid var(--color-border-light);
+    border-radius: 16px;
+    color: var(--color-text);
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all var(--transition);
+    user-select: none;
+    white-space: nowrap;
+}
+
+.product-tag:hover {
+    background: var(--color-primary-soft);
+    border-color: var(--color-primary);
+    color: var(--color-accent);
+    box-shadow: 0 0 8px var(--color-primary-glow);
+}
+
+.product-tag.active {
+    background: var(--color-primary);
+    border-color: var(--color-primary);
+    color: #fff;
+    box-shadow: 0 0 12px var(--color-primary-glow);
+}
+
+.product-tag .tag-dot {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--color-success);
+    flex-shrink: 0;
+}
+
+.product-tag.active .tag-dot {
+    background: #fff;
+}
+
 .input-wrapper {
     display: flex; gap: 10px; align-items: flex-end;
     background: var(--color-surface-alt);

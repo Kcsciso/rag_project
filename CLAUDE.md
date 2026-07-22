@@ -134,28 +134,98 @@ conda run -n rag_agent python tunnel.py --token <YOUR_NGROK_AUTHTOKEN>
 | 文件 | 功能描述 |
 |------|----------|
 | `src/config.py` | **全局配置中心** — 双通道 LLM（vLLM :8001 / 智谱 GLM-4.7-Flash）、GPU 智能探测 API（`detect_best_gpu` / `get_all_gpu_info` / `VLLM_GPU_ID`）、ChromaDB 路径、嵌入模型双轨回退、检索参数（600/100/5/0.75） |
-| `src/pdf_loader.py` | **PDF 加载** — pypdf 逐页提取 → RecursiveCharacterTextSplitter 13 级递归分块 |
-| `src/vector_store.py` | **向量知识库** — HuggingFaceEmbeddings（优先）+ ONNXMiniLM_L6_V2（回退）双轨嵌入；`search_similar_with_threshold()` 阈值过滤；`cleanup_vector_store()` 资源释放 |
-| `src/rag_chain.py` | **RAG 核心管线** — 四层金字塔容灾；`_preprocess_query` 口语化噪音多层迭代剥离（25+ 模式）；`_hybrid_retrieve` 混合检索（向量召回 4×→关键词重排序）；`_score_chunk_for_query` 三层加权打分（43 领域词 + 20 SDK 函数名）；Prompt 注入防御；Layer 3 行级归一化去重；`shutdown_clients()` |
-| `app.py` | **FastAPI 主入口** — 4 条路由 + 安全中间件（`sanitize_query` / `sanitize_filename` / `validate_chat_history`）；SSE 防泄露（`cancelled` + `CancelledError` + 限界队列）；`shutdown` 事件 |
+| `src/pdf_loader.py` | **PDF 加载** — pypdf 逐页提取 → RecursiveCharacterTextSplitter 13 级递归分块 → **Header Injection**（自动提取 C 函数名 `[Functions: xxx]` 注入切片头部） |
+| `src/vector_store.py` | **向量知识库** — bge-small-zh-v1.5 (512维) + ONNX 回退双轨嵌入；**BM25 稀疏检索**（jieba 分词 + 正则标识符保护 + 自定义 SDK 函数词典）；`search_similar_with_threshold()` 阈值过滤；`cleanup_vector_store()` 资源释放 |
+| `src/rag_chain.py` | **RAG 核心管线** — 四层金字塔容灾；`_preprocess_query` 口语噪音剥离；`_hybrid_retrieve` **BM25+向量 RRF 融合 + Autocut 动态截断**；`_score_chunk_for_query` 三层加权打分；`_resolve_vllm_model()` 动态模型解析；防退化采样参数；Prompt 注入防御；`shutdown_clients()` |
+| `app.py` | **FastAPI 主入口 (7860)** — 5 条路由 + 安全中间件；SSE 防泄露；`shutdown` 事件；产品路由（`product_id` + `GET /api/products`） |
+| `frontend_server.py` | **前端 UI 服务 (8501)** — Jinja2 模板渲染 + `/api/*` 反向代理到 7860 后端 |
 | `check_status.py` | **健康检查** — vLLM + FastAPI + GPU 显存/温度/功率 + 四层容灾可用性 + vLLM 部署 GPU 识别 |
 | `start_services.sh` | **一键启动** — GPU 智能选择（`detect_best_gpu` stdout/stderr 严格隔离）+ 端口检测 + vLLM 后台拉起 + FastAPI 启动 + 优雅退出 |
 | `tunnel.py` | **ngrok 隧道** — 公网穿透，authtoken 认证 |
 | `test_robot_rag.py` | **功能回归测试** — 4 题 × 流式/非流式双模式 |
 | `test_stability.py` | **稳定性压力测试** — 多轮对话 + 并发 + 7 种异常降级场景 |
 | `test_human_simulation.py` | **人类模拟测试** — 5 类 14 用例：口语噪音、错别字、多轮指代、长文本组合、边界攻击 |
+| `test_multidoc_simulation.py` | **多文档产品隔离测试** — 多产品 PDF 同时入库：产品打标、物理隔离检索、混合查询主动反问 |
+| `test_rag_eval.py` | **防过拟合评测** — 8 用例 (核心 5 + 泛化 3)，验证产品路由、物理隔离、SDK 函数精确匹配、防幻觉 |
+| `streamlit_app.py` | **Streamlit 前端** — 端口 8501 的备用前端 UI |
 
-## 四层金字塔容灾架构（ADR-5）
+## 产品级物理隔离架构（ADR-6）
+
+```
+用户提问 ──────────────────────────────────────────────────┐
+  │                                                        │
+  ▼                                                        │
+┌──────────────────────────────────────┐                    │
+│ 第 0 步：产品意图路由 (Product Router) │                   │
+│                                      │                   │
+│  product_id 已提供？（前端强指定）     │                   │
+│    ├── 是 → 直接使用                  │                  │
+│    └── 否 → _resolve_product_from_query()              │
+│              ├── 命中 → 锁定 product_id                 │
+│              └── 未命中 → 反问澄清                     │
+│                    "请问您询问的是哪一款产品呢？"         │
+└──────────────────────────────────────┘                   │
+  │                                                        │
+  ▼ (product_id 已确定)                                    │
+┌──────────────────────────────────────┐                    │
+│ ChromaDB 混合检索（product_id 物理隔离）│                  │
+│   where={"product_id": "OpenR6"}      │  ← 100% 单库隔离 │
+│   向量召回 4× → 关键词重排序 → Top-K   │                   │
+└──────────────────────────────────────┘                   │
+  │                                                        │
+  ▼                                                        │
+  四层容灾 (Layer 1→2→3→4)
+```
+
+### 产品映射规则（入库阶段 — 文件名 → product_id）
+
+定义于 `src/config.py` → `PRODUCT_MAPPING_RULES`：
+
+| product_id | filename_patterns | content_keywords |
+|------------|-------------------|------------------|
+| OpenR6 | `["OpenR6", "openr6", "R6", "windows系统"]` | `["py_dll", "Robot_.*", "windows"]` |
+| OpenC3 | `["OpenC3", "openc3", "六轴机械臂", "collrob", "六轴"]` | `["六轴", "collrob", "OpenC3", "机械臂"]` |
+
+**动态扩展**：新增产品只需追加一条规则，无需更改任何核心逻辑代码。
+
+### 产品路由器（查询阶段 — query → product_id）
+
+定义于 `src/config.py` → `PRODUCT_ROUTER_RULES`：
+
+| product_id | 关键词 | priority |
+|------------|--------|----------|
+| OpenR6 | `"OpenR6"`, `"py_dll"`, `"R6"`, `"windows"`, `"windows系统"` | 10 |
+| OpenC3 | `"OpenC3"`, `"collrob"`, `"六轴"`, `"六轴机械臂"` | 10 |
+
+### 产品路由相关函数
+
+| 函数 | 位置 | 用途 |
+|------|------|------|
+| `_resolve_product_from_query(query)` | `src/rag_chain.py` | 从用户查询中动态识别产品 |
+| `_build_clarification_response()` | `src/rag_chain.py` | 非流式澄清反问 |
+| `_build_clarification_response_stream()` | `src/rag_chain.py` | 流式澄清反问（15 字符/块打字机） |
+| `_resolve_product_id_from_filename()` | `src/pdf_loader.py` | 文件名→product_id 打标 |
+| `resolve_product_id(filename)` | `src/vector_store.py` | 公开的产品识别 API |
+| `get_registered_products()` | `src/vector_store.py` | 查询已入库的产品列表 |
+| `clear_vector_store()` | `src/vector_store.py` | 彻底清空 ChromaDB（Collection API + 物理删除双方案）|
 
 ```
 用户提问
   │
   ▼
-ChromaDB 混合检索（Query 预处理 + 向量召回 4× + 关键词重排序 + 阈值 0.78）
+产品路由器 (Product Router) → product_id 物理隔离
   │
-  ├── Layer 1: 本地 vLLM (Qwen2.5-1.5B-Instruct, GPU 自适应, :8001)
-  │     • 超时: connect=2s / read=12s
-  │     • 并发保护: threading.Lock（串行化，超时 30s 后降级）
+  ▼
+BM25 + 向量混合检索（RRF 融合 + Autocut 动态截断）
+  │  ├─ Dense: bge-small-zh-v1.5 向量召回 (fetch_factor=5)
+  │  ├─ Sparse: BM25 jieba+正则 关键词召回
+  │  ├─ RRF 融合排序 (K=60)
+  │  └─ Autocut 动态截断 [2, 8]
+  │
+  ├── Layer 1: 本地 vLLM (_resolve_vllm_model 动态解析, :8001)
+  │     • 超时: connect=5s / read=60s (推理) / read=5s (健康检查)
+  │     • 采样: temperature=0.3, repetition_penalty=1.2, max_tokens=1024
+  │     • 并发保护: threading.Lock + 预检 _check_vllm_health()
   │     └── 失败 → Layer 2
   │
   ├── Layer 2: 智谱 GLM-4.7-Flash (open.bigmodel.cn)
@@ -163,12 +233,10 @@ ChromaDB 混合检索（Query 预处理 + 向量召回 4× + 关键词重排序 
   │     └── 失败 → Layer 3
   │
   ├── Layer 3: 纯向量检索智能直出 (CPU-only, 零显存/零API)
-  │     • Query 预处理 → 混合检索 → 行级归一化去重 → 结构化输出
-  │     • 流式: ~15 字符/块分段 yield 模拟打字机
+  │     • 行级归一化去重 → 结构化输出 → 模拟流式
   │     └── 失败 → Layer 4
   │
   └── Layer 4: 优雅中文错误提示
-        • "大模型服务暂时不可用，请稍后重试"
         • HTTP 503 + 结构化 JSON
 ```
 
@@ -243,19 +311,54 @@ MODEL_NAME   = "Qwen/Qwen2.5-1.5B-Instruct"
 DEEPSEEK_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 DEEPSEEK_MODEL    = "glm-4.7-flash"
 
-# LLM 超时
-LLM_TIMEOUT = httpx.Timeout(connect=2.0, read=12.0, write=12.0, pool=2.0)
+# LLM 超时（vLLM 预检 + 从容超时）
+# _check_vllm_health()     → 预检 GET /v1/models（connect=3s/read=5s 独立短超时）
+# _resolve_vllm_model()    → 动态获取 vLLM 实际模型名，缓存后用于所有 LLM 调用
+LLM_TIMEOUT = httpx.Timeout(connect=5.0, read=15.0, write=15.0, pool=5.0)
+LLM_INFERENCE_TIMEOUT = httpx.Timeout(connect=5.0, read=60.0, write=15.0, pool=5.0)
+_VLLM_HEALTH_TIMEOUT = httpx.Timeout(connect=3.0, read=5.0, write=5.0, pool=3.0)
 
-# 检索参数
-CHUNK_SIZE           = 600
-CHUNK_OVERLAP        = 100
-RETRIEVAL_K          = 5
-SIMILARITY_THRESHOLD = 0.78
+# 检索参数（ADR-7 BM25 混合 + ADR-8 Autocut）
+CHUNK_SIZE           = 300
+CHUNK_OVERLAP        = 50
+RETRIEVAL_K          = 8     # 最大保留数（Autocut 上限）
+SIMILARITY_THRESHOLD = 0.68
 DIRECT_RETRIEVAL_K   = 2
+_AUTOCUT_MIN_K       = 2     # Autocut 下限（防止切太狠）
+_AUTOCUT_MAX_K       = 8     # Autocut 上限（防止撑爆上下文）
+
+# 🔴 混合检索 (ADR-7): BM25 + Vector RRF 融合
+# _hybrid_retrieve() 内置：
+#   ① Dense: bge-small-zh-v1.5 向量召回（fetch_factor=5）
+#   ② Sparse: BM25 jieba+正则 关键词召回
+#   ③ RRF 融合排序 (K=60)
+#   ④ _autocut_knee() 断崖检测 → 动态截断 [2, 8]
+#   ⑤ Header Injection: [Functions: xxx] 自动注入切片头部
+
+# 嵌入模型
+EMBEDDING_MODEL_NAME = "BAAI/bge-small-zh-v1.5"  # 512 维中文专优
+FALLBACK_TO_ONNX     = True
+HF_HUB_OFFLINE       = "1"  # 离线模式，模型已缓存
+
+# 产品隔离（ADR-6）
+# PRODUCT_MAPPING_RULES  → 入库时文件名打标 → product_id 写入 ChromaDB metadata
+# PRODUCT_ROUTER_RULES   → 查询时意图识别 → product_id 物理隔离检索
+
+# 部署端口映射
+# FastAPI 后端: 7860 (内) → 50003 (外)
+# Frontend UI:  8501 (内) → 50004 (外)
+# vLLM 推理:    8001 (内)
 
 # Web 服务
 HOST = "0.0.0.0"
 PORT = 8000
+
+# API 路由
+# GET  /                → NewsPage 主页面
+# POST /api/chat        → RAG 对话（新增 product_id 表单参数，支持流式 SSE）
+# POST /api/upload      → 上传 PDF 并重建向量库（上传前清空旧库，返回 product_distribution）
+# GET  /api/status      → 向量库状态
+# GET  /api/products    → 已注册产品列表 [新增]
 
 # 嵌入模型
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"

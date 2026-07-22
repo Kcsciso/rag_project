@@ -11,10 +11,13 @@
 - **显卡智能自适应部署**：`start_services.sh` 通过 `nvidia-smi` 实时扫描所有 GPU 空闲显存，自动绑定剩余空间最大的 GPU，避免硬编码导致的 OOM 崩溃。`detect_best_gpu()` 函数的 stdout/stderr 已严格隔离，杜绝日志污染变量。
 - **毫秒级流式秒回**：FastAPI SSE 异步非阻塞线程池隔离 + 前端 50ms 节流渲染，LLM 读取超时激进缩短至 12s。
 
-### 🔍 智能检索优化
-- **Query 预处理**（`_preprocess_query`）：多层迭代剥离口语化噪音（"那个啥"、"你给我整一个"、"呗"等 25+ 模式），提取核心检索实体。
-- **混合检索**（`_hybrid_retrieve`）：向量召回 4 倍候选池 → 相似度阈值 0.78 过滤 → 43 个中文领域操作词 + 20 个 SDK 函数名三层加权重排序 → 返回精准 Top-K。
-- **行级归一化去重**：Layer 3 降级时自动归一化代码行指纹，全局集合 `_global_seen_lines` 彻底消除 chunk_overlap 导致的代码块重复。
+### 🔍 智能检索优化（ADR-7/ADR-8）
+- **中文专优嵌入**（`BAAI/bge-small-zh-v1.5`）：512 维中文语义向量，精准匹配中文技术查询与 C 函数名。
+- **BM25 + Vector 混合检索**：Dense 向量召回 (bge 语义) + Sparse BM25 关键词召回 (jieba 分词 + 正则标识符保护) → RRF (Reciprocal Rank Fusion) 融合排序。
+- **Autocut 动态截断**（`_autocut_knee`）：基于 RRF 分数断崖/跳变点 (Knee Point) 检测，自适应确定最佳截断位置 [2, 8]。
+- **C 函数 Header Injection**（`[Functions: xxx]`）：切片头部自动注入所含函数名，极大增强 Dense/Sparse 检索敏感度。
+- **Query 预处理**（`_preprocess_query`）：多层迭代剥离口语化噪音（25+ 模式）。
+- **产品级物理隔离**（ADR-6）：入库自动打标 → 检索 `where={"product_id":"OpenR6"}` → 未指定时主动反问。
 
 ### 🔒 企业级安全与稳定性
 - **全栈输入防御**：防路径遍历（`sanitize_filename`）、Null 字节与控制字符清洗（`sanitize_query`）、Prompt 注入过滤（`_contains_injection_pattern`）、历史消息角色白名单（`validate_chat_history`）。
@@ -67,9 +70,9 @@ rag_project/
 | **推理引擎** | vLLM 0.16.0（OpenAI 兼容 API，端口 **8001**） |
 | **默认模型** | `Qwen/Qwen2.5-1.5B-Instruct`（~3.7 GB，GPU 自适应部署） |
 | **云端降级** | 智谱 GLM-4.7-Flash（免费模型，`open.bigmodel.cn`） |
-| **嵌入模型** | `all-MiniLM-L6-v2`（384 维）→ ONNX 自动回退 |
-| **相似度阈值** | 0.78（cosine distance，含 5% 混合检索放宽） |
-| **Web 框架** | FastAPI + Jinja2（端口 **8000**） |
+| **嵌入模型** | `BAAI/bge-small-zh-v1.5`（512 维，中文专优）→ ONNX 自动回退 |
+| **相似度阈值** | 0.68（cosine distance，配合 BM25+RRF 混合检索） |
+| **Web 框架** | FastAPI + Jinja2（API `7860`/前端 UI `8501`） |
 
 **🔴 核心锁定依赖（严禁升级）**：
 - `torch==2.6.0+cu124` / `torchvision==0.21.0+cu124` / `torchaudio==2.6.0+cu124`
@@ -119,26 +122,39 @@ CUDA_VISIBLE_DEVICES=1 python -m vllm.entrypoints.openai.api_server \
     --enforce-eager
 ```
 
-**终端 B — NewsPage FastAPI 后端**：
+**终端 B — NewsPage FastAPI 后端 (端口 7860)**：
 ```bash
 conda activate rag_agent
 export HF_ENDPOINT=https://hf-mirror.com
+export HF_HUB_OFFLINE=1
 python app.py
 ```
 
-访问：**`http://localhost:8000`**（页面标题：**NewsPage**）｜API 文档：`http://localhost:8000/docs`
-
-### 4. 一键停止所有服务
-
+**终端 C — 前端 UI (端口 8501)**：
 ```bash
-# 快速停止所有 NewsPage 相关进程
-pkill -f "app.py" 2>/dev/null
-pkill -f "vllm.entrypoints" 2>/dev/null
-# 或定义快捷别名:
-alias stoprag='pkill -f "app.py"; pkill -f "vllm.entrypoints"; echo \"NewsPage 已停止\"'
+conda activate rag_agent
+python frontend_server.py
 ```
 
-### 5. 系统健康检查
+访问：**`http://localhost:8501`**（页面标题：**NewsPage**）｜API 文档：`http://localhost:7860/docs`
+
+### 4. 外网端口映射
+
+| 服务 | 内部端口 | 外部端口 | 外部访问 URL |
+|------|---------|---------|-------------|
+| FastAPI 后端 | 7860 | 50003 | `http://<服务器IP>:50003` |
+| 前端 UI | 8501 | 50004 | `http://<服务器IP>:50004` |
+| vLLM 推理 | 8001 | — | 仅内网 |
+
+### 5. 一键停止所有服务
+
+```bash
+fuser -k 7860/tcp 2>/dev/null   # 停止 FastAPI
+fuser -k 8501/tcp 2>/dev/null   # 停止前端
+pkill -f "vllm.entrypoints" 2>/dev/null  # 停止 vLLM
+```
+
+### 6. 系统健康检查
 
 ```bash
 python check_status.py                # 一次性完整报告

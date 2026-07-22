@@ -12,7 +12,7 @@
     <!-- marked.js Markdown 渲染 -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
 
-    <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="/static/style.css?v=20260722">
 </head>
 <body>
     <!-- ============================================================ -->
@@ -120,6 +120,11 @@
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
                     刷新状态
                 </button>
+                <!-- 🏷️ 设备知识库标签（嵌入侧边栏） -->
+                <div class="product-tags-section" id="productTagsSection" style="display: none;">
+                    <div class="product-tags-label">🏷️ 已加载设备知识库：</div>
+                    <div class="product-tags-container" id="productTagsContainer"></div>
+                </div>
             </div>
 
             <!-- 使用提示 -->
@@ -139,6 +144,30 @@
         </aside>
     </div>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=20260722"></script>
+    <!-- 🔴 兜底内联脚本：延迟执行，仅在外链 JS 未渲染标签时补位 -->
+    <script>
+    setTimeout(function() {
+        var section = document.getElementById("productTagsSection");
+        var container = document.getElementById("productTagsContainer");
+        if (!section || !container) return;
+        // 如果主 JS 已渲染标签，不再重复渲染
+        if (container.children.length > 0) return;
+        fetch("/api/products").then(function(r) { return r.json(); }).then(function(data) {
+            var unique = []; new Set((data.products || []).filter(function(p) { return p && p !== "unknown"; })).forEach(function(v) { unique.push(v); });
+            if (unique.length === 0) return;
+            section.style.display = "block";
+            container.innerHTML = "";
+            unique.forEach(function(pid) {
+                var tag = document.createElement("span");
+                tag.className = "product-tag";
+                tag.textContent = pid;
+                tag.style.cssText = "display:inline-flex;align-items:center;gap:4px;padding:3px 10px;background:var(--color-elevated);border:1px solid var(--color-border-light);border-radius:16px;color:var(--color-text);font-size:11px;font-weight:600;cursor:pointer;margin-right:4px;margin-bottom:4px;";
+                tag.title = "点击筛选 " + pid + " 知识库";
+                container.appendChild(tag);
+            });
+        }).catch(function(){});
+    }, 500);
+    </script>
 </body>
 </html>
