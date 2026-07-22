@@ -41,6 +41,7 @@ from src.config import (
     MAX_UPLOAD_SIZE,
 )
 from src.pdf_loader import load_pdfs_from_directory
+from src.multimodal_loader import load_enhanced_documents  # 🔴 阶段二：多模态解析
 from src.vector_store import (
     create_vector_store,
     load_vector_store,
@@ -451,7 +452,25 @@ async def upload_pdf(file: UploadFile = File(..., description="PDF 文件")):
         clear_vector_store(CHROMA_PERSIST_DIR)
         logger.info("🧹 旧向量库已清空，开始重新索引...")
 
-        documents = load_pdfs_from_directory(PDF_DATA_DIR, CHUNK_SIZE, CHUNK_OVERLAP)
+        # 🔴 阶段二：智能加载 — 有表格/图片时用增强解析，纯文本用标准解析
+        from src.multimodal_loader import _extract_tables_from_page, _extract_images_info
+        has_rich_content = False
+        for f in os.listdir(PDF_DATA_DIR):
+            if not f.lower().endswith('.pdf'):
+                continue
+            fp = os.path.join(PDF_DATA_DIR, f)
+            try:
+                imgs = _extract_images_info(fp)
+                if imgs:
+                    has_rich_content = True
+                    break
+            except Exception:
+                pass
+        if has_rich_content:
+            logger.info("📊 检测到含表格/图片的复杂文档，启用多模态解析")
+            documents = load_enhanced_documents(PDF_DATA_DIR, CHUNK_SIZE, CHUNK_OVERLAP)
+        else:
+            documents = load_pdfs_from_directory(PDF_DATA_DIR, CHUNK_SIZE, CHUNK_OVERLAP)
 
         if not documents:
             return JSONResponse({
