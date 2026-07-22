@@ -199,6 +199,10 @@ async def startup_event():
     if vector_store:
         info = get_vector_store_info(vector_store)
         logger.info(f"📚 已加载向量库：{info['document_count']} 个文档片段")
+
+        # 🔴 重建 BM25 索引（内存索引，重启后需从 ChromaDB 恢复）
+        from src.vector_store import build_bm25_from_chromadb
+        build_bm25_from_chromadb(vector_store)
     else:
         logger.info("📭 向量库为空，请通过 WebUI 上传 PDF 文件")
 

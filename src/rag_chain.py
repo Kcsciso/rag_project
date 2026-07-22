@@ -1534,7 +1534,7 @@ def _build_messages(
 # Autocut 动态自适应截断 — 基于 RRF 分数断崖检测
 # ============================================================
 
-_AUTOCUT_MIN_K = 2   # 最少保留切片数（防止切太狠）
+_AUTOCUT_MIN_K = 4   # 最少保留切片数（防止切太狠，确保函数名切片不被误杀）
 _AUTOCUT_MAX_K = 8   # 最多保留切片数（防止撑爆上下文）
 
 
@@ -1578,7 +1578,7 @@ def _autocut_knee(rrf_scores: List[float]) -> int:
     # 钳制
     cut = max(_AUTOCUT_MIN_K, min(knee_pos + 1, _AUTOCUT_MAX_K, n))
 
-    logger.debug(
+    logger.info(
         f"🔪 Autocut: {n} 个候选 → max_diff={best_diff:.4f} @ pos={knee_pos} "
         f"→ cut={cut} (clamped [{_AUTOCUT_MIN_K}, {_AUTOCUT_MAX_K}])"
     )

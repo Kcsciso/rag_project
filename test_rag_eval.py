@@ -30,7 +30,7 @@ import requests
 # ============================================================
 # 配置
 # ============================================================
-BASE_URL = "http://localhost:8000"
+BASE_URL = "http://localhost:7860"
 CHAT_ENDPOINT = f"{BASE_URL}/api/chat"
 TIMEOUT = 60  # 单次请求最长等待时间（秒）
 

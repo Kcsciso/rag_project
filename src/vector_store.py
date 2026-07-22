@@ -766,6 +766,50 @@ def _tokenize_for_bm25(text: str) -> List[str]:
     return tokens
 
 
+def build_bm25_from_chromadb(vector_store: Chroma):
+    """
+    从 ChromaDB 中提取所有文档，重建 BM25 内存索引。
+
+    用于 FastAPI 启动时恢复 BM25 索引（BM25 为纯内存索引，无持久化）。
+    """
+    global _bm25_indexes, _bm25_corpus
+    from rank_bm25 import BM25Okapi
+
+    from langchain_core.documents import Document
+
+    try:
+        collection_data = vector_store._collection.get(include=["metadatas", "documents"])
+        if not collection_data or not collection_data.get("ids"):
+            logger.warning("⚠️  ChromaDB 为空，BM25 索引跳过")
+            return
+
+        ids = collection_data["ids"]
+        docs = collection_data["documents"]
+        metas = collection_data["metadatas"]
+
+        # 按 product_id 分组
+        product_docs: Dict[str, list] = {}
+        for i, doc_id in enumerate(ids):
+            pid = metas[i].get("product_id", "unknown") if i < len(metas) else "unknown"
+            if pid not in product_docs:
+                product_docs[pid] = []
+            doc = Document(page_content=docs[i], metadata=metas[i])
+            product_docs[pid].append(doc)
+
+        for pid, p_docs in product_docs.items():
+            tokenized = [_tokenize_for_bm25(doc.page_content) for doc in p_docs]
+            if not tokenized:
+                continue
+            _bm25_indexes[pid] = BM25Okapi(tokenized)
+            _bm25_corpus[pid] = p_docs
+            logger.info(f"📊 BM25 索引已恢复: product_id='{pid}', {len(p_docs)} 个片段")
+
+        total = sum(len(v) for v in _bm25_corpus.values())
+        logger.info(f"✅ BM25 混合检索就绪: {len(_bm25_indexes)} 个产品索引, 共 {total} 个片段")
+    except Exception as e:
+        logger.error(f"❌ BM25 索引恢复失败: {e}")
+
+
 def build_bm25_index(documents: list, persist_dir: str = CHROMA_PERSIST_DIR):
     """
     为每个产品构建独立的 BM25 索引。
