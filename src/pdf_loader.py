@@ -226,6 +226,70 @@ def load_pdfs_from_directory(
     # split_documents 会将每个长 Document 拆分为多个短 Document
     chunks = text_splitter.split_documents(all_documents)
 
+    # ================================================================
+    # 🔴 Section Injection: 自动提取章节标题并注入切片头部
+    # ================================================================
+    import bisect as _bisect
+    _HEADING_PATTERNS = [
+        _re.compile(r'^(\d+(?:\.\d+)+)\s+(.+?)(?:\r?\n|$)', _re.MULTILINE),
+        _re.compile(r'^(第[一二三四五六七八九十\d]+[章节])\s*(.+?)(?:\r?\n|$)', _re.MULTILINE),
+        _re.compile(r'^([（(]?[一二三四五六七八九十]+[）)]?[\s、,，])\s*(.+?)(?:\r?\n|$)', _re.MULTILINE),
+        _re.compile(r'^(#{1,4})\s+(.+?)(?:\r?\n|$)', _re.MULTILINE),
+        _re.compile(r'^(?:[■□◆◇●○]|##?)\s*(?:(\d+(?:\.\d+)*)\s+)?(.+?)(?:\r?\n|$)', _re.MULTILINE),
+    ]
+
+    def _extract_headings_pdf(text: str) -> list:
+        seen_positions = set()
+        headings = []
+        for pattern in _HEADING_PATTERNS:
+            for m in pattern.finditer(text):
+                pos = m.start()
+                if pos in seen_positions:
+                    continue
+                seen_positions.add(pos)
+                full = m.group(0).strip()
+                if 3 <= len(full) <= 80:
+                    headings.append((pos, full))
+        headings.sort(key=lambda x: x[0])
+        deduped = []
+        for pos, title in headings:
+            if deduped and pos - deduped[-1][0] < len(deduped[-1][1]) + 5:
+                if len(title) > len(deduped[-1][1]):
+                    deduped[-1] = (pos, title)
+            else:
+                deduped.append((pos, title))
+        return deduped
+
+    def _resolve_section_pdf(chunk_text: str, full_text: str, headings: list) -> str:
+        if not headings:
+            return ""
+        fingerprint = chunk_text.strip()[:80]
+        pos = full_text.find(fingerprint)
+        if pos < 0:
+            fingerprint = chunk_text.strip()[:40]
+            pos = full_text.find(fingerprint)
+        if pos < 0:
+            return ""
+        idx = _bisect.bisect_right([h[0] for h in headings], pos) - 1
+        if idx >= 0:
+            return headings[idx][1]
+        return ""
+
+    section_injected_count = 0
+    for original_doc in all_documents:
+        full_text = original_doc.page_content
+        headings = _extract_headings_pdf(full_text)
+        if not headings:
+            continue
+        source = original_doc.metadata.get("source", "?")
+        for chunk in chunks:
+            if chunk.metadata.get("source") != source:
+                continue
+            section = _resolve_section_pdf(chunk.page_content, full_text, headings)
+            if section:
+                chunk.page_content = f"[章节: {section}]\n{chunk.page_content}"
+                section_injected_count += 1
+
     # 🔴 Header Injection: 为每个 chunk 提取 C 函数名并注入文本头部
     # 极大增强 Dense Vector 和 Sparse BM25 对特定函数名的敏感度
     import re as _re
@@ -233,6 +297,7 @@ def load_pdfs_from_directory(
         r'\b([a-z_][a-z0-9_]*_[a-z0-9_]+)\s*\(',  # snake_case 函数名( → "set_move_line("
         _re.IGNORECASE
     )
+    func_injected_count = 0
     for chunk in chunks:
         funcs = set()
         for m in _FUNC_RE.finditer(chunk.page_content):
@@ -244,10 +309,11 @@ def load_pdfs_from_directory(
             funcs_sorted = sorted(funcs)[:10]  # 最多 10 个，避免过长
             header = f"[Functions: {', '.join(funcs_sorted)}]\n"
             chunk.page_content = header + chunk.page_content
+            func_injected_count += 1
 
     print(f"[pdf_loader] ✅ 加载完成：{len(all_documents)} 个原始文档 → "
           f"{len(chunks)} 个文本块（chunk_size={chunk_size}, overlap={chunk_overlap}）"
-          f" [Header Injection 已启用]")
+          f" [Section Injected: {section_injected_count}, Header Injected: {func_injected_count}]")
 
     return chunks
 

@@ -1920,3 +1920,114 @@ def _autocut_knee(rrf_scores):
 |------|--------|--------|
 | 纯 SDK | 87 | 88% (7/8) |
 | SDK + JAKA | 607 | 75% (6/8) |
+
+---
+
+## 二十六、阶段三：轻量化幻觉防御 + 检索精准度提升
+
+> **日期**: 2026-07-23  
+> **变更范围**: `src/rag_chain.py`, `src/graph_rag.py`, `src/vector_store.py`, `src/multimodal_loader.py`, `src/pdf_loader.py`, `src/agent_state.py` (新建), `CLAUDE.md`, `README.md`, `app.py`  
+> **核心目标**: 在不引入 OCR 引擎的前提下，通过上下文工程手段（父子切片扩展 + 章节注入 + 柔性 Grounding）最大化 1.5B 小模型的工业文档问答能力。
+
+### 26.1 诊断：JAKA 端口号 6502 不可提取
+
+**测试**：在 JAKA Zu APP 手册全量文本（102,562 字符）中搜索 `6502` → **0 次命中**。
+
+**根因**：端口数值仅存在于 PDF 截图（图 3-34 Modbus 参数界面）中，而非可选中文字。pdfplumber 和 PyMuPDF 只能提取文字层内容，无法 OCR 截图中的数字。
+
+**影响**：所有"默认密码"、"端口号"等需精确数字的问题，模型均无法从文本中获得答案，只能看到"端口号：与Client端口号一致"等间接描述。
+
+**结论**：此为 PDF 格式物理限制，非解析逻辑 bug。需后续引入 OCR 双轨解析（Tesseract/PaddleOCR）解决。**当前方案**：柔性 Grounding 提示引导模型诚实承认"文档未记载"，而非猜测。
+
+### 26.2 父子切片上下文扩展（Parent-Child Chunk Expansion）
+
+新增 `_expand_parent_sections()` in `src/rag_chain.py`：
+
+```python
+# 1. 从已检索切片的 [章节: X.Y.Z] 头中提取章节 ID
+# 2. 按章节 ID 从 ChromaDB 捞取同章节兄弟切片 (max_siblings=2)
+# 3. 去重后追加到上下文
+```
+
+**调用链**：`rag_chat()` → `_hybrid_retrieve()` → `_expand_parent_sections()` → `_build_messages()`
+
+**场景验证**：TCP 四点法步骤分布在 5 个切片中，检索命中第 1/3 片 → 自动补充第 2/4/5 片 → LLM 获得完整流程。
+
+### 26.3 柔性 Grounding 提示
+
+在 `_build_messages()` 中新增动态提示逻辑：
+
+- **触发**: query 正则匹配 `(默认|初始|预设).{0,6}(密码|端口|IP|参数)` 等数字关键词
+- **检查**: Context 中无 ≥2 位数字（`\b\d{2,}\b`）
+- **追加**: `[提示：参考切片中未包含确切的数字参数...切勿猜测 admin、502 等通用默认值]`
+
+**原则**：不做 `_is_impossible_query()` 硬拦截（已移除升级/固件拦截正则），相信检索 + 柔性提示引导模型诚实。
+
+### 26.4 多轮对话 Citation 前缀清洗
+
+在 `_build_messages()` 历史处理中，剥离 assistant 回复里的章节溯源长前缀：
+
+```
+剥离前: "根据《JAKA Zu APP 使用手册》第 3.1.5.1 节【Modbus通讯设置】的部分，JAKA 支持..."
+剥离后: "JAKA 支持..."
+```
+
+**目的**: 防止第二轮模型将上一轮的溯源前缀复读为当前回答的背景幻觉。
+
+### 26.5 文档术语自动提取 + 章节标题注入
+
+| 功能 | 位置 | 效果 |
+|------|------|------|
+| `_auto_extract_and_register_terms()` | `src/vector_store.py` | BM25 构建时自动扫描章节标题/表头/缩写/SDK 函数名 → 注册到 jieba（累计 600 词） |
+| Section Injection | `src/multimodal_loader.py` + `src/pdf_loader.py` | 5 类标题模式（编号型/章型/中文序号/Markdown #/装饰符）→ 85.6% 切片带 `[章节: X.Y.Z 标题]` |
+| Context 物理标注 | `src/rag_chain.py` → `_build_messages()` | 每个切片头部 `【出处: 《文件名》】` + 正文含 `[章节: X.Y.Z]` |
+
+### 26.6 LangGraph 状态图引擎（第一阶段架构重构）
+
+**新建文件**：
+- `src/agent_state.py` — `RAGState` TypedDict（9 字段）
+- `src/graph_rag.py` — 4 节点 StateGraph + 条件边
+
+**图结构**: `query_fusion → product_routing → {clarify→END | hybrid_retrieval → llm_generation → END}`
+
+**API 兼容**: `app.py` 的 `/api/chat` 路由已平滑切换为 `run_graph()` / `run_graph_stream()`，请求/响应格式完全不变。
+
+### 26.7 Token 预算与超时优化
+
+| 参数 | 旧值 | 新值 |
+|------|------|------|
+| `_AUTOCUT_MAX_K` | 8 | **3** |
+| 单 chunk Context 截断 | 无 | **200 字符** |
+| `max_tokens` | 1024 | **384** |
+| `LLM_INFERENCE_TIMEOUT.read` | 60s | **120s** |
+| `LLM_INFERENCE_TIMEOUT.connect` | 5s | **10s** |
+| `_VLLM_LOCK_TIMEOUT` | 30s | **120s** |
+
+**Token 预算**: 3 切片 × 200 字符 + System Prompt (~1500 tokens) + Query (~200 tokens) + `max_tokens=384` ≈ 3300 + 384 = 3684 **< 4096** ✅
+
+### 26.8 `[Image: ...]` OCR 噪声过滤
+
+**双级过滤**：
+- 检索级: `_hybrid_retrieve()` 中 `[Image: ...]` 内容占比 > 60% → 丢弃
+- Context 组装级: `_build_messages()` 中 `re.sub(r'\[Image:\s*[^\]]*\]', '', content)` + 空壳切片跳过
+
+### 26.9 验证结果
+
+| 测试 | 状态 |
+|------|------|
+| 5 轮连续 LLM 生成（零 Layer 3 降级） | ✅ 5/5 |
+| 章节检索精度（密码→3.1.1.6, 关机→2.2.5, Modbus→3.1.5.1） | ✅ 3/3 |
+| Token 预算（input+output < 4096） | ✅ 3684 tokens |
+| `[Image:]` 噪声过滤（安全区域查询过滤 8 个纯图片切片） | ✅ |
+| LangGraph 状态污染 Bug 修复 (`s1.update(initial_state)` → `{**initial_state, **s1}`) | ✅ |
+
+### 26.10 下一步计划：OCR 双轨解析
+
+**目标**：解决截图中的数值（端口 6502、密码 jakazuadmin）不可提取的问题。
+
+**候选方案**：
+1. **Tesseract OCR**（离线，中文支持好，需 `tesseract-ocr` + `pytesseract` 包）
+2. **PaddleOCR**（中文专优，需 `paddlepaddle` + `paddleocr` 包，显存消耗约 2-3 GB）
+3. **方案一（推荐）**：Tesseract 轻量离线 OCR，对 524 张 JAKA 截图做批量文字识别，结果注入对应章节切片。
+
+**风险**：新增依赖需验证与锁定依赖无冲突；OCR 误识别率需人工抽查。

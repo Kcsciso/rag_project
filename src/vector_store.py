@@ -627,6 +627,14 @@ def search_similar_with_threshold(
     chroma_filter = None
     if product_id:
         chroma_filter = {"product_id": product_id}
+    else:
+        # 🔴 防御性日志：product_id 为空意味着跨产品混合检索
+        # 正常情况下，调用方应在产品路由阶段锁定 product_id。
+        # 此日志用于捕获意外绕过产品隔离的调用路径。
+        logger.warning(
+            "⚠️  search_similar_with_threshold 未指定 product_id，"
+            "将进行跨产品混合检索（可能触发隐式路由后续纠正）"
+        )
 
     # 使用 similarity_search_with_score 获取带距离分数的检索结果
     # langchain-chroma 支持 filter 参数，底层转换为 ChromaDB 的 where 条件
@@ -708,7 +716,9 @@ _bm25_indexes: dict = {}
 _bm25_corpus: dict = {}
 
 
-# ── jieba 自定义词典：将 SDK 函数名注册为不可分割的整词 ──
+# ── jieba 自定义词典引导种子（少量关键 SDK 函数名，防冷启动漏词）──
+# 🟢 主要术语注册已由 _auto_extract_and_register_terms() 在 BM25 构建时自动完成。
+#    以下仅为冷启动引导种子——即使文档尚未入库，也能确保常见 SDK 函数不被切碎。
 _SDK_FUNCTION_NAMES = [
     # OpenR6
     "set_robot_power_on", "set_robot_power_off", "set_robot_arm_home",
@@ -723,18 +733,103 @@ _SDK_FUNCTION_NAMES = [
 ]
 for _func in _SDK_FUNCTION_NAMES:
     jieba.add_word(_func, freq=999, tag='eng')
-    # 也注册去除 robot_ 前缀的短名（用户可能直接搜索 "movl"）
     if _func.startswith("robot_"):
-        short = _func[6:]  # "robot_movl" → "movl"
+        short = _func[6:]
         if len(short) >= 3:
             jieba.add_word(short, freq=500, tag='eng')
-    if _func.startswith("set_"):
-        short = _func  # keep as-is for set_xxx functions
 jieba.add_word("py_dll", freq=999, tag='eng')
 jieba.add_word("collrob_sdk", freq=999, tag='eng')
 
 # ── 正则预分器：保留下划线连接的标识符作为原子 token ──
 _IDENTIFIER_RE = re.compile(r'[a-zA-Z_][a-zA-Z0-9_]*')
+
+# ── 已自动注册的术语集合（防重复注册）──
+_auto_registered_terms: set = set()
+
+
+def _auto_extract_and_register_terms(documents: list):
+    """
+    从文档全集中自动提取章节标题、表格表头和技术术语，
+    动态注册为 jieba 整词，确保 BM25 检索时不会被切碎。
+
+    提取源：
+      1. 章节标题行（编号型 / 章型 / 中文序号型 / Markdown # 型）
+      2. Markdown 表格表头（| 列1 | 列2 | 行）
+      3. SDK 函数名（snake_case 标识符，如 robot_movj）
+      4. 英文大写缩写（≥3 字符，如 TCP、JOG、IO、SDK）
+
+    所有术语在模块级 _auto_registered_terms 集合中去重，
+    避免重复调用 jieba.add_word()。
+    """
+    global _auto_registered_terms
+
+    # ── 标题提取正则（与 pdf_loader / multimodal_loader 保持一致）──
+    _HEADING_RES = [
+        re.compile(r'^(\d+(?:\.\d+)+)\s+(.+?)(?:\r?\n|$)', re.MULTILINE),
+        re.compile(r'^(第[一二三四五六七八九十\d]+[章节])\s*(.+?)(?:\r?\n|$)', re.MULTILINE),
+        re.compile(r'^([（(]?[一二三四五六七八九十]+[）)]?[\s、,，])\s*(.+?)(?:\r?\n|$)', re.MULTILINE),
+        re.compile(r'^(#{1,4})\s+(.+?)(?:\r?\n|$)', re.MULTILINE),
+    ]
+    # ── 表格表头正则：| col1 | col2 | ... |
+    _TABLE_HEADER_RE = re.compile(r'^\|\s*(.+?)\s*\|\s*(.+?)\s*\|', re.MULTILINE)
+
+    new_terms = set()
+
+    for doc in documents:
+        text = doc.page_content if hasattr(doc, 'page_content') else str(doc)
+
+        # 1. 提取章节标题
+        for pat in _HEADING_RES:
+            for m in pat.finditer(text):
+                title = m.group(0).strip()
+                if 2 <= len(title) <= 40:
+                    new_terms.add(title)
+                # 也尝试单独提取标题中的中文关键词部分
+                if m.lastindex and m.lastindex >= 2:
+                    kw = m.group(m.lastindex).strip()
+                    if 2 <= len(kw) <= 20 and re.search(r'[一-鿿]', kw):
+                        new_terms.add(kw)
+
+        # 2. 提取表格表头中的列名
+        for m in _TABLE_HEADER_RE.finditer(text):
+            header_line = m.group(0)
+            cells = re.findall(r'\|\s*(.+?)\s*(?=\||$)', header_line)
+            for cell in cells:
+                cell = cell.strip()
+                # 过滤掉分隔线行（---）和空单元格
+                if cell and not re.match(r'^[-:]+$', cell) and 2 <= len(cell) <= 30:
+                    new_terms.add(cell)
+
+        # 3. 提取英文大写缩写（≥3 字符）
+        for m in re.finditer(r'\b([A-Z][A-Z0-9]{2,}(?:-[A-Z][A-Z0-9]{2,})?)\b', text):
+            term = m.group(1)
+            if 2 <= len(term) <= 10:
+                new_terms.add(term)
+
+        # 4. 提取 snake_case SDK 函数名片段（独立关键词）
+        for m in re.finditer(r'\b([a-z]+)_([a-z]+)_([a-z]+)\b', text, re.IGNORECASE):
+            # 例如 "set_robot_power_on" → 注册整词 + 关键子词
+            full = m.group(0).lower()
+            if 6 <= len(full) <= 30:
+                new_terms.add(full)
+
+    # ── 批量注册到 jieba ──
+    registered_count = 0
+    for term in new_terms:
+        if term not in _auto_registered_terms and 2 <= len(term) <= 40:
+            # 过滤纯数字/纯标点
+            if re.match(r'^[\d\.\s\-—|]+$', term):
+                continue
+            _auto_registered_terms.add(term)
+            jieba.add_word(term, freq=300, tag='auto')
+            registered_count += 1
+
+    if registered_count > 0:
+        logger.info(
+            f"📖 自动术语注册: {registered_count} 个新词 → jieba 词典 "
+            f"(累计 {len(_auto_registered_terms)} 词)"
+        )
+    return registered_count
 
 
 def _tokenize_for_bm25(text: str) -> List[str]:
@@ -796,6 +891,10 @@ def build_bm25_from_chromadb(vector_store: Chroma):
             doc = Document(page_content=docs[i], metadata=metas[i])
             product_docs[pid].append(doc)
 
+        # 🔴 自动术语提取：从 ChromaDB 恢复的所有文档中扫描术语并注册到 jieba
+        all_docs = [doc for docs_list in product_docs.values() for doc in docs_list]
+        _auto_extract_and_register_terms(all_docs)
+
         for pid, p_docs in product_docs.items():
             tokenized = [_tokenize_for_bm25(doc.page_content) for doc in p_docs]
             if not tokenized:
@@ -823,6 +922,9 @@ def build_bm25_index(documents: list, persist_dir: str = CHROMA_PERSIST_DIR):
     """
     global _bm25_indexes, _bm25_corpus
     from rank_bm25 import BM25Okapi
+
+    # 🔴 自动术语提取：从文档中扫描章节标题/表头/缩写并注册到 jieba
+    _auto_extract_and_register_terms(documents)
 
     # 按 product_id 分组
     product_docs: Dict[str, list] = {}

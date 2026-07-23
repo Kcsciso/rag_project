@@ -325,6 +325,70 @@ def load_enhanced_documents(
         logger.error("所有 PDF 均无法解析")
         return []
 
+    # ================================================================
+    # 🔴 章节标题自动提取（用于后续注入到切片头部）
+    # ================================================================
+    # 在每个文档的原始文本中提取所有标题行及其字符位置，
+    # 分块后根据 Chunk 在原文中的位置自动注入最近的父级标题。
+    _HEADING_PATTERNS = [
+        # 编号型：2.2.4.3 版本升级、1.1 概述
+        re.compile(r'^(\d+(?:\.\d+)+)\s+(.+?)(?:\r?\n|$)', re.MULTILINE),
+        # 章/节型：第5章 通信协议、第3.2节 电气参数
+        re.compile(r'^(第[一二三四五六七八九十\d]+[章节])\s*(.+?)(?:\r?\n|$)', re.MULTILINE),
+        # 中文序号型：一、系统概述、（一）功能说明
+        re.compile(r'^([（(]?[一二三四五六七八九十]+[）)]?[\s、,，])\s*(.+?)(?:\r?\n|$)', re.MULTILINE),
+        # Markdown 标题型：# 标题、## 子标题
+        re.compile(r'^(#{1,4})\s+(.+?)(?:\r?\n|$)', re.MULTILINE),
+        # 功能/模块标题型（如 "■ 功能说明"、"## 2. 通信协议"）
+        re.compile(r'^(?:[■□◆◇●○]|##?)\s*(?:(\d+(?:\.\d+)*)\s+)?(.+?)(?:\r?\n|$)', re.MULTILINE),
+    ]
+
+    def _extract_headings(text: str) -> list:
+        """扫描全文提取所有标题行，返回 [(字符位置, 标题文本), ...] 升序。"""
+        headings = []
+        seen_positions = set()
+        for pattern in _HEADING_PATTERNS:
+            for m in pattern.finditer(text):
+                pos = m.start()
+                if pos in seen_positions:
+                    continue
+                seen_positions.add(pos)
+                full = m.group(0).strip()
+                # 过滤过短（< 3 字）或过长（> 80 字）的标题
+                if 3 <= len(full) <= 80:
+                    headings.append((pos, full))
+        headings.sort(key=lambda x: x[0])
+        # 合并相邻重复标题（同一标题可能被多个 pattern 匹配到）
+        deduped = []
+        for pos, title in headings:
+            if deduped and pos - deduped[-1][0] < len(deduped[-1][1]) + 5:
+                # 位置太近，优先保留更长的标题
+                if len(title) > len(deduped[-1][1]):
+                    deduped[-1] = (pos, title)
+            else:
+                deduped.append((pos, title))
+        return deduped
+
+    def _resolve_section(chunk_text: str, full_text: str, headings: list) -> str:
+        """根据 chunk 在原文中的位置，找到最近的父级标题。"""
+        if not headings:
+            return ""
+        # 用前 80 字符作为指纹在原文中定位（重叠区域的重复风险很低）
+        fingerprint = chunk_text.strip()[:80]
+        pos = full_text.find(fingerprint)
+        if pos < 0:
+            # 回退：用前 40 字符
+            fingerprint = chunk_text.strip()[:40]
+            pos = full_text.find(fingerprint)
+        if pos < 0:
+            return ""
+        # 二分查找最近的前置标题
+        import bisect
+        idx = bisect.bisect_right([h[0] for h in headings], pos) - 1
+        if idx >= 0:
+            return headings[idx][1]
+        return ""
+
     # 分块
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
@@ -335,10 +399,31 @@ def load_enhanced_documents(
     )
     chunks = text_splitter.split_documents(all_docs)
 
-    # 🔴 Header Injection（保持与阶段一兼容）
+    # 🔴 Section Injection: 为每个 chunk 注入章节标题上下文
+    section_injected = 0
+    for doc_idx, original_doc in enumerate(all_docs):
+        full_text = original_doc.page_content
+        headings = _extract_headings(full_text)
+        if not headings:
+            continue
+        logger.info(
+            f"📑 章节扫描: {original_doc.metadata.get('source', '?')} "
+            f"→ {len(headings)} 个标题"
+        )
+        # 为属于该文档的所有 chunk 注入标题
+        for chunk in chunks:
+            if chunk.metadata.get("source") != original_doc.metadata.get("source"):
+                continue
+            section = _resolve_section(chunk.page_content, full_text, headings)
+            if section:
+                chunk.page_content = f"[章节: {section}]\n{chunk.page_content}"
+                section_injected += 1
+
+    # 🔴 Function Header Injection（保持与阶段一兼容）
     _FUNC_RE = re.compile(
         r'\b([a-z_][a-z0-9_]*_[a-z0-9_]+)\s*\(', re.IGNORECASE
     )
+    func_injected = 0
     for chunk in chunks:
         funcs = set()
         for m in _FUNC_RE.finditer(chunk.page_content):
@@ -346,12 +431,12 @@ def load_enhanced_documents(
             if len(fname) >= 6 and '_' in fname:
                 funcs.add(fname)
         if funcs:
-            header = f"[Functions: {', '.join(sorted(funcs)[:10])}]\n"
-            chunk.page_content = header + chunk.page_content
+            # 追加到已有 section header 之后（而非覆盖）
+            chunk.page_content = f"[Functions: {', '.join(sorted(funcs)[:10])}]\n{chunk.page_content}"
+            func_injected += 1
 
-    injected = sum(1 for c in chunks if c.page_content.startswith("[Functions:"))
     logger.info(
         f"✅ 增强加载完成: {len(all_docs)} 文档 → {len(chunks)} chunks "
-        f"(Header Injected: {injected})"
+        f"(Section Injected: {section_injected}, Func Injected: {func_injected})"
     )
     return chunks

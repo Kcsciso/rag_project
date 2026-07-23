@@ -205,8 +205,10 @@ PRODUCT_ROUTER_RULES = [
         "keywords": [
             "JAKA", "jaka", "Zu", "MiniCab", "节卡", "Zu APP",
             "JAKA Zu", "Modbus", "Profinet",
+            "VBrake", "vbrake", "Vbrake", "minicab",
+            "TCP", "JOG", "jog", "tcp校准", "工具坐标系",
         ],
-        "priority": 10,
+        "priority": 15,  # 🔴 最高优先：强特征词直接锁定 JAKA
     },
 ]
 

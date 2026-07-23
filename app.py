@@ -48,8 +48,16 @@ from src.vector_store import (
     get_vector_store_info,
     clear_vector_store,
     get_registered_products,
+    cleanup_vector_store,
 )
-from src.rag_chain import rag_chat, rag_chat_stream, LLMServiceError, shutdown_clients
+from src.rag_chain import LLMServiceError, shutdown_clients
+
+# 🔴 第一阶段架构升级：LangGraph 状态图引擎（平滑切换）
+from src.graph_rag import (
+    run_graph,
+    run_graph_stream,
+    set_graph_vector_store,
+)
 
 # ============================================================
 # 日志配置
@@ -204,19 +212,28 @@ async def startup_event():
         # 🔴 重建 BM25 索引（内存索引，重启后需从 ChromaDB 恢复）
         from src.vector_store import build_bm25_from_chromadb
         build_bm25_from_chromadb(vector_store)
+
+        # 🔴 LangGraph 引擎注入向量库实例
+        set_graph_vector_store(vector_store)
+        logger.info("📐 LangGraph 状态图引擎已就绪")
     else:
         logger.info("📭 向量库为空，请通过 WebUI 上传 PDF 文件")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """应用关闭时：释放 LLM 客户端连接池等资源"""
+    """应用关闭时：释放 LLM 客户端连接池、BM25 索引、嵌入模型等资源"""
     logger.info("🛑 NewsPage 正在关闭...")
     try:
         shutdown_clients()
         logger.info("✅ LLM 客户端连接池已释放")
     except Exception as e:
         logger.warning(f"关闭 LLM 客户端时出错: {e}")
+    try:
+        cleanup_vector_store()
+        logger.info("✅ 向量库资源已释放（嵌入函数 + BM25 索引）")
+    except Exception as e:
+        logger.warning(f"释放向量库资源时出错: {e}")
 
 
 # ============================================================
@@ -328,11 +345,10 @@ async def chat(
             cancelled = False
 
             def _run_blocking_stream():
-                """在线程池中运行阻塞的 rag_chat_stream 生成器"""
+                """在线程池中运行 LangGraph 引擎的流式生成器"""
                 try:
-                    for token in rag_chat_stream(
-                        vector_store, query, chat_history, k=RETRIEVAL_K,
-                        product_id=product_id,
+                    for token in run_graph_stream(
+                        query, chat_history, product_id=product_id,
                     ):
                         if cancelled:
                             # 客户端已断开 → 不再往队列投递，退出生成循环
@@ -343,7 +359,9 @@ async def chat(
                 except Exception as exc:
                     logger.error(f"流式对话错误: {exc}")
                     if not cancelled:
-                        loop.call_soon_threadsafe(queue.put_nowait, ("error", str(exc)))
+                        # 🔴 发送用户友好的错误提示，而非原始 Python 异常堆栈
+                        friendly_error = "抱歉，系统处理您的请求时遇到了问题，请稍后重试。"
+                        loop.call_soon_threadsafe(queue.put_nowait, ("error", friendly_error))
 
             # 将阻塞调用卸载到默认线程池
             loop.run_in_executor(None, _run_blocking_stream)
@@ -379,8 +397,7 @@ async def chat(
     # ---- 非流式 JSON 响应 ----
     else:
         try:
-            result = rag_chat(vector_store, query, chat_history, k=RETRIEVAL_K,
-                             product_id=product_id)
+            result = run_graph(query, chat_history, product_id=product_id)
             return JSONResponse(content=result)
         except LLMServiceError as e:
             logger.error(f"LLM 服务不可用（四层容灾已耗尽）: {e}")
@@ -481,6 +498,10 @@ async def upload_pdf(file: UploadFile = File(..., description="PDF 文件")):
 
         vector_store = create_vector_store(documents, CHROMA_PERSIST_DIR)
         info = get_vector_store_info(vector_store)
+
+        # 🔴 重建后重新注入 Graph 引擎
+        set_graph_vector_store(vector_store)
+        logger.info("📐 LangGraph 引擎已更新（向量库重建后）")
 
         # 统计各产品的切片数量
         product_counts = {}

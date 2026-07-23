@@ -49,7 +49,7 @@ VLLM_GPU_ID="${VLLM_GPU_ID:-}"  # 空 = 自动检测，非空 = 手动覆盖
 # < 5 GB  → 报错退出
 # 模型候选池（专为共享 GPU 优化：仅需 ~6-8 GB 显存，避免锁死大块显存引发 OOM）
 MODEL_CANDIDATES=(
-    "Qwen/Qwen2.5-3B-Instruct|0.35|4096"   # 1.5B 保底：显存比例 0.25 (~10GB 预留上限)，上下文 4k
+    "Qwen/Qwen2.5-1.5B-Instruct|0.35|4096"   # 1.5B 保底：显存比例 0.25 (~10GB 预留上限)，上下文 4k
 )
 MIN_FREE_MEMORY_MIB=5120   # 5 GB — 最低门槛，低于此值无法部署任何模型
 
