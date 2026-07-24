@@ -73,7 +73,55 @@
 - ✅ **Token 预算硬控制**：3 切片 × 200 字符 + `max_tokens=384` → 确保 input+output < 4096
 - ⚠️ **已知限制**：截图中的数字（如 JAKA 端口号 6502）不可提取（需 OCR 引擎，待后续升级）
 
-## 6. 操作指令
+## 5.5 LangGraph v2 后处理控制层（ADR-11，2026-07-24）
+
+针对 1.5B 小模型在工业文档问答中的属性词颠倒/篡改问题，在 LangGraph 状态图中新增 2 个后处理节点 + 2 条条件边，构建零特定数字补丁的通用对齐与自纠错环路。
+
+### 5.5.1 通用属性对齐节点（ExtractAlignNode）
+- **节点**: `extract_align_node` in `src/graph_rag.py`
+- **逻辑**: 从 Context 中通过通用属性词库（50+ 物理属性词）+ 正则扫描提取 KV 映射（`{"端口号": "6502"}`），在生成后逐数字校验模型输出中的属性词是否与 Context 原文一致。若模型将属性词颠倒（如把"端口号 6502"误写为"从站地址 6502"），用 Context 中的正确属性词硬改写。
+- **原则**: 绝不硬编码 6502、9600 等特定数值 — 通过通用词库 + 正则实现通用免疫。
+
+### 5.5.2 SDK 代码自纠错条件环路（SDK_VerifyNode）
+- **节点**: `sdk_verify_node` in `src/graph_rag.py`
+- **条件边**: `_route_after_llm` → `sdk_verify` | `extract_align`；`_route_after_sdk_verify` → `llm_generation`（回环）| `extract_align`
+- **逻辑**: 检测生成代码是否缺失 `set_` 前缀、`ctypes.CDLL` 加载或 `argtypes` 声明。若发现问题 → 写入 `State["feedback"]` + 递增 `State["retry_count"]` → 条件边路由回 `llm_generation_node`（上限 2 次）。
+- **智能豁免**: CDLL 已存在时不报 CDLL 缺失；argtypes 已存在时不报 argtypes 缺失；`(?<!set_)` 负向后顾排除已有 `set_` 前缀的正确写法。
+
+### 5.5.3 System Prompt Few-Shot 强化
+- 新增 Rule 12 在 `RAG_SYSTEM_PROMPT` 中，含 2 个 Few-Shot 示例：
+  - 示例 1：端口属性精确归因（6502 → 端口号，不是"从站地址"或"设备标识符"）
+  - 示例 2：步骤原文逐字复述（不添加"初始为红色"、"右上角"、"约 3 秒"等未记载细节）
+
+### 5.5.4 AgentState v2 扩展
+- `agent_state.py` → `RAGState` 新增 5 个后处理控制字段：
+  - `extracted_entities: Dict[str, str]` — Context KV 映射
+  - `feedback: str` — SDK 校验反馈文本
+  - `retry_count: int` — 自纠错重试计数（0-2）
+  - `context_text: str` — Context 原始文本拼接
+  - `raw_llm_answer: str` — 未修改的 LLM 原始输出
+
+### 5.5.5 新图结构
+```
+START → query_fusion → product_routing → hybrid_retrieval → llm_generation
+                                                                  │
+                                          ┌───────────────────────┼───────────────────────┐
+                                          │                                               │
+                                     sdk_verify                                     extract_align
+                                          │                                               │
+                                  ┌───────┴───────┐                                       ▼
+                                  │               │                                      END
+                            llm_generation   extract_align
+                            (retry ≤ 2)         │
+                                                ▼
+                                               END
+```
+
+### 5.5.6 设计原则
+- ✅ **零特定数字补丁**：通用属性词库 + 正则扫描，不硬编码任何具体数值
+- ✅ **通用免疫**：对齐逻辑基于 Context KV 对比，而非特定产品/数字的 if-else
+- ✅ **自纠错不中断**：SDK 重试上限 2 次，超限后放弃修复进入对齐，绝不卡死
+- ✅ **所有既有 API 兼容**：`run_graph()` / `run_graph_stream()` 签名不变，`app.py` 零改动
 
 - 在执行破坏性 Bash 命令或安装软件包之前，必须征得用户的明确授权。
 - 所有重大架构调整、Ablation 实验及 Git 提交必须记录在 `dev_log.md` 中。
@@ -163,8 +211,10 @@ conda run -n rag_agent python tunnel.py --token <YOUR_NGROK_AUTHTOKEN>
 | `src/config.py` | **全局配置中心** — 双通道 LLM（vLLM :8001 / 智谱 GLM-4.7-Flash）、GPU 智能探测 API（`detect_best_gpu` / `get_all_gpu_info` / `VLLM_GPU_ID`）、ChromaDB 路径、嵌入模型双轨回退、检索参数（600/100/5/0.75） |
 | `src/pdf_loader.py` | **PDF 加载** — pypdf 逐页提取 → RecursiveCharacterTextSplitter 13 级递归分块 → **Header Injection**（自动提取 C 函数名 `[Functions: xxx]` 注入切片头部） |
 | `src/vector_store.py` | **向量知识库** — bge-small-zh-v1.5 (512维) + ONNX 回退双轨嵌入；**BM25 稀疏检索**（jieba 分词 + 正则标识符保护 + 自定义 SDK 函数词典）；`search_similar_with_threshold()` 阈值过滤；`cleanup_vector_store()` 资源释放 |
-| `src/rag_chain.py` | **RAG 核心管线** — 四层金字塔容灾；`_preprocess_query` 口语噪音剥离；`_hybrid_retrieve` **BM25+向量 RRF 融合 + Autocut 动态截断**；`_score_chunk_for_query` 三层加权打分；`_resolve_vllm_model()` 动态模型解析；防退化采样参数；Prompt 注入防御；`shutdown_clients()` |
-| `app.py` | **FastAPI 主入口 (7860)** — 5 条路由 + 安全中间件；SSE 防泄露；`shutdown` 事件；产品路由（`product_id` + `GET /api/products`） |
+| `src/rag_chain.py` | **RAG 核心管线** — 四层金字塔容灾；`_preprocess_query` 口语噪音剥离；`_hybrid_retrieve` **BM25+向量 RRF 融合 + Autocut 动态截断**；`_score_chunk_for_query` 三层加权打分；`_resolve_vllm_model()` 动态模型解析；防退化采样参数；Prompt 注入防御（含 Few-Shot 示例 Rule 12）；`shutdown_clients()` |
+| `src/agent_state.py` | **LangGraph 状态定义 (v2)** — `RAGState` TypedDict（14 字段），含 5 个后处理控制字段：`extracted_entities`、`feedback`、`retry_count`、`context_text`、`raw_llm_answer` |
+| `src/graph_rag.py` | **LangGraph 状态图引擎 (v2)** — 6 节点 + 3 条件边 + 自纠错环路；`extract_align_node` 通用属性对齐（零特定数字补丁）；`sdk_verify_node` SDK 代码自纠错条件环路（上限 2 次回环）；`_extract_generic_kv_entities()` 通用 KV 实体提取器；`run_graph()` / `run_graph_stream()` 兼容旧 API |
+| `app.py` | **FastAPI 主入口 (7860)** — 5 条路由 + 安全中间件；SSE 防泄露；`shutdown` 事件；产品路由（`product_id` + `GET /api/products`）|
 | `src/multimodal_loader.py` | **多模态解析** — PyMuPDF + pdfplumber 表格→Markdown、图片→Caption 注入、智能路由（纯文本→标准 pypdf） |
 | `frontend_server.py` | **前端 UI 服务 (8501)** — Jinja2 模板渲染 + `/api/*` 反向代理到 7860 后端 |
 | `check_status.py` | **健康检查** — vLLM + FastAPI + GPU 显存/温度/功率 + 四层容灾可用性 + vLLM 部署 GPU 识别 |

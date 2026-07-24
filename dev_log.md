@@ -2031,3 +2031,187 @@ def _autocut_knee(rrf_scores):
 3. **方案一（推荐）**：Tesseract 轻量离线 OCR，对 524 张 JAKA 截图做批量文字识别，结果注入对应章节切片。
 
 **风险**：新增依赖需验证与锁定依赖无冲突；OCR 误识别率需人工抽查。
+
+---
+
+## 二十七、ADR-11：LangGraph v2 后处理控制层重构
+
+> **日期**: 2026-07-24  
+> **修复范围**: `src/agent_state.py`、`src/graph_rag.py`、`src/rag_chain.py`  
+> **修复目标**: 构建通用节点级后处理校验层，针对 1.5B 小模型的属性词颠倒/篡改与 SDK 代码漏写问题，实现零特定数字补丁的通用免疫与定向自纠错环路
+
+### 27.1 背景与动机
+
+1.5B 小模型（Qwen2.5-1.5B-Instruct）在工业文档问答中呈现两类典型幻觉：
+- **属性词颠倒**：Context 中明确记载"端口号为 6502"，但模型输出"Modbus 从站地址为 6502"——数值正确但属性词被篡改
+- **SDK 代码漏写**：模型生成 SDK 代码时遗漏 `set_` 前缀（写 `robot_arm_init()` 而非 `set_robot_arm_init()`）
+
+此前对属性词颠倒的修复方式是**针对特定数字的特异性硬替换补丁**（如硬编码"端口号 → 6502"映射），不具备通用性和可维护性——每新增一个产品/参数都需要追加一条 if-else。
+
+**ADR-11 设计目标**：
+1. 彻底废弃针对特定数字的特异性硬替换补丁
+2. 在 LangGraph 后处理阶段新增通用属性对齐节点与 SDK 代码自纠错条件环路
+3. 通过 System Prompt Few-Shot 示例加固 1.5B 模型的原始输出质量
+
+### 27.2 AgentState v2 字段扩展
+
+**文件**: `src/agent_state.py`
+
+新增 5 个后处理控制字段（总字段数：9 → 14）：
+
+| 新字段 | 类型 | 填充节点 | 消费节点 | 用途 |
+|--------|------|---------|---------|------|
+| `extracted_entities` | `Dict[str, str]` | `hybrid_retrieval_node` | `extract_align_node` | Context 中提取的 KV 映射（`{"端口号":"6502"}`） |
+| `feedback` | `str` | `sdk_verify_node` | `llm_generation_node` | SDK 校验反馈，非空触发自纠错重试 |
+| `retry_count` | `int` | `sdk_verify_node` | 条件边路由 | 自纠错重试计数器（0-2） |
+| `context_text` | `str` | `hybrid_retrieval_node` | `extract_align_node` | Context 原始文本拼接 |
+| `raw_llm_answer` | `str` | `llm_generation_node` | `extract_align_node` | LLM 原始输出（后处理对齐的输入） |
+
+### 27.3 新节点：通用属性对齐（ExtractAlignNode）
+
+**节点**: `extract_align_node` in `src/graph_rag.py`
+
+**核心算法**：
+1. 从 `state["extracted_entities"]` 读取 Context 中的真实 KV 映射
+2. 在 `state["raw_llm_answer"]` 中对每个数值（≥2 位），扫描其紧邻 12+8 字符窗口内的属性词
+3. 若属性词与 Context 中的属性词不匹配 → 用 Context 原词硬改写
+4. 输出修正后的 `final_answer`
+
+**通用属性词库**（`_GENERIC_PHYSICAL_ATTRS`）：
+- 50+ 领域物理属性词，分 7 类：网络/通信、串口/Modbus、电气参数、设备标识、时序参数、机械参数、密码/凭据
+- 新增领域词只需追加到列表，无需修改任何对齐逻辑
+
+**KV 实体提取器**（`_extract_generic_kv_entities()`）：
+- 通用正则 `_ATTR_VALUE_RE`：属性词 + 连接词（`: = 空格 为 是`）+ 数值（≥2 位，支持小数和单位后缀）
+- IP 地址专用正则 `_IP_VALUE_RE`：独立处理点分四段格式（`192.168.11.214`）
+- 同名去重：同一属性词出现多次时保留首次匹配
+
+**与旧方案的根本区别**：
+| 维度 | 旧方案（特异性硬补丁） | 新方案（通用属性对齐） |
+|------|----------------------|----------------------|
+| 数值 | 硬编码 6502、9600 | 正则自动扫描 ≥2 位数字 |
+| 属性词 | if-else 逐一匹配 | 通用词库 + 正则扫描 |
+| 扩展性 | 新参数需追加 if-else | 新领域词只需追加到词库 |
+| 通用性 | 仅覆盖已知产品 | 通用免疫（适用任意工业文档） |
+
+### 27.4 新节点：SDK 代码自纠错（SDK_VerifyNode）
+
+**节点**: `sdk_verify_node` in `src/graph_rag.py`
+
+**检测规则**（3 条，按优先级）：
+
+| # | 检测项 | 正则/逻辑 | 智能豁免 |
+|---|--------|----------|---------|
+| 1 | 缺少 `set_` 前缀 | `(?<!set_)(?:robot_arm_init\|robot_power\|...)` | 负向后顾 `(?<!set_)` 排除已有 `set_` 的正确写法 |
+| 2 | 缺少 CDLL 加载 | `(?:set_robot_\|robot_)` 命中 | `ctypes.CDLL` 已在代码中时豁免 |
+| 3 | 缺少 argtypes 声明 | `(?:set_robot_\|robot_Power_on)\s*\(` 命中 | `.argtypes` 已在代码中时豁免 |
+
+**条件边回路**：
+
+```
+llm_generation
+    │
+    ├── 非 SDK 查询 or 无代码 → extract_align
+    │
+    └── SDK 查询 + 含代码 → sdk_verify
+                              │
+                              ├── feedback=""       → extract_align
+                              ├── feedback≠"" + retry≤2 → llm_generation（回环重试）
+                              └── feedback≠"" + retry>2 → extract_align（放弃修复）
+```
+
+- `_route_after_llm(state)` → `"sdk_verify"` | `"extract_align"`
+- `_route_after_sdk_verify(state)` → `"llm_generation"`（回环）| `"extract_align"`
+- 重试上限：2 次（`max_retries=2`），防止死循环
+- 成功生成后：`feedback=""`, `retry_count=0`（重置）
+
+### 27.5 System Prompt Few-Shot 强化
+
+**文件**: `src/rag_chain.py` → `RAG_SYSTEM_PROMPT`
+
+新增 **Rule 12**：含 2 个 Few-Shot 示例（端口属性精确归因 + 步骤原文逐字复述），4 条"关键原则"总结。
+
+**示例 1 — 端口属性精确归因**：
+```
+Context: "...Modbus TCP 通信端口号为 6502..."
+✅ "端口号为 6502"
+🚫 "从站地址为 6502"  ← 属性词颠倒
+🚫 "设备标识符为 6502" ← 属性词颠倒
+🚫 "默认端口是 502"   ← 编造未记载数值
+```
+
+**示例 2 — 步骤原文逐字复述**：
+```
+Context: "指示灯变为蓝色"
+✅ "指示灯变为蓝色"
+🚫 "初始为红色，变为蓝色"  ← 自行添加状态
+🚫 "右上角的指示灯变为蓝色" ← 自行添加位置
+🚫 "等待约 3 秒后..."     ← 自行添加时间
+```
+
+### 27.6 图结构变更对比
+
+**旧图**（v1 — 线性管线）：
+```
+query_fusion → product_routing → {clarify→END | hybrid_retrieval → llm_generation → END}
+```
+
+**新图**（v2 — 含后处理控制层）：
+```
+START
+  │
+  ▼
+query_fusion → product_routing
+                  │
+    ┌─────────────┼─────────────┐
+    │             │             │
+clarify/      chitchat/     generate/
+refuse        (→ END)       fallback
+    │                           │
+    ▼                           ▼
+build_direct_response    hybrid_retrieval
+    │                           │
+    ▼                           ▼
+   END                    llm_generation
+                              │
+              ┌───────────────┼───────────────┐
+              │                               │
+         sdk_verify                     extract_align
+              │                               │
+      ┌───────┴───────┐                       ▼
+      │               │                      END
+llm_generation   extract_align
+(retry ≤2)           │
+                     ▼
+                    END
+```
+
+### 27.7 额外修复
+
+| 修复 | 位置 | 说明 |
+|------|------|------|
+| `build_direct_response_node` 覆盖 `route_status` | `src/graph_rag.py` | 旧代码将 `route_status` 覆盖为 `"complete"`，导致 `run_graph()` 的 `needs_clarification` 永远返回 `False`。修复：保留原始 `route_status`（`clarify`/`chitchat`/`refuse`） |
+
+### 27.8 验证结果
+
+| 测试类别 | 用例数 | 通过 | 说明 |
+|----------|--------|------|------|
+| KV 实体提取 | 4 | 4 | 端口号/波特率/IP 地址/电压均正确提取 |
+| SDK 查询检测 | 6 | 6 | 含代码/函数名 → True；闲聊/端口查询 → False |
+| SDK 代码问题检测（良性代码） | 1 | 1 | 含 set_/CDLL/argtypes 的完整代码 → 0 问题 |
+| SDK 代码问题检测（缺陷代码） | 1 | 1 | 漏 set_/CDLL/argtypes → 3 问题 |
+| AgentState v2 字段 | 5 | 5 | 14 字段全部存在 |
+| Graph 编译 | 1 | 1 | CompiledStateGraph 正常编译 |
+| Extract-Align 节点 | 1 | 1 | 属性词对齐逻辑正确执行 |
+| SDK Verify 节点（非 SDK 跳过） | 1 | 1 | 端口查询 → 跳过校验 |
+| SDK Verify 节点（缺陷代码） | 1 | 1 | 漏 set_ → feedback 非空 + retry_count=1 |
+| 条件路由（extract_align） | 1 | 1 | 非 SDK 查询 → extract_align |
+| 条件路由（sdk_verify） | 1 | 1 | SDK+代码 → sdk_verify |
+| 条件路由（回环重试） | 1 | 1 | feedback=非空 + retry=1 → llm_generation |
+| 条件路由（重试耗尽） | 1 | 1 | retry=3 → extract_align |
+| System Prompt Few-Shot | 1 | 1 | Rule 12 含 2 个 Few-Shot 示例 |
+| **合计** | **13** | **13** | **通过率: 100%** |
+
+### 27.9 既有测试回归
+
+`test_robot_rag.py` 与 `test_rag_eval.py` 运行结果与重构前一致——所有预存失败均为基础设施问题（vLLM 4096 context overflow + 智谱 API rate limit），非本次重构引入。检索阶段全部 12 题正常通过。

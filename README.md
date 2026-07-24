@@ -19,7 +19,8 @@
 - **Query 预处理**（`_preprocess_query`）：多层迭代剥离口语化噪音（25+ 模式）。
 - **产品级物理隔离**（ADR-6）：入库自动打标 → 检索 `where={"product_id":"OpenR6"}` → 未指定时主动反问。
 
-### 🧠 智能上下文扩展与防幻觉（ADR-9/ADR-10）
+### 🧠 智能上下文扩展与防幻觉（ADR-9/ADR-10/ADR-11）
+- **LangGraph v2 后处理控制层**（ADR-11）：通用属性对齐节点 (`extract_align_node`) 基于 50+ 物理属性词库 + 正则扫描，自动检测并修正模型输出中的属性词颠倒（如将"端口号 6502"误写为"从站地址 6502"），零特定数字硬编码；SDK 代码自纠错条件环路 (`sdk_verify_node`) 检测 `set_` 前缀/`ctypes.CDLL`/`argtypes` 缺失后触发定向重试（上限 2 次）。
 - **父子切片上下文扩展**（Parent-Child Chunking）：检索命中子切片时，自动按章节 ID 捞取同章节兄弟切片，补充完整流程上下文，彻底解决 TCP 四点法、关机步骤等长流程因截断导致总结不完整的问题。
 - **柔性 Grounding 提示**：动态检测 query 中含数字请求（密码/端口/IP），若 Context 中无具体数值则自动追加诚实提示，引导模型明确告知"文档未记载"而非猜测 `admin`、`502` 等通用默认值。
 - **多轮对话 Citation 前缀清洗**：剥离 chat_history 中助理回复的章节溯源长前缀（`根据《X》第 Y.Z 节【...】`），防止后续轮次复读背景幻觉。
@@ -45,8 +46,11 @@
 rag_project/
 ├── src/
 │   ├── config.py              # 全局配置中心 + GPU 智能探测 API
+│   ├── agent_state.py         # LangGraph v2 RAGState 状态定义（14 字段，含后处理控制层）
+│   ├── graph_rag.py           # LangGraph v2 状态图引擎（6 节点 + 3 条件边 + 自纠错环路）
 │   ├── pdf_loader.py          # PDF 解析与递归字符级文本分块
 │   ├── vector_store.py        # ChromaDB 向量库（HF→ONNX 双轨嵌入）
+│   ├── multimodal_loader.py   # 多模态解析（PyMuPDF + pdfplumber 表格→Markdown）
 │   └── rag_chain.py           # RAG 四层容灾 + 混合检索 + 口语化预处理 + 安全防御
 ├── templates/
 │   └── index.html             # NewsPage 聊天与文档交互主页面
