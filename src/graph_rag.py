@@ -64,6 +64,7 @@ from .rag_chain import (
     _is_product_name_only,
     _build_messages,
     _expand_parent_sections,
+    _last_numeric_context_missing,
     _hybrid_retrieve,
     _call_llm,
     _stream_llm,
@@ -321,6 +322,16 @@ def llm_generation_node(state: RAGState) -> dict:
                 "model": "fatal-fallback",
                 "route_status": "complete",
             }
+
+    # 🔴 数字请求无上下文硬防护
+    if _last_numeric_context_missing:
+        logger.info("🚫 [Graph] 数字请求无上下文 → 直接返回硬拒答")
+        return {
+            "final_answer": _HARD_REFUSAL,
+            "sources": [],
+            "model": "numeric-guard",
+            "route_status": "complete",
+        }
 
     # ── Layer 1: 本地 vLLM ──
     vllm_healthy = _check_vllm_health()
@@ -594,6 +605,12 @@ def run_graph_stream(
     try:
         messages = _build_messages(fused_query, context_docs, chat_history)
     except Exception:
+        yield from _hard_refusal_stream()
+        return
+
+    # 🔴 数字请求无上下文硬防护
+    if _last_numeric_context_missing:
+        logger.info("🚫 [Graph Stream] 数字请求无上下文 → 硬拒答")
         yield from _hard_refusal_stream()
         return
 

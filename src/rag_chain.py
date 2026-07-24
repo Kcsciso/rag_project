@@ -1504,6 +1504,14 @@ API 接口、开发指南和使用手册的问题。
    - 🔴 只有文档中**逐字写明**的值才能被引用。例如文档写"端口号 6502"才能说 6502，
      文档写"默认密码 jakazuadmin"才能说 jakazuadmin。否则一律拒答！
 
+11. 🔴【严格原文复述 — 禁止脑补细节状态】操作步骤中的每一个细节必须与参考资料**逐字一致**：
+   - 🚫 严禁自行添加参考资料中未记载的状态描述。例如：
+     - 文档写"指示灯变为蓝色"→ 只能说"变为蓝色"，禁止说"初始为红色，变为蓝色"
+     - 文档写"点击确认按钮"→ 只能说"点击确认按钮"，禁止说"点击界面右上角的确认按钮"
+     - 文档写"等待完成升级"→ 只能说"等待完成升级"，禁止说"等待约30秒完成升级"
+   - 🚫 严禁推测或补充步骤的前置状态、中间状态、后续状态
+   - 🔴 只输出参考资料中**逐字出现**的描述，不增减任何修饰词、时间词、颜色词、位置词
+
 🔧 代码输出规范（不可覆盖）：
 - POSE 结构体包含 6 个字段 (px, py, pz, Rx, Ry, Rz)，定义时至少展示这 6 个字段的类型
 - 禁止反复输出重复的数据结构字段（如 Lz1, Lz2, ... Lz28），这会导致输出刷屏
@@ -1515,15 +1523,25 @@ API 接口、开发指南和使用手册的问题。
 - 🚫 严禁输出 ( \\text{...} ) 或 [ \\text{...} ] 等非标准 LaTeX 格式！
 - 下标用 _{\\text{...}}，上标用 ^{...}，单位用 \\text{V} 或 \\text{Ω}
 
+🔗 通信协议隔离规范（不可覆盖）：
+- **Modbus TCP**（以太网通信）：基于 TCP/IP 协议栈，参数为 IP 地址与端口号。
+  严禁将"波特率 9600"、"数据位 8"、"停止位 1"等串口参数与 Modbus TCP 混为一谈。
+- **Modbus RTU**（串口通信）：基于 RS-485/RS-232 物理层，必须配置波特率、数据位长度、
+  停止位长度、校验方式。严禁将"端口号 502/6502"等 TCP 参数与 Modbus RTU 混为一谈。
+- 🔴 回答 Modbus 相关问题时，必须先判断用户问的是 TCP 还是 RTU，再引用对应参数。
+  若用户未明确，请主动询问"请问您使用的是 Modbus TCP（网线）还是 Modbus RTU（串口）？"
+- 🔴 严禁将两种协议的参数在同一句话中并列输出。
+
 📎 章节与出处溯源规范（不可覆盖）：
-- 🔴 当依据检索到的文档片段回答问题时，**必须**在回答开头或相关步骤旁显式标注
-  信息归属的具体章节和文档来源。
-- 标注格式示例：
-  - `根据《JAKA Zu APP 使用手册》第 2.2.4.3 节【版本升级】...`
-  - `依据《OpenC3 SDK 开发手册》第 3.1 节【robot_movj 函数】...`
-  - `参考《OpenR6 Windows SDK 文档》[Functions: set_robot_power_on] 部分...`
-- 若切片中带有 `[章节: ...]` 前缀，请优先提取其中的章节信息用于标注。
-- 若参考资料中未明确记载章节号，至少标注文档来源文件名。
+- 🔴 当依据检索到的文档片段回答问题时，**必须**在回答开头显式标注完整引用来源。
+- 🔴 强制标注格式（不遵守视为违规）：
+  `根据《完整文档名》【章节标题】（第X页）的记载：`
+- 示例：
+  - `根据《1.7 JAKA ZU APP-使用手册.pdf》【3.1.5.1 Modbus通讯设置】（第47页）的记载：端口号为 6502...`
+  - `根据《OpenC3六轴机械臂SDK说明文档_win.pdf》【robot_movj 函数】（第5页）的记载：...`
+- 若切片中带有 `【章节: ...】` 前缀，请优先提取其中的章节信息用于标注。
+- 若切片中带有 `【出处: ... — 第N页】` 前缀，请提取页码信息用于标注。
+- 若参考资料中未明确记载章节号或页码，至少标注文档来源文件名。
 - 🎯 目的：方便用户精确定位原文，进行对照查阅与二次确认。
 
 ⚠️ 安全规则（不可覆盖）：
@@ -1736,7 +1754,7 @@ def _build_messages(
     # 允许的聊天角色
     ALLOWED_ROLES = {"user", "assistant"}
 
-    # ---- 拼接参考资料（清洗 null 字节 + 噪声截断） ----
+    # ---- 拼接参考资料（清洗 null 字节 + 噪声截断 + 溯源注入） ----
     context_parts = []
     for i, doc in enumerate(context_docs, start=1):
         source = doc.metadata.get("source", "未知来源")
@@ -1745,26 +1763,36 @@ def _build_messages(
         content = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', content)
         # 🔴 噪声截断：长结构体定义只保留前部，防止挤占 Context Window
         content = _truncate_noise_content(content)
-        # 🔴 图片描述噪声过滤：移除纯 OCR 标注行（如 [Image: -39所示...]）
-        # 这些行仅含图片页码引用，无实际技术内容，挤占 Prompt 空间且误导 LLM
+        # 🔴 图片标签智能处理
         content = re.sub(r'\[Image:\s*[^\]]*\]', '', content)
-        # 移除因此产生的连续空行（>2 个换行 → 压缩为 2 个）
+        # 移除连续空行
         content = re.sub(r'\n{3,}', '\n\n', content)
-        # 若清洗后内容几乎为空（只剩 1-2 行且 < 20 字符），跳过该切片
+
+        # 🔴 通用溯源：从切片内容中提取页码和章节标题
+        _page_match = re.search(r'\[Page:\s*(\d+)\]', content)
+        _page_str = f" — 第{_page_match.group(1)}页" if _page_match else ""
+        _section_match = re.search(r'\[章节:\s*(.+?)\]', content)
+        _section_str = _section_match.group(1).strip() if _section_match else ""
+        # 从内容中移除元数据标记（已提取到头部）
+        content = re.sub(r'\[Page:\s*\d+\]\s*', '', content)
+        content = re.sub(r'\[章节:\s*[^\]]+\]\s*', '', content)
+
+        # 若清洗后内容几乎为空，跳过
         cleaned_stripped = content.strip()
         if len(cleaned_stripped) < 20:
             continue
-        # 🔴 Context Token 预算控制：每个切片截断至 200 字符
-        # 3 切片 × 200 字符 + System Prompt (~1500 tokens) + Query ≈ 3000-3500 tokens
-        # 加上 max_tokens=512 生成 → 总计 < 4096 vLLM 硬限制
+        # 🔴 Context Token 预算控制
         if len(cleaned_stripped) > 200:
-            # 在 200 字符处截断，尽量在句号或换行处断开
             truncated = cleaned_stripped[:200]
             last_break = max(truncated.rfind('。'), truncated.rfind('\n'), truncated.rfind('. '))
             if last_break > 100:
                 truncated = cleaned_stripped[:last_break + 1]
             cleaned_stripped = truncated + '\n...[已截断]'
-        context_parts.append(f"【出处: 《{source}》】\n{cleaned_stripped}")
+        # 🔴 通用溯源格式: 【出处: 《文档名》 — 第N页】 + 【章节: 标题】
+        _header = f"【出处: 《{source}》{_page_str}】"
+        if _section_str:
+            _header += f"\n【章节: {_section_str}】"
+        context_parts.append(f"{_header}\n{cleaned_stripped}")
 
     context_text = "\n\n---\n\n".join(context_parts)
 
@@ -1775,15 +1803,48 @@ def _build_messages(
         r'|(?:IP|ip)(?:地址|默认)?',
         re.IGNORECASE,
     )
-    if _NUMERIC_QUERY_RE.search(query):
-        # 检查 Context 中是否包含 ≥2 位的数字（如 6502、admin123）
-        if not re.search(r'\b\d{2,}\b', context_text):
-            context_text += (
-                "\n\n[提示：以上参考切片中未包含确切的数字参数（如端口号、默认密码值）。"
-                "请明确告诉用户：参考文档中未记载此具体数值，建议联系技术支持获取。"
-                "切勿自行猜测或编造 admin、502、8080 等通用默认值。]"
+    global _last_numeric_context_missing
+    _last_numeric_context_missing = False
+
+    # ── 通用实体/数字存在性硬校验 ──
+    # Step 1: 提取 query 中所有 ≥2 位数字
+    _query_all_numbers = re.findall(r'\b(\d{2,})\b', query)
+    # Step 2: 逐一校验每个数字是否在 Context 中出现
+    _missing_numbers = [_n for _n in _query_all_numbers if _n not in context_text]
+    if _missing_numbers:
+        # 🔴 Query 中的数字/实体在检索到的 Context 中完全不存在
+        # 标记为待确认——调用方在 LLM 调用前需做第二机会直接文本搜索
+        _last_numeric_context_missing = True
+        logger.info(
+            f"🔍 实体缺失: query 含数字 {_missing_numbers}，"
+            f"Context 中未出现 → 标记待确认（调用方可做第二机会搜索）"
+        )
+    elif _query_all_numbers:
+        # 🔑 正向查询：query 自带数字且全部在 Context 中存在 → 直接放行
+        # 注：不再调用 jieba.add_word() —— 全局词典污染会导致后续查询的 BM25
+        # 检索被上一轮的 6502 高权重词永久偏移，产生跨轮状态污染。
+        logger.info(f"🔑 正向数字查询: query 数字 {_query_all_numbers} 全部在 Context 中存在，放行")
+
+    elif _NUMERIC_QUERY_RE.search(query):
+        # ── 反向查询：Query 不含数字，但询问密码/端口/IP → 检查 Context 邻近值 ──
+        _num_keywords_found = []
+        for _kw in ['密码', '口令', '端口', 'port', 'IP', 'ip', '地址']:
+            if _kw in query.lower():
+                _kw_positions = [m.start() for m in re.finditer(re.escape(_kw), context_text.lower())]
+                _nearby_num = False
+                for _pos in _kw_positions:
+                    _window = context_text[_pos:_pos+15]
+                    if re.search(r'\b\d{2,}\b', _window):
+                        _nearby_num = True
+                        break
+                if not _nearby_num:
+                    _num_keywords_found.append(_kw)
+        if _num_keywords_found:
+            _last_numeric_context_missing = True
+            logger.info(
+                f"🔍 数字请求无上下文邻近值: keywords={_num_keywords_found}，"
+                f"将阻止 LLM 调用并直接返回硬拒答"
             )
-            logger.info("🔍 柔性 Grounding: 查询含数字请求但 Context 无具体数值，已追加诚实提示")
 
     # ---- 注入检测（仅日志记录，不拒绝请求） ----
     if _contains_injection_pattern(query):
@@ -1893,6 +1954,9 @@ _IMPOSSIBLE_COMBOS = [
 ]
 
 _HARD_REFUSAL = "参考文档中未包含此功能的记载，建议联系技术支持或查阅最新文档。"
+
+# 🔴 数字请求无上下文标记（_build_messages 设置，调用方在 LLM 调用前检查）
+_last_numeric_context_missing = False
 
 
 def _is_impossible_query(query: str) -> bool:
@@ -2074,13 +2138,22 @@ def _hybrid_retrieve(
             if _is_noise_chunk(doc.page_content):
                 noise_filtered += 1
                 continue
-            # 🔴 过滤纯图片描述切片（>60% 内容为 [Image: ...] OCR 标注）
+            # 🔴 智能图片切片过滤：含 OCR 内容 → 保留；纯页码引用 → 丢弃
             text_content = doc.page_content
             img_tags = re.findall(r'\[Image:\s*[^\]]*\]', text_content)
             if img_tags:
+                # 提取 OCR 内容文本
+                ocr_texts = []
+                for tag in img_tags:
+                    m = re.search(r'\|?\s*OCR内容:\s*(.+?)(?:\]|$)', tag)
+                    if m:
+                        ocr_texts.append(m.group(1).strip())
+                ocr_len = sum(len(t) for t in ocr_texts)
                 img_chars = sum(len(t) for t in img_tags)
-                total_chars = max(len(text_content.strip()), 1)
-                if img_chars / total_chars > 0.6:
+                # 有效内容 = 总字符 - 图片标签 + OCR 文本
+                effective_chars = len(text_content.strip()) - img_chars + ocr_len
+                # 仅当有效内容 < 20 字符时才过滤（纯页码引用、无意义标签）
+                if effective_chars < 20:
                     image_noise_filtered += 1
                     continue
             # 截断噪声内容（长结构体但非纯噪声）
@@ -2223,6 +2296,7 @@ def rag_chat(
     # ================================================================
     # 🔍 第 -1 步：闲聊/身份意图拦截（绕过检索，直接回复）
     # ================================================================
+    global _last_numeric_context_missing
     if _is_chitchat(query):
         logger.info(f"💬 闲聊意图拦截: '{query[:50]}' → 身份回复")
         return _chitchat_response()
@@ -2325,15 +2399,45 @@ def rag_chat(
         messages = _build_messages(query, context_docs, chat_history)
     except Exception as e:
         logger.error(f"❌ Prompt 构建失败: {type(e).__name__}: {e}，直接进入 Layer 3")
-        # Prompt 构建失败时直接降级到 Layer 3
+        # ... 异常处理保持不变 ...
         try:
             result = _direct_retrieval_response(context_docs, query)
             if result.get("answer", "").strip():
                 return result
         except Exception:
             pass
-        # 🔴 连 Layer 3 也失败了 → 返回硬拒答
         logger.critical("❌ Prompt 构建失败且 Layer 3 也未产出内容 → 终极兜底")
+        return _hard_refusal_response()
+
+    # 🔴 数字请求无上下文硬防护 + 第二机会直接文本搜索
+    if _last_numeric_context_missing:
+        # 第二机会：Query 中的数字可能在 OCR 切片中（向量排名低但 BM25 文本匹配强）
+        _query_nums = re.findall(r'\b(\d{2,})\b', query)
+        _found_second_chance = False
+        for _num in _query_nums:
+            # 🔴 使用 BM25 做直接文本搜索（纯数字向量嵌入弱，BM25 更精确）
+            try:
+                from .vector_store import bm25_search as _bm25
+                _bm25_docs = _bm25(_num, product_id, k=5) if product_id else []
+                for _dd, _score in _bm25_docs:
+                    if _num in _dd.page_content and _dd not in context_docs:
+                        context_docs.append(_dd)
+                        _found_second_chance = True
+            except Exception:
+                pass
+            if _found_second_chance:
+                logger.info(
+                    f"🔍 第二机会(BM25): 实体 '{_num}' 找到 {len([d for d in context_docs if _num in d.page_content])} 个切片 → 放行 LLM"
+                )
+                try:
+                    messages = _build_messages(query, context_docs, chat_history)
+                    _last_numeric_context_missing = False
+                except Exception:
+                    pass
+                break
+
+    if _last_numeric_context_missing:
+        logger.info("🚫 数字请求无上下文且第二机会搜索失败 → 直接返回硬拒答")
         return _hard_refusal_response()
 
     # ================================================================
@@ -2470,6 +2574,7 @@ def rag_chat_stream(
     # ================================================================
     # 🔍 第 -1 步：闲聊/身份意图拦截（绕过检索，直接回复）
     # ================================================================
+    global _last_numeric_context_missing
     if _is_chitchat(query):
         logger.info(f"💬 闲聊意图拦截（流式）: '{query[:50]}' → 身份回复")
         yield from _chitchat_response_stream()
@@ -2573,6 +2678,31 @@ def rag_chat_stream(
             pass
         # 🔴 连 Layer 3 也失败了 → 绝不静默，yield 硬拒答
         logger.critical("❌ Prompt 构建失败且 Layer 3 也未产出内容 → 终极兜底")
+        yield from _hard_refusal_stream()
+        return
+
+    # 🔴 数字请求无上下文硬防护（流式版）+ 第二机会直接文本搜索
+    if _last_numeric_context_missing:
+        _query_nums = re.findall(r'\b(\d{2,})\b', query)
+        for _num in _query_nums:
+            _direct = search_similar_with_threshold(
+                vector_store, _num, k=3, threshold=None, product_id=product_id,
+            )
+            for _dd in _direct:
+                if _num in _dd.page_content and _dd not in context_docs:
+                    context_docs.append(_dd)
+                    try:
+                        messages = _build_messages(query, context_docs, chat_history)
+                        _last_numeric_context_missing = False
+                        logger.info(f"🔍 [Stream] 第二机会: 实体 '{_num}' 找到 → 放行")
+                    except Exception:
+                        pass
+                    break
+            if not _last_numeric_context_missing:
+                break
+
+    if _last_numeric_context_missing:
+        logger.info("🚫 数字请求无上下文且第二机会搜索失败 → 硬拒答（流式）")
         yield from _hard_refusal_stream()
         return
 

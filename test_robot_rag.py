@@ -67,32 +67,114 @@ logger = logging.getLogger("test_robot_rag")
 # ============================================================
 
 TEST_QUESTIONS = [
+    # ================================================================
+    # 基础 SDK 测试（OpenR6 / OpenC3）
+    # ================================================================
     {
         "id": "Q1",
         "question": "机械臂上电和使能的函数分别是什么？请给出 Python 示例代码。",
         "keywords": ["robot_Power_on", "robot_motor_enable", "ctypes", "上电", "使能"],
         "description": "验证：上电/使能函数名 + ctypes 调用示例",
+        "product_id": None,
     },
     {
         "id": "Q2",
         "question": "如何控制机械臂进行关节运动 (movj)？参数有哪些？",
         "keywords": ["movj", "关节运动", "joint", "速度", "加速度", "RobJoint"],
         "description": "验证：movj 函数名 + 关节参数结构体",
+        "product_id": None,
     },
     {
         "id": "Q3",
         "question": "获取机械臂当前位姿 (Pose) 的函数是什么？",
         "keywords": ["pose", "位姿", "robot_get_pose", "px", "py", "pz", "Rx", "Ry", "Rz"],
         "description": "验证：位姿获取函数 + Pose 结构体字段",
+        "product_id": None,
     },
     {
         "id": "Q4",
         "question": "摄像头支持哪些分辨率和帧率？",
-        "keywords": [],  # 期望：所有文档切片被阈值过滤，无相关结果
+        "keywords": [],
         "description": "验证：无关问题经相似度阈值过滤后 Layer 3 返回空结果提示",
-        "expect_empty": True,  # 标记：期望检索结果为空
+        "expect_empty": True,
+        "product_id": None,
+    },
+    # ================================================================
+    # JAKA 专项测试（JAKA Zu APP 使用手册）
+    # ================================================================
+    {
+        "id": "J1",
+        "question": "JAKA 机械臂上电和使能的正确操作流程是什么？",
+        "keywords": ["上电", "使能", "电控柜", "电源", "启动"],
+        "description": "验证：JAKA 上电流程不含 OpenC3/OpenR6 的 ctypes DLL 代码",
+        "product_id": "JAKA",
+        "forbidden": ["collrob_sdk.dll", "py_dll.dll", "ctypes.CDLL", "robot_Power_on"],
+    },
+    {
+        "id": "J2",
+        "question": "JAKA 怎么版本升级？",
+        "keywords": ["升级", "版本", "3.1.1.4"],
+        "description": "验证：短 Query 融合 + 版本升级章节召回",
+        "product_id": "JAKA",
+        "forbidden": ["微信公众号", "小程序", "联系售后"],
+    },
+    {
+        "id": "J3",
+        "question": "JAKA 机器人做 Modbus TCP 服务器时默认端口号是多少？",
+        "keywords": ["Modbus", "TCP", "端口", "3.1.5.1"],
+        "description": "验证：Modbus 端口召回 + 不编造 502/8080",
+        "product_id": "JAKA",
+        "forbidden": ["502", "8080", "admin"],
+    },
+    {
+        "id": "J4",
+        "question": "JAKA 软件登录时管理员的默认密码是多少？",
+        "keywords": ["密码", "管理员", "登录", "3.1.1.6"],
+        "description": "验证：密码章节召回 + 不编造 admin/123456",
+        "product_id": "JAKA",
+        "forbidden": ["admin", "123456", "password", "0"],
+    },
+    {
+        "id": "J5",
+        "question": "JAKA 机械臂关机和断电的正确顺序是什么？",
+        "keywords": ["关机", "断电", "下使能", "2.2.5"],
+        "description": "验证：关机流程召回正确章节",
+        "product_id": "JAKA",
+        "forbidden": ["collrob_sdk", "py_dll"],
+    },
+    {
+        "id": "J6",
+        "question": "JAKA 机器人 TCP 四点法设置步骤是什么？",
+        "keywords": ["TCP", "四点法", "坐标系", "5.1.4"],
+        "description": "验证：TCP 校准长流程不被截断",
+        "product_id": "JAKA",
+        "forbidden": ["collrob_sdk", "py_dll"],
+    },
+    {
+        "id": "J7",
+        "question": "JAKA 安全区域如何设置？",
+        "keywords": ["安全区域", "安全平面", "3.1.3.5"],
+        "description": "验证：安全区域章节召回无 [Image:] 噪声",
+        "product_id": "JAKA",
+        "forbidden": ["[Image:", "纯文档检索直出"],
+    },
+    {
+        "id": "J8",
+        "question": "JAKA 机器人初始化波特率 9600 用于什么通信？",
+        "keywords": ["Modbus", "RTU", "波特率", "9600", "串口"],
+        "description": "验证：正向数字查询不被硬拒答拦截，精准回答 Modbus RTU",
+        "product_id": "JAKA",
+        "forbidden": ["参考文档中未包含此功能的记载"],
     },
 ]
+
+# ⸻ 跨产品污染检测关键词 ⸻
+CROSS_CONTAMINATION_CHECKS = {
+    "JAKA": ["collrob_sdk.dll", "py_dll.dll", "ctypes.CDLL(", "robot_Power_on(",
+             "set_robot_power_on", "set_move_line", "rob_ip"],
+    "OpenC3": ["JAKA", "MiniCab", "VBrake", "Modbus", "Zu APP"],
+    "OpenR6": ["JAKA", "MiniCab", "collrob_sdk.dll", "robot_movj"],
+}
 
 # ============================================================
 # 辅助函数
@@ -163,13 +245,17 @@ def main():
         qid = tq["id"]
         question = tq["question"]
         keywords = tq["keywords"]
+        pid = tq.get("product_id")
 
         print(f"  [{qid}] {question}")
         print(f"      预期关键词: {keywords}")
+        if pid:
+            print(f"      产品隔离: {pid}")
 
-        # 检索 Top-K 文档（带相似度阈值过滤）
+        # 检索 Top-K 文档（带产品隔离 + 相似度阈值过滤）
         context_docs = search_similar_with_threshold(
-            vs, question, k=RETRIEVAL_K, threshold=SIMILARITY_THRESHOLD
+            vs, question, k=RETRIEVAL_K, threshold=SIMILARITY_THRESHOLD,
+            product_id=pid,
         )
         print(f"      检索到 {len(context_docs)} 个相关片段（阈值过滤后）:")
 
@@ -218,11 +304,11 @@ def main():
                 print(f"  │  │ ... (共 {len(content.split(chr(10)))} 行)")
             print(f"  │  └─")
 
-        # ---- 3b. 执行 RAG 对话 ----
+        # ---- 3b. 执行 RAG 对话 (with product_id) ----
         print(f"  │")
-        print(f"  │  🤖 正在调用 RAG 管线...")
+        print(f"  │  🤖 正在调用 RAG 管线... (product_id={pid})")
         try:
-            result = rag_chat(vs, question, k=RETRIEVAL_K)
+            result = rag_chat(vs, question, k=RETRIEVAL_K, product_id=pid)
             answer = result["answer"]
             model_used = result["model"]
             sources = result["sources"]
@@ -251,20 +337,59 @@ def main():
             if len(keywords) > 0:
                 hit_rate = hits / len(keywords) * 100
             else:
-                hit_rate = 100.0  # 无关键词时（如 Q4 期望空结果），默认满分
+                hit_rate = 100.0
             print(f"  │  📊 关键词命中: {hits}/{len(keywords)} ({hit_rate:.0f}%)")
 
-            # 判断状态：expect_empty 标记的问题使用特殊逻辑
+            # 🔴 禁用关键词检查
+            forbidden = tq.get("forbidden", [])
+            forbidden_hits = [kw for kw in forbidden if kw.lower() in answer.lower()]
+            if forbidden_hits:
+                print(f"  │  🚫 禁用词命中: {forbidden_hits}")
+                hit_rate = max(0, hit_rate - len(forbidden_hits) * 20)
+
+            # 🔴 跨产品污染检测
+            if pid:
+                contam_keywords = CROSS_CONTAMINATION_CHECKS.get(pid, [])
+                contam_hits = [kw for kw in contam_keywords if kw.lower() in answer.lower()]
+                if contam_hits:
+                    print(f"  │  ⚠️  跨产品污染: {contam_hits}")
+                    hit_rate = max(0, hit_rate - len(contam_hits) * 25)
+
+            # 🔴 幻觉检测：编造的函数名/库
+            HALLUCINATION_PATTERNS = [
+                r'import\s+(numpy|matplotlib|pandas|scipy|tensorflow|pytorch)',
+                r'LineTrajectory|RobotController|TrajectoryPlanner',
+                r'pip\s+install',
+                r'微信公众号|微信小程序|关注公众号',
+            ]
+            import re as _re
+            for pat in HALLUCINATION_PATTERNS:
+                if _re.search(pat, answer, _re.IGNORECASE):
+                    print(f"  │  💀 幻觉检测命中: {pat}")
+                    hit_rate = max(0, hit_rate - 30)
+
+            # 判断状态
             is_empty_result = (
                 "未在现有文档中检索到" in answer
                 or len(context_docs) == 0
             )
+            # 🔴 综合评分（关键词 + 禁用词 + 污染 + 幻觉）
             if tq.get("expect_empty"):
                 test_status = "PASS" if is_empty_result else "WARN"
-            elif hit_rate >= 30:
+            elif len(forbidden_hits) > 0 or len(contam_hits) > 0:
+                test_status = "FAIL"  # 跨产品污染/禁用词 = 硬失败
+            elif hit_rate >= 50:
                 test_status = "PASS"
-            else:
+            elif hit_rate >= 30:
                 test_status = "WARN"
+            else:
+                test_status = "FAIL"
+
+            # 记录坏例详情
+            bad_case_detail = []
+            if forbidden_hits: bad_case_detail.append(f"forbidden={forbidden_hits}")
+            if contam_hits: bad_case_detail.append(f"contamination={contam_hits}")
+            if hit_rate < 30: bad_case_detail.append(f"low_hit_rate={hit_rate:.0f}%")
 
             # 打印完整回答（截断显示）
             print(f"  │  ┌─ 完整回答 ({len(answer)} chars) ─")
@@ -279,7 +404,7 @@ def main():
             print(f"  │  🌊 流式输出测试 (前 200 chars): ", end="", flush=True)
             streamed = ""
             try:
-                for token in rag_chat_stream(vs, question, k=RETRIEVAL_K):
+                for token in rag_chat_stream(vs, question, k=RETRIEVAL_K, product_id=pid):
                     streamed += token
                     if len(streamed) <= 200:
                         print(token, end="", flush=True)
@@ -300,6 +425,9 @@ def main():
                 "stream_length": len(streamed) if streamed else 0,
                 "sources": sources,
                 "status": test_status,
+                "forbidden_hits": forbidden_hits,
+                "contamination_hits": contam_hits,
+                "bad_case_detail": "; ".join(bad_case_detail) if bad_case_detail else "",
             })
 
         except Exception as e:
@@ -325,14 +453,15 @@ def main():
     # ================================================================
     print_separator("阶段四: 测试结果汇总", "█")
 
-    print(f"  {'ID':<4} {'状态':<6} {'层级':<6} {'模型':<45} {'命中':<8} {'回答长度':<10}")
-    print(f"  {'-'*4} {'-'*6} {'-'*6} {'-'*45} {'-'*8} {'-'*10}")
+    print(f"  {'ID':<4} {'状态':<6} {'层级':<6} {'命中':<8} {'禁用/污染':<15} {'坏例详情'}")
+    print(f"  {'-'*4} {'-'*6} {'-'*6} {'-'*8} {'-'*15} {'-'*20}")
 
     for r in results:
         status_icon = "✅" if r["status"] == "PASS" else "⚠️" if r["status"] == "WARN" else "❌"
-        layer_str = f"L{r['layer']}"
         hits_str = f"{r['keyword_hits']}/{r['keyword_total']}"
-        print(f"  {r['id']:<4} {status_icon:<6} {layer_str:<6} {r['model']:<45} {hits_str:<8} {r['answer_length']:<10}")
+        bad_str = f"{len(r.get('forbidden_hits',[]))}/{len(r.get('contamination_hits',[]))}"
+        detail = r.get("bad_case_detail", "")[:30]
+        print(f"  {r['id']:<4} {status_icon:<6} L{r['layer']:<5} {hits_str:<8} {bad_str:<15} {detail}")
 
     print()
 
@@ -340,18 +469,21 @@ def main():
     pass_count = sum(1 for r in results if r["status"] == "PASS")
     warn_count = sum(1 for r in results if r["status"] == "WARN")
     fail_count = sum(1 for r in results if r["status"] == "FAIL")
-    layer_counts = {}
-    for r in results:
-        layer_counts[r["layer"]] = layer_counts.get(r["layer"], 0) + 1
+    total_forbidden = sum(len(r.get("forbidden_hits", [])) for r in results)
+    total_contam = sum(len(r.get("contamination_hits", [])) for r in results)
 
     print(f"  📊 通过: {pass_count} | 警告: {warn_count} | 失败: {fail_count}")
-    print(f"  🛡️  容灾层级分布: {layer_counts}")
+    print(f"  🚫 禁用词命中: {total_forbidden} | ⚠️ 跨产品污染: {total_contam}")
+    if fail_count > 0:
+        print(f"  🔴 坏例列表:")
+        for r in results:
+            if r["status"] == "FAIL":
+                print(f"     [{r['id']}] {r['question'][:60]}")
+                if r.get("bad_case_detail"):
+                    print(f"         原因: {r['bad_case_detail']}")
+
     print(f"  📄 向量库状态: {get_vector_store_info(vs)['document_count']} 个文档片段")
     print()
-
-    # 输出 JSON 结果（便于 CI 集成）
-    print(f"  📋 JSON 结果:")
-    print(json.dumps(results, ensure_ascii=False, indent=2))
 
     print_separator("测试完成", "█")
     return 0 if fail_count == 0 else 1

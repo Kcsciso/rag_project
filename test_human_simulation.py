@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 # ============================================================
 # 配置
 # ============================================================
-API_CHAT_URL = "http://localhost:8000/api/chat"
+API_CHAT_URL = "http://localhost:7860/api/chat"
 TIMEOUT_SECONDS = 60  # 单请求最长等待时间
 
 # ============================================================
@@ -517,7 +517,7 @@ def main():
 
     print("=" * 70)
     print("  NewsPage 人类模拟测试")
-    print("  目标: http://localhost:8000/api/chat")
+    print("  目标: http://localhost:7860/api/chat")
     print(f"  用例数: {len(TEST_CASES)} | 类别数: 5")
     print("=" * 70)
 

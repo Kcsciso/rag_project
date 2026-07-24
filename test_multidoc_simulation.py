@@ -31,7 +31,7 @@ from urllib.parse import urlencode
 # ============================================================
 # 配置
 # ============================================================
-API_CHAT_URL = "http://localhost:8000/api/chat"
+API_CHAT_URL = "http://localhost:7860/api/chat"
 TIMEOUT_SECONDS = 90
 
 DOC1 = "六轴机械臂SDK说明文档_win.pdf"

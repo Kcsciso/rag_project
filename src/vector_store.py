@@ -817,9 +817,12 @@ def _auto_extract_and_register_terms(documents: list):
     registered_count = 0
     for term in new_terms:
         if term not in _auto_registered_terms and 2 <= len(term) <= 40:
-            # 过滤纯数字/纯标点
+            # 🔴 允许 3-5 位数字通过（端口号 6502、密码等屏幕截图 OCR 提取值）
             if re.match(r'^[\d\.\s\-—|]+$', term):
-                continue
+                if re.match(r'^\d{3,5}$', term):
+                    pass  # 放行 3-5 位数字
+                else:
+                    continue
             _auto_registered_terms.add(term)
             jieba.add_word(term, freq=300, tag='auto')
             registered_count += 1
@@ -852,6 +855,12 @@ def _tokenize_for_bm25(text: str) -> List[str]:
 
     # 🔴 Step 2: 移除标识符后再 jieba 分词中文部分
     text_no_ident = _IDENTIFIER_RE.sub(' ', text)
+    # 🔴 Step 2b: 提取 3-5 位数字作为原子 token（端口号 6502、密码等）
+    _numeric_tokens = re.findall(r'\b(\d{3,5})\b', text_no_ident)
+    for num in _numeric_tokens:
+        tokens.append(num)
+    text_no_ident = re.sub(r'\b\d{3,5}\b', ' ', text_no_ident)
+    # jieba 分词
     for word in jieba.cut(text_no_ident):
         word = word.strip()
         if not word or word in (' ', '_', '.', ',', ':', ';'):
