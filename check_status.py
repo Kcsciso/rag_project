@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 =============================================================================
-NewsPage 统一服务健康状态检查脚本
+NewsPage 统一服务健康状态检查脚本 (v4)
 =============================================================================
 
 检查范围：
   1. 本地 vLLM 推理服务（端口 8001）— 在线状态、已加载模型名称
-  2. FastAPI 后端（NewsPage，端口 8000）— 在线状态、向量库文档数
-  3. CUDA GPU 显存占用 — GPU 0 & GPU 1 的实时显存、温度、功率
+  2. FastAPI 后端（NewsPage，端口 7860）— 在线状态、向量库文档数
+  3. v4 Parent-Child 双索引 — rag_v4_parent / rag_v4_child chunk 数量
+  4. CUDA GPU 显存占用 — GPU 0 & GPU 1 的实时显存、温度、功率
 
 使用方式：
   python check_status.py              # 一次性检查
@@ -17,6 +18,7 @@ NewsPage 统一服务健康状态检查脚本
 依赖：
   - httpx（HTTP 请求）
   - nvidia-smi（GPU 状态查询）
+  - chromadb（v4 索引检查）
 =============================================================================
 """
 
@@ -60,7 +62,7 @@ STATUS_DOWN = red("● 离线")
 # ============================================================
 
 VLLM_BASE_URL      = "http://localhost:8001"
-FASTAPI_BASE_URL   = "http://localhost:8000"
+FASTAPI_BASE_URL   = "http://localhost:7860"
 
 TIMEOUT_CONNECT = 3.0   # HTTP 连接超时（秒）
 TIMEOUT_READ    = 5.0   # HTTP 读取超时（秒）
@@ -271,6 +273,55 @@ def check_fastapi() -> Dict[str, Any]:
 
 
 # ============================================================
+# v4 双索引检查
+# ============================================================
+
+def check_v4_collections() -> Dict[str, Any]:
+    """
+    检查 v4 Parent-Child 双索引 ChromaDB Collections。
+
+    Returns:
+        {
+            "v4_available": bool,
+            "parent_count": int,
+            "child_count": int,
+            "legacy_count": int,
+            "error": str | None,
+        }
+    """
+    result = {
+        "v4_available": False,
+        "parent_count": 0,
+        "child_count": 0,
+        "legacy_count": 0,
+        "error": None,
+    }
+    try:
+        import chromadb
+        from chromadb.config import Settings
+        client = chromadb.PersistentClient(
+            path="vector_db",
+            settings=Settings(anonymized_telemetry=False),
+        )
+        for name in ["rag_v4_parent", "rag_v4_child", "rag_documents"]:
+            try:
+                coll = client.get_collection(name)
+                count = coll.count()
+                if name == "rag_v4_parent":
+                    result["parent_count"] = count
+                elif name == "rag_v4_child":
+                    result["child_count"] = count
+                else:
+                    result["legacy_count"] = count
+            except Exception:
+                pass
+        result["v4_available"] = result["parent_count"] > 0 and result["child_count"] > 0
+    except Exception as e:
+        result["error"] = str(e)[:80]
+    return result
+
+
+# ============================================================
 # CUDA GPU 显存查询
 # ============================================================
 
@@ -418,8 +469,8 @@ def _gpu_bar(pct: float, width: int = 8) -> str:
 
     return f"[{bar}] {pct:.0f}%"
 
-def print_service_section(vllm: Dict, fastapi: Dict):
-    """打印服务状态表格"""
+def print_service_section(vllm: Dict, fastapi: Dict, v4: Dict = None):
+    """打印服务状态表格（v4 含双索引信息）"""
     print(bold("┌─ 核心服务状态 " + "─" * 42 + "┐"))
 
     # vLLM
@@ -438,7 +489,6 @@ def print_service_section(vllm: Dict, fastapi: Dict):
         gpu_label = f"GPU {vllm_gpu_id}" + (f" ({vllm_gpu_name})" if vllm_gpu_name else "")
         print(f"│   └ 部署 GPU      {green(gpu_label):<30} │")
     elif not vllm["online"]:
-        # 显示配置中预期的 GPU
         expected_gpu = os.environ.get("VLLM_GPU_ID", "自动检测")
         print(f"│   └ 目标 GPU      {dim(f'[{expected_gpu}] — vLLM 离线'):<30} │")
     if not vllm["online"] and vllm_err:
@@ -449,7 +499,7 @@ def print_service_section(vllm: Dict, fastapi: Dict):
     # FastAPI
     api_status  = STATUS_OK if fastapi["online"] else STATUS_DOWN
     api_ready   = green("✅ 向量库就绪") if fastapi["ready"] else yellow("⚠️  向量库未初始化")
-    api_docs    = f"{fastapi['document_count']} 个文档片段"
+    api_docs    = f"{fastapi['document_count']} 个文档片段 (v3)"
     api_lat     = f"{fastapi.get('latency_ms', 0)}ms"
     api_err     = fastapi.get("error", "")
 
@@ -459,6 +509,17 @@ def print_service_section(vllm: Dict, fastapi: Dict):
         print(f"│   └ 向量库        {api_ready:<24} {api_docs:<15} │")
     if not fastapi["online"] and api_err:
         print(f"│   └ 错误          {red(api_err[:48]):<48} │")
+
+    # v4 双索引
+    if v4:
+        print("│" + " " * 59 + "│")
+        v4_status = green("✅ v4 双索引就绪") if v4.get("v4_available") else (yellow("⚠️  v4 未构建") if v4.get("error") else dim("  未检测"))
+        print(f"│ {'v4 双索引 (ADR-15)':<16} {v4_status:<36} │")
+        if v4.get("parent_count") or v4.get("child_count"):
+            print(f"│   └ Parent       {green(str(v4['parent_count'])):<6} chunks (H2 章节级粗召回)        │")
+            print(f"│   └ Child        {green(str(v4['child_count'])):<6} chunks (H3/H4 函数级精匹配)        │")
+        if v4.get("legacy_count", 0) > 0:
+            print(f"│   └ Legacy (v3)  {dim(str(v4['legacy_count'])):<6} chunks (旧索引，兼容保留)         │")
 
     print("└" + "─" * 59 + "┘")
     print()
@@ -522,11 +583,12 @@ def run_check():
     # ---- 收集数据 ----
     vllm_result    = check_vllm()
     fastapi_result = check_fastapi()
+    v4_result      = check_v4_collections()
     gpus           = check_gpu_memory()
 
     # ---- 打印报告 ----
     print_header()
-    print_service_section(vllm_result, fastapi_result)
+    print_service_section(vllm_result, fastapi_result, v4_result)
     print_gpu_section(gpus, vllm_gpu_id=vllm_result.get("gpu_id"))
     print_layer_status(vllm_result["online"], fastapi_result["online"])
     print_summary(vllm_result, fastapi_result, gpus)

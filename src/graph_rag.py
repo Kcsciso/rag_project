@@ -48,6 +48,7 @@ from langgraph.graph import StateGraph, END
 
 from .agent_state import RAGState
 from . import config as _cfg
+from . import rag_chain as _rag_chain_mod  # 模块引用 — 访问可变全局变量
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +177,51 @@ def _is_sdk_query(query: str) -> bool:
     return bool(_SDK_QUERY_PATTERNS.search(query))
 
 
+# ── v3 CodeEntityAnchor: 代码实体提取与 BM25 增强 ──
+
+# 函数名模式: robot_*, set_*, get_*, movl/movc/movj/movp
+_CODE_ENTITY_PATTERNS = [
+    re.compile(r'\b(?:robot_|set_|get_)\w+\b', re.IGNORECASE),
+    re.compile(r'\b(?:movl|movc|movj|movp|movb)\b', re.IGNORECASE),
+    re.compile(r'\b(?:py_dll|collrob_sdk)\b', re.IGNORECASE),
+    re.compile(r'\b(?:ctypes\.CDLL|ctypes\.c_\w+|POINTER|byref)\b', re.IGNORECASE),
+    re.compile(r'\b(?:power_on|enable|brkopen|home|joint_angle|io_output)\b', re.IGNORECASE),
+    re.compile(r'\b(?:POSE|RobJoint|RobPos|JNT)\b', re.IGNORECASE),
+]
+
+# 运动类型归一化 — 防止 movl/movc 混淆
+_MOTION_ALIASES = {
+    "movl": "直线运动 (movl)",
+    "movc": "圆弧运动 (movc)",
+    "movj": "关节运动 (movj)",
+    "movp": "点位运动 (movp)",
+    "movb": "样条运动 (movb)",
+}
+
+
+def _extract_code_entities(query: str) -> List[str]:
+    """
+    从 query 中提取代码实体名（函数名/DLL/结构体），用于增强 BM25 检索精度。
+
+    比如 query "怎么用 movl 走直线" → ["movl", "robot_movl"]
+    检索时 "[CODE:movl]" 标签会被 BM25 tokenizer 保护，强制精确匹配。
+    """
+    entities = []
+    seen = set()
+    for pat in _CODE_ENTITY_PATTERNS:
+        for m in pat.finditer(query):
+            entity = m.group(0).lower()
+            if entity not in seen:
+                seen.add(entity)
+                entities.append(entity)
+    # 如果是运动类型缩写，追加完整形式到检索词
+    for e in list(entities):
+        if e in _MOTION_ALIASES:
+            alias = _MOTION_ALIASES[e]
+            # 不修改 query，仅记录以供 BM25 boost
+    return entities[:8]  # 最多 8 个实体，防止 query 过长
+
+
 def _check_sdk_code_issues(code_text: str) -> List[str]:
     """
     扫描生成的代码文本，检测常见的 SDK 代码缺失项。
@@ -214,7 +260,6 @@ from .rag_chain import (
     _is_product_name_only,
     _build_messages,
     _expand_parent_sections,
-    _last_numeric_context_missing,
     _hybrid_retrieve,
     _call_llm,
     _stream_llm,
@@ -237,6 +282,35 @@ from .rag_chain import (
     _build_clarification_response_stream,
 )
 from .vector_store import get_registered_products, search_similar_with_threshold
+
+# ── 短词查询最大长度阈值（低于此值触发短词融合）──
+_SHORT_QUERY_MAX_LEN = 15
+
+
+# ============================================================
+# 🔴 v2.2: 全图节点全局异常捕获装饰器 (Fail-Safe)
+# ============================================================
+
+def _node_safe(fallback: dict):
+    """
+    节点安全装饰器 — 捕获节点内所有未处理异常，返回平滑兜底 State，
+    绝对禁止向外抛出 Unhandled Exception 导致 HTTP 500。
+
+    用法: @_node_safe(fallback_dict)  或  手动包装: node = _node_safe({...})(node)
+    """
+    def decorator(fn):
+        def wrapper(state):
+            try:
+                return fn(state)
+            except Exception as e:
+                logger.error(
+                    f"❌ [{fn.__name__}] 运行时异常: {e}", exc_info=True
+                )
+                return fallback
+        wrapper.__name__ = fn.__name__
+        wrapper.__doc__ = fn.__doc__
+        return wrapper
+    return decorator
 
 
 # ============================================================
@@ -284,17 +358,29 @@ def query_fusion_node(state: RAGState) -> dict:
 # Node 2: ProductRoutingNode — 产品识别 + 意图分类
 # ============================================================
 
+# ── v3.0 多产品检测: 返回 query 中匹配的所有产品 ID ──
+def _detect_all_products(query: str) -> List[str]:
+    """扫描 PRODUCT_ROUTER_RULES，返回 query 中命中的所有产品 ID（去重）。"""
+    q = query.lower()
+    products = []
+    for rule in _cfg.PRODUCT_ROUTER_RULES:
+        for kw in rule["keywords"]:
+            if kw.lower() in q:
+                if rule["product_id"] not in products:
+                    products.append(rule["product_id"])
+                break
+    return products
+
+
 def product_routing_node(state: RAGState) -> dict:
     """
-    确定 route_status：
-      - "chitchat"  → 闲聊/身份询问
-      - "refuse"    → 不可能组合（如 JAKA+NumPy）
-      - "clarify"   → 产品未识别，需反问
-      - "generate"  → 正常检索+生成
-      - "fallback"  → 产品已识别但检索词较弱
-
-    同时生成对应的直接回答（如澄清反问/身份回复/硬拒答），
-    存入 state["final_answer"]。
+    确定 route_status (v3.0 — 多产品对比支持):
+      - "chitchat"       → 闲聊/身份询问
+      - "refuse"         → 不可能组合（如 JAKA+NumPy）
+      - "clarify"        → 产品未识别，需反问
+      - "multi_product"  → 2+ 产品同时命中 → 拆分检索
+      - "generate"       → 正常单产品检索+生成
+      - "fallback"       → 产品已识别但检索词较弱
     """
     query = state.get("fused_query") or state.get("query", "")
     product_id = state.get("product_id")
@@ -305,23 +391,27 @@ def product_routing_node(state: RAGState) -> dict:
     if _is_chitchat(query):
         logger.info("  ↳ route_status='chitchat'")
         resp = _chitchat_response()
-        return {
-            "route_status": "chitchat",
-            "final_answer": resp["answer"],
-            "sources": resp.get("sources", []),
-            "model": resp.get("model", "identity-router"),
-        }
+        return {"route_status": "chitchat", "final_answer": resp["answer"],
+                "sources": resp.get("sources", []), "model": resp.get("model", "identity-router")}
 
     # ── 意图 2: 不可能组合 ──
     if _is_impossible_query(query):
         logger.info("  ↳ route_status='refuse'")
         resp = _hard_refusal_response()
-        return {
-            "route_status": "refuse",
-            "final_answer": resp["answer"],
-            "sources": [],
-            "model": "hard-refusal",
-        }
+        return {"route_status": "refuse", "final_answer": resp["answer"],
+                "sources": [], "model": "hard-refusal"}
+
+    # ── v3.0 意图 2.5: 多产品对比检测 ──
+    if not product_id:
+        all_products = _detect_all_products(query)
+        if len(all_products) >= 2:
+            logger.info(f"  ↳ route_status='multi_product': {all_products}")
+            return {
+                "route_status": "multi_product",
+                "product_id": None,  # 不绑定单一产品 → 检索节点拆分
+            }
+        elif len(all_products) == 1:
+            product_id = all_products[0]
 
     # ── 意图 3: 产品未识别 → 反问澄清 ──
     if not product_id:
@@ -331,20 +421,12 @@ def product_routing_node(state: RAGState) -> dict:
             registered = get_registered_products()
             resp = _build_clarification_response(registered)
             logger.info("  ↳ route_status='clarify'")
-            return {
-                "route_status": "clarify",
-                "final_answer": resp["answer"],
-                "sources": [],
-                "model": "product-clarification",
-                "product_id": None,
-            }
+            return {"route_status": "clarify", "final_answer": resp["answer"],
+                    "sources": [], "model": "product-clarification", "product_id": None}
 
     # ── 意图 4: 正常生成 ──
     logger.info(f"  ↳ route_status='generate', product_id='{product_id}'")
-    return {
-        "route_status": "generate",
-        "product_id": product_id,
-    }
+    return {"route_status": "generate", "product_id": product_id}
 
 
 # ============================================================
@@ -358,8 +440,25 @@ def _route_after_product_routing(state: RAGState) -> str:
       - 需要检索生成 → "hybrid_retrieval"
     """
     status = state.get("route_status", "generate")
-    if status in ("clarify", "chitchat", "refuse"):
+    if status in ("chitchat", "refuse"):
         return "build_direct_response"
+    # v3: clarify 也进入 SubGoalPlanner — 由 Planner 决定是反问还是跨产品检索
+    # 仅纯拒绝/闲聊直接返回
+    return "subgoal_planner"
+
+
+def _route_after_planner(state: RAGState) -> str:
+    """
+    SubGoalPlannerNode 之后的分发逻辑:
+
+      - plan_mode == "cross_product" 且 product_id 为 None → cross_product_retrieval
+      - 否则 → hybrid_retrieval（Fast Path, 保持零额外延迟）
+    """
+    plan_mode = state.get("plan_mode", "single")
+    product_id = state.get("product_id")
+
+    if plan_mode == "cross_product" and not product_id:
+        return "cross_product_retrieval"
     return "hybrid_retrieval"
 
 
@@ -388,6 +487,7 @@ def hybrid_retrieval_node(state: RAGState) -> dict:
     使用 fused_query + product_id 执行混合检索（向量 + BM25 + RRF + Autocut）。
 
     检索策略：
+      0. v3 CodeEntityAnchor: 从 query 提取代码实体，注入 BM25 boost
       1. 主检索：阈值过滤 + 产品隔离
       2. 若主检索为空 → 第二机会：无阈值原始向量 Top-3 兜底
       3. 若仍为空 → route_status="fallback"（仍尝试 LLM 生成）
@@ -399,6 +499,17 @@ def hybrid_retrieval_node(state: RAGState) -> dict:
 
     logger.info(f"🔵 [Node 3] HybridRetrieval: query='{query[:60]}', product_id='{product_id}'")
 
+    # ── v3 CodeEntityAnchor: 代码实体提取与 BM25 增强 ──
+    code_entities = _extract_code_entities(query)
+    if code_entities:
+        logger.info(f"  ↳ [CodeEntityAnchor] 检测到 {len(code_entities)} 个代码实体: {code_entities}")
+        # 将代码实体追加到检索 query 中，提升 BM25 权重
+        # 用特殊标签标记，在 BM25 tokenizer 中会被保护
+        _entity_suffix = " ".join(f"[CODE:{e}]" for e in code_entities)
+        query = f"{query} {_entity_suffix}"
+    else:
+        code_entities = []
+
     vector_store = _get_graph_vector_store()
     if vector_store is None:
         logger.error("❌ vector_store 未注入到 Graph 引擎")
@@ -407,14 +518,35 @@ def hybrid_retrieval_node(state: RAGState) -> dict:
             "route_status": "fallback",
         }
 
-    # 主检索
-    context_docs = _hybrid_retrieve(
-        vector_store, query,
-        k=_cfg.RETRIEVAL_K,
-        threshold=_cfg.SIMILARITY_THRESHOLD,
-        fetch_factor=5,
-        product_id=product_id,
-    )
+    # ── v3.0: 多产品拆分检索 ──
+    route_status_in = state.get("route_status", "generate")
+    if route_status_in == "multi_product":
+        all_products = _detect_all_products(query)
+        logger.info(f"  ↳ 多产品拆分检索: {all_products}")
+        merged: List[Any] = []
+        seen_fps: set = set()
+        for pid in all_products:
+            sub_docs = _hybrid_retrieve(
+                vector_store, query,
+                k=2, threshold=_cfg.SIMILARITY_THRESHOLD,
+                fetch_factor=3, product_id=pid,
+            )
+            for doc in sub_docs:
+                fp = doc.page_content[:120]
+                if fp not in seen_fps:
+                    seen_fps.add(fp)
+                    merged.append(doc)
+            logger.info(f"    [{pid}]: {len(sub_docs)} chunks → merged {len(merged)}")
+        context_docs = merged
+    else:
+        # 主检索（单产品）
+        context_docs = _hybrid_retrieve(
+            vector_store, query,
+            k=_cfg.RETRIEVAL_K,
+            threshold=_cfg.SIMILARITY_THRESHOLD,
+            fetch_factor=5,
+            product_id=product_id,
+        )
 
     # 第二机会检索
     if not context_docs:
@@ -475,6 +607,38 @@ def llm_generation_node(state: RAGState) -> dict:
 
     logger.info(f"🟣 [Node 4] LLMGeneration: {len(context_docs)} docs → LLM")
 
+    # ── 🔴 v3.0 ABSTAIN 网关: 查询含实体/数字但 Context 中不存在 → 硬弃答 ──
+    _query_entities = set(
+        re.findall(r'\b(\d{2,})\b', query) +
+        re.findall(r'(?:Modbus|Profinet|EtherCAT|TCP|RTU|RS485|RS232|'
+                   r'波特率|端口号|IP地址|寄存器|从站|主站|末端传感器|'
+                   r'电控柜|制动电阻|MiniCab|VBrake)', query, re.IGNORECASE)
+    )
+    if _query_entities and context_docs:
+        _context_combined = " ".join(
+            d.page_content if hasattr(d, 'page_content') else str(d)
+            for d in context_docs
+        )
+        _missing = [e for e in _query_entities
+                    if e.lower() not in _context_combined.lower()]
+        if _missing:
+            _doc_name = (context_docs[0].metadata.get("source", "相关文档")
+                         if hasattr(context_docs[0], 'metadata') else "相关文档")
+            _abstain_msg = (
+                f"根据《{_doc_name}》，未找到关于 '{_missing[0]}' 的明确记载。"
+                f"请确认参数名称或联系技术支持。"
+            )
+            logger.info(f"🚫 ABSTAIN: 实体 {_missing} 不在 Context 中 → 硬弃答")
+            return {
+                "final_answer": _abstain_msg,
+                "raw_llm_answer": _abstain_msg,
+                "sources": [],
+                "model": "abstain-gateway",
+                "route_status": "complete",
+                "feedback": "",
+                "retry_count": state.get("retry_count", 0),
+            }
+
     # ── 父子切片扩展 + 构建消息 ──
     if context_docs:
         context_docs = _expand_parent_sections(
@@ -516,8 +680,29 @@ def llm_generation_node(state: RAGState) -> dict:
         messages.append({"role": "user", "content": correction_msg})
         logger.info(f"  ↳ 已注入自纠错反馈到消息列表")
 
-    # 🔴 数字请求无上下文硬防护
-    if _last_numeric_context_missing:
+    # 🔴 数字请求无上下文硬防护 + KV 属性检索 (ADR-13)
+    _numeric_guard = _rag_chain_mod._last_numeric_context_missing
+    if _numeric_guard:
+        # ── 第零机会: KV 属性存储检索 ──
+        try:
+            from .kv_extractor import lookup_attribute as _kv_lookup
+            _kv_result = _kv_lookup(query, product_id=state.get("product_id"))
+            if _kv_result:
+                logger.info(f"✅ [Graph] KV 属性检索命中: {_kv_result}")
+                # 🔴 将 KV 结果注入用户消息头部作为最高优先级事实参考
+                _kv_prefix = (
+                    f"【⚠️ 以下为系统属性库中的已知事实，必须在回答中直接引用：{_kv_result}。"
+                    f"请以系统属性库为准，不要引用PDF中不完整的信息。】\n\n"
+                )
+                for _i, _m in enumerate(messages):
+                    if _m["role"] == "user":
+                        messages[_i]["content"] = _kv_prefix + messages[_i]["content"]
+                        break
+                _numeric_guard = False
+        except Exception:
+            pass
+
+    if _numeric_guard:
         logger.info("🚫 [Graph] 数字请求无上下文 → 直接返回硬拒答")
         return {
             "final_answer": _HARD_REFUSAL,
@@ -664,6 +849,152 @@ def sdk_verify_node(state: RAGState) -> dict:
 
 
 # ============================================================
+# Node 5b: RenderNode — 提取模式 JSON 渲染器 (v4.0 Extract-Render)
+# ============================================================
+
+def render_node(state: RAGState) -> dict:
+    """
+    解析 LLM 输出的 JSON 提取块，用确定性 Python 渲染器生成最终答案。
+
+    若 LLM 输出包含有效的【提取】...【提取结束】JSON 块:
+      → 解析 JSON → 确定性渲染代码/步骤/引用（零模型幻觉）
+    若 JSON 解析失败或不存在:
+      → 透传原始回答（优雅降级）
+
+    渲染规则:
+      ① 文档引用: 根据《{doc}》【{section}】的记载:
+      ② 函数代码: Python ctypes 模板 → DLL名/函数签名/参数全部来自 JSON
+      ③ 操作步骤: 编号列表 → 每步来自 JSON steps 数组原文
+      ④ 参数列表: 表格格式 → 参数名/值来自 JSON params 字典
+      ⑤ 硬件配置: 列表格式 → 来自 JSON hardware 字典
+    """
+    import json as _json
+    raw_answer = state.get("raw_llm_answer") or state.get("final_answer", "")
+
+    # ── 解析 JSON 提取块 ──
+    _extract_match = re.search(
+        r'【提取】\s*\n?(.*?)\n?\s*【提取结束】', raw_answer, re.DOTALL
+    )
+
+    if not _extract_match:
+        logger.info("🟠 [RenderNode] 无 JSON 提取块 → 透传原始回答")
+        return {"final_answer": raw_answer, "route_status": state.get("route_status", "complete")}
+
+    _json_str = _extract_match.group(1).strip()
+    try:
+        _data = _json.loads(_json_str)
+    except _json.JSONDecodeError as e:
+        # 🔴 Bug Fix 1: JSON 解析失败时，必须剥离【提取】...【提取结束】块再透传
+        # 否则前端流式输出会泄露 JSON 源码
+        logger.warning(f"🟠 [RenderNode] JSON 解析失败: {e} → 剥离提取块后透传")
+        _clean_answer = re.sub(
+            r'【提取】\s*\n?.*?\n?\s*【提取结束】', '', raw_answer, flags=re.DOTALL
+        ).strip()
+        if not _clean_answer:
+            _clean_answer = raw_answer.replace("【提取】", "").replace("【提取结束】", "").strip()
+        return {"final_answer": _clean_answer or raw_answer,
+                "route_status": state.get("route_status", "complete")}
+
+    # ── 确定性渲染 ──
+    _doc = _data.get("doc", "未知文档")
+    _section = _data.get("section", "")
+    _note = _data.get("note", "")
+
+    _parts = []
+
+    # ① 文档引用（强制执行 — 与模型输出无关）
+    if _doc:
+        _header = f"根据《{_doc}》"
+        if _section:
+            _header += f"【{_section}】"
+        _header += "的记载："
+        _parts.append(_header)
+
+    # Bug Fix 3: note 不为空时才追加，且必须是实质性内容
+    if _note and len(_note) >= 10 and not _note.startswith("确保"):
+        _parts.append(_note)
+        # 只有当没有其他结构化数据时才从 note 返回
+        if not _funcs and not _steps and not _params and not _hw:
+            return {
+                "final_answer": "\n\n".join(_parts),
+                "raw_llm_answer": raw_answer,
+                "route_status": "complete",
+            }
+        # 否则继续渲染其他结构化数据
+
+    # ② 函数代码渲染
+    _funcs = _data.get("functions", [])
+    if _funcs:
+        for _f in _funcs:
+            _fname = _f.get("name", "")
+            _fsig = _f.get("signature", "")
+            _fdll = _f.get("dll", "")
+            _parts.append(f"\n■ 函数: {_fname}({_fsig})" if _fsig else f"\n■ 函数: {_fname}")
+            if _fdll:
+                _parts.append(f"  动态库: {_fdll}")
+            _parts.append("")
+            if _fsig:
+                _parts.append("  Python ctypes 调用示例:")
+                _parts.append("  ```python")
+                _parts.append("  import ctypes")
+                _parts.append(f"  robot = ctypes.CDLL('{_fdll}')" if _fdll else "  robot = ctypes.CDLL('...')")
+                _parts.append(f"  # {_fname}({_fsig})")
+                _parts.append("  ```")
+            _parts.append("")
+
+    # ③ 操作步骤渲染
+    _steps = _data.get("steps", [])
+    if _steps:
+        _parts.append("\n📋 操作步骤:")
+        for _i, _s in enumerate(_steps, 1):
+            _parts.append(f"  {_i}. {_s}")
+        _parts.append("")
+
+    # ④ 参数列表渲染
+    _params = _data.get("params", {})
+    if _params:
+        _parts.append("\n📊 参数:")
+        for _k, _v in _params.items():
+            _parts.append(f"  • {_k}: {_v}")
+        _parts.append("")
+
+    # ⑤ 硬件配置渲染
+    _hw = _data.get("hardware", {})
+    if _hw:
+        _parts.append("\n🖥️ 硬件配置:")
+        for _k, _v in _hw.items():
+            _parts.append(f"  • {_k}: {_v}")
+        _parts.append("")
+
+    _rendered = "\n".join(_parts).strip()
+
+    # 🔴 Bug Fix 1: 从 raw_llm_answer 中剥离 JSON 提取块，防止后续 extract_align 复读
+    _clean_raw = re.sub(
+        r'【提取】\s*\n?.*?\n?\s*【提取结束】', '', raw_answer, flags=re.DOTALL
+    ).strip()
+
+    # 🔴 去重保护: 如果渲染结果与清理后的原始文本有≥80%重叠，只保留渲染版本
+    if _clean_raw and _rendered:
+        _clean_words = set(_clean_raw.replace("\n", " ").split())
+        _rendered_words = set(_rendered.replace("\n", " ").split())
+        if _clean_words and _rendered_words:
+            _overlap = len(_clean_words & _rendered_words) / max(len(_clean_words), len(_rendered_words))
+            if _overlap > 0.8:
+                _clean_raw = ""  # 高度重叠 → 丢弃原始文本，防止复读
+
+    logger.info(
+        f"🟢 [RenderNode] JSON 渲染: doc='{_doc}', section='{_section}', "
+        f"funcs={len(_funcs)}, steps={len(_steps)}, params={len(_params)}"
+    )
+
+    return {
+        "final_answer": _rendered,
+        "raw_llm_answer": _clean_raw,  # 已清理 JSON 块
+        "route_status": "complete",
+    }
+
+
+# ============================================================
 # Node 6: ExtractAlignNode — 通用属性对齐校验（v2）
 # ============================================================
 
@@ -755,6 +1086,41 @@ def extract_align_node(state: RAGState) -> dict:
     if fixes_applied > 0:
         logger.info(f"  ↳ 共修正 {fixes_applied} 处属性词颠倒/篡改")
 
+    # ── 🔴 v3.0 SemanticDedup: 后处理语义去重，消除1.5B小模型段落级重复生成 ──
+    import re as _re_dedup
+    _sentences = _re_dedup.split(r'(?<=[。！？\n])\s*', corrected)
+    _sentences = [s.strip() for s in _sentences if len(s.strip()) >= 8]
+
+    if len(_sentences) >= 4:
+        _deduped = [_sentences[0]]  # 保留首句
+        _cut_at = len(_sentences)
+        for _i in range(1, len(_sentences)):
+            # 滑动窗口: 检查当前句是否与前面任一已保留句高度重复
+            _is_dup = False
+            _cur = _sentences[_i]
+            for _j in range(max(0, _i - 3), _i):
+                _prev = _sentences[_j]
+                # Jaccard-like trigram overlap
+                _cur_grams = set(_cur[i:i+3] for i in range(len(_cur) - 2))
+                _prev_grams = set(_prev[i:i+3] for i in range(len(_prev) - 2))
+                if _cur_grams and _prev_grams:
+                    _overlap = len(_cur_grams & _prev_grams) / min(len(_cur_grams), len(_prev_grams))
+                    if _overlap > 0.55:
+                        _is_dup = True
+                        break
+            if _is_dup:
+                _cut_at = _i
+                break
+            _deduped.append(_sentences[_i])
+
+        if _cut_at < len(_sentences):
+            _trimmed_count = len(_sentences) - _cut_at
+            logger.info(
+                f"  ✂️  SemanticDedup: 截断 {_trimmed_count} 个重复句 "
+                f"(trigram_overlap > 0.55 @ pos {_cut_at})"
+            )
+            corrected = "\n".join(_deduped)
+
     return {
         "final_answer": corrected,
         "route_status": "complete",
@@ -842,9 +1208,266 @@ def set_graph_vector_store(vs):
     logger.info("✅ Graph 引擎已注入 vector_store 实例")
 
 
+# ============================================================
+# v3 Node: SubGoalPlannerNode — 任务分解（ADR-14 Plan-Execute-Synthesize）
+# ============================================================
+
+# 快速判断：是否需要 Planner（单产品简单查询跳过）
+def _needs_planner(state: RAGState) -> bool:
+    """有明确 product_id 且 query 无跨产品/属性意图时跳过 Planner"""
+    query = state.get("query", "")
+    product_id = state.get("product_id", "")
+    # Fast Path: 有明确产品 ID 的单产品查询
+    if product_id and product_id != "multi":
+        return False
+    # 无产品 ID 或 query 含跨产品意图 → 需要 Planner
+    return True
+
+
+def _parse_subgoals_markdown(text: str) -> List[Dict]:
+    """从 LLM 输出的 Markdown 中解析子目标列表。含严密异常捕获。"""
+    goals = []
+    try:
+        in_list = False
+        for line in text.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            # 匹配 "- 类型: product_qa" 等
+            if line.startswith("-") and "类型:" in line:
+                in_list = True
+                goal = {"type": "product_qa", "product_id": None, "query": "", "priority": 1}
+                # 提取字段
+                type_match = re.search(r'类型\s*[:：]\s*(\w+)', line)
+                if type_match:
+                    goal["type"] = type_match.group(1).strip()
+                pid_match = re.search(r'产品\s*[:：]\s*(\S+)', line)
+                if pid_match and pid_match.group(1).lower() != "无":
+                    goal["product_id"] = pid_match.group(1).strip()
+                q_match = re.search(r'查询\s*[:：]\s*["“]?(.+?)["”]?\s*(?:,|，|$)', line)
+                if q_match:
+                    goal["query"] = q_match.group(1).strip()
+                elif goal["type"] == "cross_product":
+                    goal["query"] = text[:200]  # fallback
+                goals.append(goal)
+            elif line.startswith("-") and in_list:
+                # 续行
+                if goals:
+                    q_match = re.search(r'查询\s*[:：]\s*["“]?(.+?)["”]?\s*$', line)
+                    if q_match and not goals[-1].get("query"):
+                        goals[-1]["query"] = q_match.group(1).strip()
+        if not goals:
+            logger.warning("SubGoalPlanner: Markdown 解析为空，降级为单路检索")
+    except Exception as e:
+        logger.warning(f"SubGoalPlanner: 解析异常 {e}，降级为单路检索")
+        goals = []
+    return goals
+
+
+def subgoal_planner_node(state: RAGState) -> dict:
+    """
+    SubGoalPlannerNode — 用 LLM 轻量调用拆分子问题。
+
+    防崩兜底：Markdown 解析失败 / LLM 调用失败 / 返回空结果 →
+    全部降级为标准单路检索（plan_mode="single"）。
+    """
+    query = state.get("query", "")
+    product_id = state.get("product_id") or ""
+    skip = state.get("skip_planner", False) or not _needs_planner(state)
+
+    if skip:
+        logger.info(f"🟢 [SubGoalPlanner] Fast Path: product_id='{product_id}' → 跳过规划")
+        return {
+            "plan_mode": "single",
+            "sub_goals": [{"type": "product_qa", "product_id": product_id or None,
+                           "query": query, "priority": 1}],
+            "skip_planner": True,
+        }
+
+    logger.info(f"🟡 [SubGoalPlanner] 启动任务规划: query='{query[:60]}'")
+
+    # ── 构建规划 Prompt ──
+    product_list = "JAKA, OpenC3, OpenR6"
+    if product_id:
+        product_list = product_id
+
+    planner_prompt = f"""分析用户问题，判断是否需要拆分为多个子问题。
+
+已知产品: {product_list}
+用户问题: {query}
+
+输出规则（严格按 Markdown 列表）:
+- 如果是单产品简单查询 → 只输出 1 行:
+- 类型: product_qa, 产品: {product_id or '自动检测'}, 查询: "{query}"
+
+- 如果涉及跨产品对比 → 每个产品输出 1 行（最多 3 个）:
+- 类型: product_qa, 产品: JAKA, 查询: "JAKA 相关子问题"
+- 类型: product_qa, 产品: OpenR6, 查询: "OpenR6 相关子问题"
+
+- 如果涉及端口号/密码/波特率等参数 → 增加 1 行:
+- 类型: attribute_lookup, 产品: 产品名或自动, 查询: "属性关键词"
+
+- 如果涉及 SDK 函数名（如 movl/power_on/joint）→ 增加 1 行:
+- 类型: code_search, 产品: 产品名或自动, 查询: "函数名"
+
+- 如果产品不明确 → 输出:
+- 类型: cross_product, 产品: 无, 查询: "{query}"
+
+只输出列表，不要解释。"""
+
+    try:
+        from .rag_chain import _call_llm, _get_client, _resolve_vllm_model, _build_messages
+        # 构建最简 messages（不需要 context retrieval）
+        messages = [
+            {"role": "system", "content": "你是任务规划助手。根据用户问题判断是否需要拆分为多个子任务。"},
+            {"role": "user", "content": planner_prompt},
+        ]
+        response = _call_llm(_get_client(), _resolve_vllm_model(), messages, max_tokens=256)
+        sub_goals = _parse_subgoals_markdown(response)
+    except Exception as e:
+        logger.warning(f"SubGoalPlanner: LLM 调用失败 ({e})，降级为单路检索")
+        sub_goals = []
+
+    # ── 兜底：空结果 → 根据是否有 product_id 选择策略 ──
+    if not sub_goals:
+        if product_id:
+            sub_goals = [{"type": "product_qa", "product_id": product_id,
+                          "query": query, "priority": 1}]
+            plan_mode = "single"
+        else:
+            sub_goals = [{"type": "cross_product", "product_id": None,
+                          "query": query, "priority": 1}]
+            plan_mode = "cross_product"
+    else:
+        plan_mode = "multi" if len(sub_goals) > 1 else "single"
+
+    logger.info(f"🟢 [SubGoalPlanner] 规划完成: mode={plan_mode}, {len(sub_goals)} 个子目标")
+    for g in sub_goals:
+        logger.info(f"  ↳ type={g['type']}, pid={g.get('product_id','?')}, q={g.get('query','')[:60]}")
+
+    return {
+        "sub_goals": sub_goals,
+        "plan_mode": plan_mode,
+        "skip_planner": plan_mode == "single",
+    }
+
+
+# ============================================================
+# v3 Node: CrossProductRetrievalNode — 全库检索（product_id=None）
+# ============================================================
+
+def cross_product_retrieval_node(state: RAGState) -> dict:
+    """
+    当 product_id 为 None 时，执行全库混合检索，而非仅输出反问。
+
+    行为:
+      1. 对所有已注册产品执行 Top-3 检索
+      2. 返回综合候选 + 反问（两者兼有，不 Only 反问）
+    """
+    query = state.get("fused_query") or state.get("query", "")
+    logger.info(f"🔵 [CrossProductRetrieval] 全库检索: '{query[:60]}'")
+
+    try:
+        from .vector_store import get_registered_products, search_similar_with_threshold
+        products = get_registered_products() or ["JAKA", "OpenC3", "OpenR6"]
+    except Exception:
+        products = ["JAKA", "OpenC3", "OpenR6"]
+
+    candidates = []
+    all_docs = []
+
+    for pid in products:
+        try:
+            docs = search_similar_with_threshold(
+                _get_graph_vector_store(), query, k=3, threshold=0.55, product_id=pid
+            )
+            for doc in docs:
+                relevance = getattr(doc, "relevance", 0.7) if hasattr(doc, "relevance") else 0.7
+                snippet = doc.page_content[:150] if hasattr(doc, "page_content") else str(doc)[:150]
+                candidates.append({
+                    "product_id": pid,
+                    "snippet": snippet,
+                    "relevance": relevance,
+                })
+                all_docs.append(doc)
+        except Exception as e:
+            logger.debug(f"CrossProductRetrieval: {pid} 检索失败: {e}")
+
+    # 按相关性排序
+    candidates.sort(key=lambda x: x["relevance"], reverse=True)
+
+    logger.info(f"🔵 [CrossProductRetrieval] 找到 {len(candidates)} 个候选（{len(products)} 产品）")
+    for c in candidates[:5]:
+        logger.info(f"  ↳ {c['product_id']} r={c['relevance']:.2f}: {c['snippet'][:80]}")
+
+    return {
+        "cross_product_candidates": candidates[:9],
+        "retrieved_docs": all_docs,  # 填充 retrieved_docs 以便后续节点使用
+    }
+
+
+# ============================================================
+# v3 Node: SynthesizeNode — 多路结果融合
+# ============================================================
+
+def synthesize_node(state: RAGState) -> dict:
+    """
+    融合多路子目标结果，生成最终回答。
+
+    策略:
+      - 单子目标（plan_mode="single"）→ 透传原始回答，零额外延迟
+      - 多子目标 → LLM 融合：对比、并列、反问
+      - 全库检索 → 先反问确认产品，同时附上各产品候选信息
+    """
+    plan_mode = state.get("plan_mode", "single")
+    sub_results = state.get("sub_results") or []
+    candidates = state.get("cross_product_candidates") or []
+
+    # ── Fast Path: 单子目标透传 ──
+    if plan_mode == "single" or (not sub_results and not candidates):
+        logger.info(f"🟢 [Synthesize] Fast Path: 单路透传 (mode={plan_mode})")
+        return {}
+
+    logger.info(f"🟡 [Synthesize] 融合 {len(sub_results)} 路结果 + {len(candidates)} 候选")
+
+    # ── 全库检索模式：反问 + 候选信息 ──
+    if candidates and not sub_results:
+        product_names = list(dict.fromkeys(c["product_id"] for c in candidates[:6]))
+        product_list = "、".join(product_names) if product_names else "多个产品"
+        snippets = "\n".join(
+            f"- {c['product_id']}: {c['snippet'][:100]}" for c in candidates[:5]
+        )
+        answer = (
+            f"您的问题可能涉及{product_list}。以下是各产品的相关信息：\n\n"
+            f"{snippets}\n\n"
+            f"请问您具体询问的是哪一款产品？我将为您提供更精准的回答。"
+        )
+        return {"final_answer": answer, "sources": [], "model": "cross-product-synthesis"}
+
+    # ── 多子目标融合 ──
+    parts = []
+    for i, sr in enumerate(sub_results):
+        if sr and sr.get("answer"):
+            goal_type = sr.get("type", "?")
+            answer = sr["answer"]
+            if goal_type == "attribute_lookup":
+                parts.append(f"【参数查询结果】\n{answer}")
+            elif goal_type == "code_search":
+                parts.append(f"【代码查询结果】\n{answer}")
+            else:
+                pid = sr.get("product_id", "?")
+                parts.append(f"【{pid} 产品】\n{answer}")
+
+    if parts:
+        final_answer = "\n\n---\n\n".join(parts)
+        return {"final_answer": final_answer, "sources": [], "model": "multi-path-synthesis"}
+
+    return {}
+
+
 def _build_graph() -> StateGraph:
     """
-    构建并编译 LangGraph StateGraph（v2 — 含后处理节点与自纠错环路）。
+    构建并编译 LangGraph StateGraph（v3 — Plan-Execute-Synthesize 架构）。
 
     图结构:
 
@@ -856,76 +1479,106 @@ def _build_graph() -> StateGraph:
               ┌───────────┼───────────┐
               │           │           │
           clarify/    chitchat/    generate/
-          refuse      (→ END)     fallback
+          refuse      (→ END)     (→ subgoal_planner)
               │                       │
-              ▼                       ▼
-      build_direct_response    hybrid_retrieval
-              │                       │
-              ▼                       ▼
-             END               llm_generation
-                                   │
-                    ┌──────────────┼──────────────┐
-                    │                             │
-               sdk_verify                   extract_align
-                    │                             │
-            ┌───────┼───────┐                     ▼
-            │               │                    END
+              ▼               ┌───────┴───────┐
+      build_direct_response   │               │
+              │           plan_mode=      plan_mode=
+              ▼            single       multi/cross_product
+             END               │               │
+                               ▼               ▼
+                        hybrid_retrieval  cross_product_retrieval
+                               │               │
+                               ▼               ▼
+                        llm_generation   llm_generation
+                               │               │
+                               ▼               ▼
+                          synthesize  ←────────┘
+                               │
+                    ┌──────────┼──────────┐
+                    │                     │
+               sdk_verify           extract_align
+                    │                     │
+            ┌───────┴───────┐             ▼
+            │               │            END
       llm_generation   extract_align
-      (retry loop)        │
-                          ▼
-                         END
+      (retry ≤ 2)          │
+                           ▼
+                          END
 
     返回编译后的图实例（带状态校验）。
     """
     graph = StateGraph(RAGState)
 
-    # ── 注册节点 ──
+    # ── 注册现有节点 ──
     graph.add_node("query_fusion", query_fusion_node)
     graph.add_node("product_routing", product_routing_node)
     graph.add_node("build_direct_response", build_direct_response_node)
     graph.add_node("hybrid_retrieval", hybrid_retrieval_node)
     graph.add_node("llm_generation", llm_generation_node)
-    # ── v2 新增节点 ──
+    graph.add_node("render", render_node)
     graph.add_node("sdk_verify", sdk_verify_node)
     graph.add_node("extract_align", extract_align_node)
 
-    # ── 注册边（前置管线不变）──
+    # ── v3 新增节点 ──
+    graph.add_node("subgoal_planner", subgoal_planner_node)
+    graph.add_node("cross_product_retrieval", cross_product_retrieval_node)
+    graph.add_node("synthesize", synthesize_node)
+
+    # ── 前置管线不变 ──
     graph.set_entry_point("query_fusion")
     graph.add_edge("query_fusion", "product_routing")
 
+    # ── v3 条件路由: product_routing → 3 路分发 ──
     graph.add_conditional_edges(
         "product_routing",
         _route_after_product_routing,
         {
             "build_direct_response": "build_direct_response",
-            "hybrid_retrieval": "hybrid_retrieval",
+            "subgoal_planner": "subgoal_planner",
         },
     )
 
     graph.add_edge("build_direct_response", END)
-    graph.add_edge("hybrid_retrieval", "llm_generation")
 
-    # ── v2 新增条件边：LLM 生成后 → SDK 校验 或 属性对齐 ──
+    # ── v3 条件路由: subgoal_planner → Fast Path 或 Multi Path ──
     graph.add_conditional_edges(
-        "llm_generation",
-        _route_after_llm,
+        "subgoal_planner",
+        _route_after_planner,
+        {
+            "hybrid_retrieval": "hybrid_retrieval",           # Fast Path: single product
+            "cross_product_retrieval": "cross_product_retrieval",  # product_id=None
+        },
+    )
+
+    # ── 检索 → 生成（两路汇聚到 llm_generation）──
+    graph.add_edge("hybrid_retrieval", "llm_generation")
+    graph.add_edge("cross_product_retrieval", "llm_generation")
+
+    # ── llm_generation → render → synthesize ──
+    graph.add_edge("llm_generation", "render")
+    graph.add_edge("render", "synthesize")
+
+    # ── synthesize → 后处理路由（复用 v2 结构）──
+    graph.add_conditional_edges(
+        "synthesize",
+        _route_after_llm,  # 复用现有路由（SDK校验/属性对齐）
         {
             "sdk_verify": "sdk_verify",
             "extract_align": "extract_align",
         },
     )
 
-    # ── v2 新增条件边：SDK 校验后 → 回环重试 或 属性对齐 ──
+    # ── v2 自纠错回环 + 属性对齐（与现有逻辑一致）──
     graph.add_conditional_edges(
         "sdk_verify",
         _route_after_sdk_verify,
         {
-            "llm_generation": "llm_generation",   # 🔄 自纠错回环
-            "extract_align": "extract_align",      # → 最终后处理
+            "llm_generation": "llm_generation",
+            "extract_align": "extract_align",
         },
     )
 
-    # ── v2: 属性对齐后结束 ──
     graph.add_edge("extract_align", END)
 
     return graph.compile()
@@ -1099,7 +1752,27 @@ def run_graph_stream(
             yield from _hard_refusal_stream()
             return
 
-        if _last_numeric_context_missing:
+        _numeric_guard_s = _rag_chain_mod._last_numeric_context_missing
+        if _numeric_guard_s:
+            # ── 第零机会: KV 属性存储检索 ──
+            try:
+                from .kv_extractor import lookup_attribute as _kv_lookup_s
+                _kv_result = _kv_lookup_s(query, product_id=state.get("product_id"))
+                if _kv_result:
+                    logger.info(f"✅ [Graph Stream] KV 属性检索命中: {_kv_result}")
+                    _kv_fact = (
+                        f"\n\n【⚠️ 系统属性库 — 高优先级已知事实，优先于检索结果】\n"
+                        f"{_kv_result}\n"
+                    )
+                    for _i, _m in enumerate(messages):
+                        if _m["role"] == "system":
+                            messages[_i]["content"] = _kv_fact + messages[_i]["content"]
+                            break
+                    _numeric_guard_s = False
+            except Exception:
+                pass
+
+        if _numeric_guard_s:
             logger.info("🚫 [Graph Stream] 数字请求无上下文 → 硬拒答")
             yield from _hard_refusal_stream()
             return
@@ -1210,5 +1883,42 @@ def run_graph_stream(
 # ============================================================
 # 模块初始化
 # ============================================================
+
+# ============================================================
+# 🔴 v2.2: 全图节点全局异常捕获 (Fail-Safe Wrapping)
+# 所有节点函数在模块加载时自动包装 try/except，兜底返回安全 State，
+# 绝对禁止 Unhandled Exception 向外传播导致 HTTP 500
+# ============================================================
+
+_NODE_FALLBACKS = {
+    "query_fusion_node": {
+        "fused_query": "", "query": "", "product_id": None,
+    },
+    "product_routing_node": {
+        "route_status": "generate", "product_id": None,
+    },
+    "build_direct_response_node": {},
+    "hybrid_retrieval_node": {
+        "retrieved_docs": [], "route_status": "fallback",
+        "context_text": "", "extracted_entities": {},
+    },
+    "llm_generation_node": {
+        "final_answer": "服务暂时不可用，请稍后重试",
+        "raw_llm_answer": "", "sources": [], "model": "node-fallback",
+        "route_status": "complete", "feedback": "", "retry_count": 0,
+    },
+    "sdk_verify_node": {
+        "feedback": "", "retry_count": 0,
+    },
+    "extract_align_node": {
+        "final_answer": "", "route_status": "complete",
+    },
+}
+
+# 对每个节点应用安全包装器
+for _name, _fallback in _NODE_FALLBACKS.items():
+    _fn = globals().get(_name)
+    if _fn is not None and callable(_fn):
+        globals()[_name] = _node_safe(_fallback)(_fn)
 
 logger.info("📐 LangGraph RAG 引擎模块已加载（图实例将在首次调用时编译）")

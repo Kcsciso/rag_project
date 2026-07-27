@@ -56,7 +56,7 @@ DEEPSEEK_MODEL = "glm-4.7-flash"  # 智谱 GLM-4.7-Flash 免费模型
 # ============================================================
 BASE_URL = os.environ.get("LLM_BASE_URL", "http://localhost:8001/v1")
 API_KEY = os.environ.get("LLM_API_KEY", "EMPTY")
-MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "Qwen/Qwen2.5-1.5B-Instruct")
+MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct-AWQ")
 
 # ============================================================
 # 向量库 & 嵌入模型配置
@@ -116,6 +116,14 @@ PDF_DATA_DIR = os.path.join(
 # chunk_overlap=50: 相邻块之间重叠 50 个字符 (~17%)，保证函数边界不丢失
 CHUNK_SIZE = 300
 CHUNK_OVERLAP = 50
+
+# ── v4 Dual Indexing 切片配置 (ADR-15) ──
+CHUNK_MODE = "v4_dual"  # "v4_dual" | "v3_legacy"
+PARENT_CHUNK_SIZE = 1000   # H2 章节级父层切片（粗召回）
+CHILD_CHUNK_SIZE = 400     # H3/H4 函数级子层切片（精匹配，API 原子）
+
+# ── v4 GPU 批量加速 (ADR-16) ──
+EMBEDDING_BATCH_SIZE = 64   # GPU 批量推理大小（A100 建议 64-128）
 
 # ============================================================
 # RAG 检索配置

@@ -32,7 +32,7 @@ import requests
 # ============================================================
 BASE_URL = "http://localhost:7860"
 CHAT_ENDPOINT = f"{BASE_URL}/api/chat"
-TIMEOUT = 60  # 单次请求最长等待时间（秒）
+TIMEOUT = 180  # 单次请求最长等待时间（秒）— 7B AWQ 模型推理预留充足时间
 
 # ============================================================
 # 评测用例定义
@@ -140,6 +140,9 @@ EVAL_CASES = [
 def run_single_case(case: dict) -> dict:
     """
     执行单个评测用例，返回结果字典。
+
+    🔴 v2: 使用 SSE 流式传输 (stream=true)，从架构上消除整体请求超时。
+    元数据（model/needs_clarification）从答案内容推断。
     """
     result = {
         "id": case["id"],
@@ -155,35 +158,69 @@ def run_single_case(case: dict) -> dict:
         "errors": [],
     }
 
-    fd = {"query": case["query"], "stream": "false"}
+    fd = {"query": case["query"], "stream": "true"}
     if case.get("product_id"):
         fd["product_id"] = case["product_id"]
 
     t0 = time.time()
+    answer_parts = []
     try:
-        resp = requests.post(CHAT_ENDPOINT, data=fd, timeout=TIMEOUT)
+        resp = requests.post(CHAT_ENDPOINT, data=fd, stream=True, timeout=TIMEOUT)
         result["elapsed_s"] = round(time.time() - t0, 2)
-        data = resp.json()
+
+        if resp.status_code != 200:
+            result["errors"].append(f"HTTP {resp.status_code}: {resp.text[:200]}")
+            return result
+
+        # ── 解析 SSE 事件流 ──
+        for line in resp.iter_lines(decode_unicode=True):
+            if line is None:
+                continue
+            if line.startswith("data: "):
+                try:
+                    event = json.loads(line[6:])
+                    if "delta" in event:
+                        answer_parts.append(event["delta"])
+                    elif "done" in event:
+                        break  # 流结束
+                    elif "error" in event:
+                        result["errors"].append(f"服务端错误: {event['error']}")
+                        break
+                except json.JSONDecodeError:
+                    continue
+
     except requests.Timeout:
+        # 即使超时，也保留已收集到的 tokens
         result["elapsed_s"] = round(time.time() - t0, 2)
-        result["errors"].append(f"请求超时 (>{TIMEOUT}s)")
-        return result
+        if answer_parts:
+            result["errors"].append(f"流式超时 (>{TIMEOUT}s)，但已收到 {len(answer_parts)} 个 token")
+        else:
+            result["errors"].append(f"请求超时 (>{TIMEOUT}s)")
+            return result
     except Exception as e:
         result["elapsed_s"] = round(time.time() - t0, 2)
         result["errors"].append(f"请求异常: {e}")
         return result
 
-    answer = data.get("answer", "")
+    answer = "".join(answer_parts)
     result["answer"] = answer
-    result["model"] = data.get("model", "?")
-    result["needs_clarification"] = data.get("needs_clarification", False)
 
-    # 判断容灾层级
-    if "direct-retrieval" in str(data.get("model", "")):
-        result["layer"] = "L3 (纯检索直出)"
-    elif "product-clarification" in str(data.get("model", "")):
+    # ── 从答案内容推断元数据（无需额外 API 调用）──
+    if answer.startswith("请问您询问的是哪一款产品"):
+        result["model"] = "product-clarification"
+        result["needs_clarification"] = True
         result["layer"] = "L0 (产品澄清)"
+    elif len(answer) < 200 and ("未找到" in answer or "未包含" in answer or "拒答" in answer):
+        result["model"] = "direct-retrieval (CPU-only, zero-GPU/API)"
+        result["needs_clarification"] = False
+        result["layer"] = "L3 (纯检索直出)"
+    elif "抱歉" in answer and len(answer) < 150:
+        result["model"] = "friendly-error"
+        result["needs_clarification"] = False
+        result["layer"] = "L4 (友好错误)"
     else:
+        result["model"] = "streaming-via-vllm"
+        result["needs_clarification"] = False
         result["layer"] = "L1/L2 (LLM 生成)"
 
     # ── 检查期望的澄清行为 ──

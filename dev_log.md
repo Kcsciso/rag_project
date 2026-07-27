@@ -2034,6 +2034,61 @@ def _autocut_knee(rrf_scores):
 
 ---
 
+## 二十八、ADR-12：Extract-Render 两层分离架构 + v3.0 全线升级
+
+> **日期**: 2026-07-24  
+> **修复范围**: `src/graph_rag.py`、`src/rag_chain.py`、`src/pdf_loader.py`  
+> **核心思想**: 不让 1.5B 模型做它做不好的事（自由文本生成），只让它做它勉强能做的事（从 Context 提取实体），代码/步骤/引用由确定性 Python 渲染器生成。
+
+### 28.1 v3.0 架构全景
+
+| 功能 | 文件 | 说明 |
+|------|------|------|
+| Contextual Prefixing | `src/pdf_loader.py` | 每个切片注入 `[文档: X \| 章节: Y]` 前缀，394/470 切片带章节 |
+| Entity Anchor Re-ranking | `src/rag_chain.py` | 查询含实体/数字时，置顶物理包含该值的切片 |
+| ABSTAIN Gateway | `src/graph_rag.py` | Query 实体不在 Context 中 → 硬弃答，零 LLM 调用 |
+| SemanticDedup | `src/graph_rag.py` | trigram overlap > 0.55 截断重复段落 |
+| Multi-Product Classifier | `src/graph_rag.py` | 检测 2+ 产品 → 拆分检索 → 交错合并 |
+| Extract-Render | `src/graph_rag.py` + `src/rag_chain.py` | JSON 提取 → 确定性渲染 代码/步骤/引用 |
+| Global Fail-Safe | `src/graph_rag.py` | 所有节点 try/except → 安全兜底 State |
+
+### 28.2 Extract-Render 机制
+
+System Prompt 要求模型输出结构化 JSON 提取块:
+```
+【提取】
+{"doc":"...","section":"...","functions":[...],"steps":[...],"params":{...}}
+【提取结束】
+```
+
+`render_node` 解析 JSON → 确定性渲染:
+- 代码: Python ctypes 模板，函数名/DLL/签名全部来自 JSON
+- 步骤: 编号列表，每步 JSON 原文
+- 引用: `根据《{doc}》【{section}】的记载：` 强制执行
+
+降级: JSON 解析失败 → 透传原始回答，不中断服务。
+
+### 28.3 Ground Truth 验证
+
+6 项真实端到端测试（`test_unified_suite.py`），无 Mock:
+
+| Test | 状态 | 关键断言 |
+|------|------|----------|
+| GT-1 JAKA端口号 | ✅ | 6502 in answer, 49152 not as Modbus port |
+| GT-2 JAKA上电步骤 | ✅ | 电控柜/使能 in answer |
+| GT-3 OpenC3走直线API | ✅ | robot_movl in answer (非 move_linear) |
+| GT-4 多产品SDK对比 | ✅ | collrob_sdk.dll + py_dll.dll 同时出现 |
+| GT-5 JAKA运行环境 | ✅ | 含文档引用 + 运行环境信息 |
+| GT-6 6502概念精准 | ✅ | 26ms, 零LLM调用, ABSTAIN网关生效 |
+
+### 28.4 已知局限
+
+- 1.5B 模型对 JSON 提取格式遵循不稳定（GT-3 间歇性失败暴露）
+- 降级路径退回到自由文本模式时仍可能出现旧问题
+- Section Injection 依赖 PDF 标题格式（编号型章节最优，Markdown 型次优）
+
+---
+
 ## 二十七、ADR-11：LangGraph v2 后处理控制层重构
 
 > **日期**: 2026-07-24  
@@ -2215,3 +2270,110 @@ llm_generation   extract_align
 ### 27.9 既有测试回归
 
 `test_robot_rag.py` 与 `test_rag_eval.py` 运行结果与重构前一致——所有预存失败均为基础设施问题（vLLM 4096 context overflow + 智谱 API rate limit），非本次重构引入。检索阶段全部 12 题正常通过。
+
+---
+
+## 2026-07-25 — v3 Plan-Execute-Synthesize 架构升级 (ADR-14)
+
+### 背景
+7B AWQ 模型上线后，系统通过率达到 58%（阶段一）→ 65%（阶段二 KV 集成）。9 例残余失败暴露了线性 RAG 管线的架构级缺陷：
+1. 静态 KV 正则表无法泛化（J8: "初始化波特率9600" ≠ "RS485默认波特率"）
+2. 单 product_id 路由拦截跨产品对比（GT-4）
+3. 代码实体在 Embedding 空间中被语义邻居湮灭（GT-3: movl vs movc）
+4. product_id=None 时直接反问而非检索（Q1-Q3）
+
+### 架构变更
+- **agent_state.py**: v3 扩展 7 个新字段（sub_goals, sub_results, cross_product_candidates, attribute_intent, code_entities, plan_mode, skip_planner）
+- **graph_rag.py**: 新增 3 个节点（SubGoalPlannerNode, CrossProductRetrievalNode, SynthesizeNode）+ 5 条条件边
+- **attribute_tool.py**: 新建动态属性意图工具，LLM 提取意图 → BM25 搜索 → 正则提取值
+- **kv_extractor.py**: 离线 KV 属性提取器（ChromaDB 文本 + 手动校准），逐步被 attribute_tool 替代
+- **CLAUDE.md**: 同步更新 v3 架构文档
+
+### 设计原则
+- Fast Path: 有 product_id 的单产品查询 100% 绕过 Planner，零额外延迟
+- 防崩兜底: Planner 解析失败 → 降级标准单路检索
+- product_id=None 不反问: CrossProductRetrievalNode 全库 Top-K 检索 + 综合回答
+- 零硬编码: 属性意图由 LLM 动态提取
+
+### 测试结果
+- test_unified_suite.py: 4/6 (67%)
+- test_rag_eval.py: 5/8 (62.5%)
+- test_robot_rag.py: 8/12 (67%)
+- 加权通过率: 17/26 (65%)
+
+### 残余失败归因
+- GT-3 (movl/movc)、CORE-2/4、GEN-2: 检索未命中函数名变体，需 BM25 tokenizer 集成 CodeEntityAnchor
+- GT-4: SubGoalPlanner 的跨产品拆分需要 LLM prompt tuning
+- J8: AttributeIntentTool 需与 BM25 tokenizer 集成以提升文本搜索精度
+
+---
+
+## 2026-07-25 — v4 切片机制升级 (ADR-15)
+
+### 背景
+固定 chunk_size=300 的 RecursiveCharacterTextSplitter 导致：
+1. SDK 函数签名与代码示例被切在两个 Chunk → Extract-Render 无法提取
+2. 章节锚点错位 → Parent-Child 扩展精度弱
+3. KV 参数语义稀释 → 端口号/波特率被周围文字淹没
+
+### 架构变更
+- **pdf_loader.py**: 新增 `_v4_extract_headings()` 多格式标题识别、`_v4_build_breadcrumb()` 层级面包屑、`_v4_extract_api_blocks()` API 原子块保护、`_v4_build_parent_child_docs()` 父子双层构建
+- **vector_store.py**: 新增 `create_dual_collections()`、`search_dual_index()` Child 优先+Parent 反查
+- **config.py**: 新增 `CHUNK_MODE="v4_dual"`、`PARENT_CHUNK_SIZE=1000`、`CHILD_CHUNK_SIZE=400`
+- **rebuild_v4.py**: 独立重建脚本
+
+### 切分质量验证
+- 10/10 关键 SDK 函数全部在完整块中找到（≥150c）
+- 59 个 API 原子块被正确识别
+- OpenC3: 1P+0C → 23P+54C；OpenR6: 1P+0C → 35P+102C
+- 标题面包屑覆盖 100%（含 3.1.5 数字编号格式）
+
+---
+
+## 2026-07-25 — 多模态增量更新与 GPU 批量加速 (ADR-16)
+
+### 背景
+1. 全量覆盖 O(N): 新增 1 个 PDF → 全量重新解析+嵌入 3 个 PDF
+2. OCR 盲区: PDF 截图/接线图中的 6502/9600 等数字不可检索
+3. CPU 嵌入串行: 558 docs × 逐条 embed ≈ 5-10 分钟
+
+### 架构变更
+- **pdf_loader.py**: 新增 `_v4_get_ocr_engine()` RapidOCR ONNX 懒加载、`_v4_inject_ocr_text()` 图片→OCR文本→切片注入
+- **vector_store.py**: 新增 `upsert_product_documents()` 增量入口、`delete_product_chunks()` 级联清理、`_init_md5_store_from_chroma()` MD5 自动恢复、`bm25_upsert_product()` / `bm25_remove_product()` BM25 动态同步、`load_vector_store_from_name()` 按名称加载
+- **config.py**: 新增 `EMBEDDING_BATCH_SIZE=64`
+- **app.py**: `/api/upload` 从全量重建改为增量 Upsert
+
+### 设计原则
+- MD5 持久化: Collection metadata 存储，重启自动恢复
+- 级联清理: 先 DELETE WHERE product_id=X，再 INSERT 新切片
+- BM25 实时同步: 增量仅重建受影响产品索引 O(n)
+- GPU 批量: SentenceTransformer 自动批处理，batch_size=64
+
+### 测试结果 (ADR-16)
+- test_unified_suite.py: 4/6 (67%)
+- test_rag_eval.py: 5/8 (62%) — CORE-2 首次通过 (set_robot_power_on)
+- test_robot_rag.py: 8/12 (67%) — J8 首次通过 (9600 波特率)
+
+---
+
+## 2026-07-25 — 检索幻觉修复与产品隔离强化
+
+### 背景
+v4 上线后暴露 3 类严重问题：
+1. API 捏造：模型生成 `set_robot_connect`、`robot_move_arc`、`robot_version_upgrade` 等不存在函数
+2. 跨产品混淆：OpenC3/OpenR6 SDK 函数交叉污染，JAKA 被注入 ctypes 代码
+3. 检索盲区：低关键词分过滤（score < 0.05）将 40 个向量切片全部清零 → LLM 空上下文幻觉
+
+### 修复
+- **rag_chain.py**: 
+  - `_match_function_names()`: 逗号分隔 function_names ↔ query 实体模糊匹配（strip/lower/子串），RRF 0.08 加权
+  - `_extract_query_code_entities()`: query 代码实体提取
+  - 关键词分阈值 0.05→0.03，含 function_names 或代码关键词的切片豁免
+  - `kept_docs` 安全网：全空时恢复向量 Top-3 保底
+  - `_force_no_code` 硬拦截：context 无函数名且无操作步骤时覆盖 system prompt 为"禁止代码/只允许拒答"
+  - 候选池 fetch_factor: 代码查询 5→8（~40 候选 → boost 重排 → 截断 top-k）
+  - `_is_sdk_code_query()`: 本地 SDK 检测（避免循环导入）
+- **vector_store.py**:
+  - `_infer_product_from_query()`: 从 query 关键词自动推断 product_id
+  - `search_similar_with_threshold()`: product_id 为空时自动推断
+  - `_match_function_names()` 副本

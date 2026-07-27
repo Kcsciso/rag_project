@@ -422,18 +422,17 @@ async def chat(
 @app.post("/api/upload")
 async def upload_pdf(file: UploadFile = File(..., description="PDF 文件")):
     """
-    PDF 上传接口 — POST /api/upload
+    PDF 上传接口 — POST /api/upload (v4 增量更新, ADR-16)
 
     【处理流程】
-    1. 校验文件类型（只允许 .pdf）
-    2. 校验文件大小（默认上限 50MB）
-    3. 保存文件到 data/ 目录
-    4. 重新扫描 data/ 下所有 PDF 并重建向量库
-    5. 返回重建结果
-
-    【注意】
-    - 每次上传都会触发全量重建（简单可靠，适合文档量不大的场景）
-    - 如需增量更新，可后续优化为仅索引新增文档
+    1. 校验文件类型 + 大小
+    2. 保存文件到 data/ 目录
+    3. 增量 Upsert: 仅处理新增/更新的单个 PDF
+       - MD5 去重: 相同文件秒级跳过
+       - 级联清理: 按 product_id 删除旧 Parent + Child
+       - OCR: 自动识别图片中的文本参数
+       - BM25: 增量同步内存索引
+    4. 返回统计信息
     """
     global vector_store
 
@@ -441,12 +440,10 @@ async def upload_pdf(file: UploadFile = File(..., description="PDF 文件")):
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="仅支持 PDF 文件格式")
 
-    # 🔴 文件名清洗：防路径遍历 (../../etc/passwd) + 防 null 字节注入
     safe_filename = sanitize_filename(file.filename)
     if not safe_filename.lower().endswith(".pdf"):
         safe_filename += ".pdf"
 
-    # 读取文件内容并检查大小
     content = await file.read()
     if len(content) > MAX_UPLOAD_SIZE:
         raise HTTPException(
@@ -463,64 +460,51 @@ async def upload_pdf(file: UploadFile = File(..., description="PDF 文件")):
 
     logger.info(f"📄 已保存 PDF: {save_path} ({len(content)} 字节)")
 
-    # ---- 重建向量库（先清空旧数据，再入库新产品切片） ----
+    # ---- v4 增量 Upsert ----
     try:
-        # 🔴 清空旧向量库：确保不同产品的旧切片不会与新切片混合
-        clear_vector_store(CHROMA_PERSIST_DIR)
-        logger.info("🧹 旧向量库已清空，开始重新索引...")
+        from src.vector_store import upsert_product_documents, delete_product_chunks, bm25_upsert_product
+        from src.config import CHILD_CHUNK_SIZE, PARENT_CHUNK_SIZE
 
-        # 🔴 阶段二：智能加载 — 有表格/图片时用增强解析，纯文本用标准解析
-        from src.multimodal_loader import _extract_tables_from_page, _extract_images_info
-        has_rich_content = False
-        for f in os.listdir(PDF_DATA_DIR):
-            if not f.lower().endswith('.pdf'):
-                continue
-            fp = os.path.join(PDF_DATA_DIR, f)
-            try:
-                imgs = _extract_images_info(fp)
-                if imgs:
-                    has_rich_content = True
-                    break
-            except Exception:
-                pass
-        if has_rich_content:
-            logger.info("📊 检测到含表格/图片的复杂文档，启用多模态解析")
-            documents = load_enhanced_documents(PDF_DATA_DIR, CHUNK_SIZE, CHUNK_OVERLAP)
-        else:
-            documents = load_pdfs_from_directory(PDF_DATA_DIR, CHUNK_SIZE, CHUNK_OVERLAP)
+        result = upsert_product_documents(
+            save_path,
+            product_id="",  # 自动从文件名识别
+            child_chunk_size=CHILD_CHUNK_SIZE,
+            parent_chunk_size=PARENT_CHUNK_SIZE,
+        )
 
-        if not documents:
+        if result.get("status") == "error":
             return JSONResponse({
-                "success": True,
-                "message": f"文件 {safe_filename} 已保存，但未提取到有效文本。",
-                "document_count": 0,
+                "success": False,
+                "message": f"文件 {safe_filename} 未提取到有效文本。",
             })
 
-        vector_store = create_vector_store(documents, CHROMA_PERSIST_DIR)
-        info = get_vector_store_info(vector_store)
-
-        # 🔴 重建后重新注入 Graph 引擎
-        set_graph_vector_store(vector_store)
-        logger.info("📐 LangGraph 引擎已更新（向量库重建后）")
-
-        # 统计各产品的切片数量
-        product_counts = {}
-        for doc in documents:
-            pid = doc.metadata.get("product_id", "unknown")
-            product_counts[pid] = product_counts.get(pid, 0) + 1
+        # 更新 Graph 引擎引用
+        try:
+            parent_vs = load_vector_store_from_name("rag_v4_parent")
+            if parent_vs:
+                set_graph_vector_store(parent_vs)
+        except Exception:
+            pass
 
         return JSONResponse({
             "success": True,
-            "message": f"文件 {safe_filename} 已上传，向量库已重建",
-            "document_count": info["document_count"],
+            "message": (
+                f"文件已处理 (v4 增量): {result.get('status','?')}"
+                if result.get("status") != "skipped"
+                else f"文件已跳过 (MD5 相同): {safe_filename}"
+            ),
             "file_name": safe_filename,
-            "product_id": documents[0].metadata.get("product_id", "unknown") if documents else "unknown",
-            "product_distribution": product_counts,
+            "product_id": result.get("product_id", "unknown"),
+            "parents": result.get("parents", 0),
+            "children": result.get("children", 0),
+            "ocr_images": result.get("ocr_images", 0),
+            "deleted_old": result.get("deleted_old", 0),
+            "status": result.get("status", "?"),
         })
 
     except Exception as e:
-        logger.error(f"向量库重建失败: {e}")
-        raise HTTPException(status_code=500, detail=f"向量库重建失败: {e}")
+        logger.error(f"向量库增量更新失败: {e}")
+        raise HTTPException(status_code=500, detail=f"更新失败: {e}")
 
 
 # ============================================================
@@ -556,6 +540,196 @@ async def list_products():
     return JSONResponse(content={
         "products": products,
         "count": len(products),
+    })
+
+
+# ============================================================
+# 调试端点 — Retrieval Debugger (v4.2)
+# ============================================================
+
+@app.get("/api/debug/inspect_chunks")
+async def inspect_chunks(
+    product_id: Optional[str] = None,
+    keyword: Optional[str] = None,
+    limit: int = 10,
+):
+    """
+    切片检查器 — GET /api/debug/inspect_chunks
+
+    参数:
+      - product_id: 按产品过滤（可选）
+      - keyword: 按 page_content 子串匹配（可选）
+      - limit: 最大返回数（默认 10）
+
+    返回每个匹配 Child 切片的:
+      - chunk_id, product_id, section, raw_text(前 300 字),
+        function_names(list), api_atomic(bool), source
+    """
+    # 复用应用级 vector_store 的底层 ChromaDB client
+    _coll = None
+    if vector_store is not None:
+        _coll = vector_store._collection  # 当前加载的 collection (rag_v4_child)
+    if _coll is None:
+        return JSONResponse({"error": "vector store not loaded"}, status_code=503)
+    try:
+        coll = _coll
+    except Exception as e:
+        return JSONResponse({"error": f"collection access failed: {e}"}, status_code=404)
+
+    where_filter = {}
+    if product_id:
+        where_filter["product_id"] = product_id
+
+    all_data = coll.get(
+        where=where_filter if where_filter else None,
+        include=["documents", "metadatas"],
+    )
+
+    chunks = []
+    for i, (doc_id, doc_text, meta) in enumerate(
+        zip(all_data["ids"], all_data["documents"], all_data["metadatas"])
+    ):
+        if keyword and keyword.lower() not in doc_text.lower():
+            continue
+        fn_str = meta.get("function_names", "")
+        chunks.append({
+            "chunk_id": doc_id,
+            "product_id": meta.get("product_id", "?"),
+            "section": meta.get("section_title", "") or meta.get("section_id", ""),
+            "source": meta.get("source", "?"),
+            "api_atomic": meta.get("api_atomic", False),
+            "function_names": [f.strip() for f in fn_str.split(",") if f.strip()],
+            "parent_id": meta.get("parent_id", ""),
+            "text_preview": doc_text[:300],
+            "text_length": len(doc_text),
+        })
+        if len(chunks) >= limit:
+            break
+
+    return JSONResponse({
+        "total_in_collection": coll.count(),
+        "filtered_count": len(chunks),
+        "filters": {"product_id": product_id, "keyword": keyword},
+        "chunks": chunks,
+    })
+
+
+@app.post("/api/debug/retrieve")
+async def debug_retrieve(
+    query: str = Form(...),
+    product_id: Optional[str] = Form(None),
+    k: int = Form(8),
+):
+    """
+    检索沙盒 — POST /api/debug/retrieve
+
+    不调用 LLM，仅输出完整检索管线中间结果:
+      - 向量召回 Top-N 及相似度得分
+      - BM25 召回 Top-N 及得分
+      - RRF 融合排序后的最终 Context
+      - 是否触发 _force_no_code 硬拦截
+      - 候选池统计（kept_docs / noise_filtered）
+    """
+    global vector_store
+    if not vector_store:
+        return JSONResponse({"error": "vector store not loaded"}, status_code=503)
+
+    from src.vector_store import (
+        search_similar_with_threshold, bm25_search,
+        _match_function_names, _extract_query_code_entities,
+    )
+    from src.rag_chain import (
+        _hybrid_retrieve, _score_chunk_for_query, _autocut_knee,
+        _is_noise_chunk, _extract_query_code_entities as _eqc,
+        _is_sdk_code_query, _match_function_names as _mfn,
+    )
+
+    # ── Step 1: 向量召回 ──
+    fetch_k = k * 5
+    try:
+        vec_results = search_similar_with_threshold(
+            vector_store, query, k=fetch_k, threshold=None, product_id=product_id,
+        )
+    except Exception as e:
+        vec_results = []
+    vec_scores = []
+    for doc in vec_results:
+        try:
+            scored = vector_store.similarity_search_with_score(
+                doc.page_content[:80], k=1,
+                filter={"product_id": product_id} if product_id else None,
+            )
+            vec_scores.append(round(scored[0][1], 4) if scored else 0)
+        except Exception:
+            vec_scores.append(0)
+
+    vector_top = [
+        {"score": s, "text": d.page_content[:200], "source": d.metadata.get("source", "?"),
+         "function_names": d.metadata.get("function_names", "")}
+        for d, s in zip(vec_results[:k], vec_scores[:k])
+    ]
+
+    # ── Step 2: BM25 召回 ──
+    bm25_results = []
+    if product_id:
+        try:
+            bm25_results = bm25_search(query, product_id, k=k)
+        except Exception:
+            pass
+    bm25_top = [
+        {"score": round(s, 4), "text": d.page_content[:200],
+         "source": d.metadata.get("source", "?")}
+        for d, s in bm25_results[:k]
+    ]
+
+    # ── Step 3: 完整混合检索 ──
+    try:
+        final_docs = _hybrid_retrieve(
+            vector_store, query, k=k, product_id=product_id,
+        )
+    except Exception as e:
+        final_docs = []
+    final_context = [
+        {"text": d.page_content[:250], "source": d.metadata.get("source", "?"),
+         "function_names": d.metadata.get("function_names", ""),
+         "api_atomic": d.metadata.get("api_atomic", False)}
+        for d in final_docs[:k]
+    ]
+
+    # ── Step 4: 防幻觉位标 ──
+    code_entities = _extract_query_code_entities(query)
+    is_sdk = _is_sdk_code_query(query)
+    has_func = any(
+        _match_function_names(d.metadata.get("function_names", ""), code_entities)
+        for d in final_docs if hasattr(d, 'metadata')
+    )
+    force_no_code = is_sdk and not has_func and not any(
+        d.page_content and ("点击" in d.page_content or "设置" in d.page_content)
+        for d in final_docs if hasattr(d, 'page_content')
+    )
+
+    # ── Step 5: 噪声过滤统计 ──
+    noise_count = sum(1 for d in vec_results if _is_noise_chunk(d.page_content))
+
+    return JSONResponse({
+        "query": query,
+        "product_id": product_id,
+        "pipeline": {
+            "vector_recall": {"total_fetched": len(vec_results), "top_k": vector_top},
+            "bm25_recall": {"total_fetched": len(bm25_results), "top_k": bm25_top},
+            "rrf_final_context": final_context,
+        },
+        "guards": {
+            "force_no_code": force_no_code,
+            "is_sdk_query": is_sdk,
+            "code_entities_in_query": code_entities,
+            "function_names_matched_in_context": has_func,
+        },
+        "stats": {
+            "candidate_pool": len(vec_results),
+            "noise_filtered": noise_count,
+            "final_kept": len(final_docs),
+        },
     })
 
 

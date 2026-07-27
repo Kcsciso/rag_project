@@ -43,13 +43,15 @@ FASTAPI_PORT=8000
 VLLM_GPU_ID="${VLLM_GPU_ID:-}"  # 空 = 自动检测，非空 = 手动覆盖
 
 # ── 动态模型选择（启动时根据 GPU 空闲显存自动选择）──
-# > 18 GB → 7B 模型 (最强推理)
-# 10-18 GB → 3B 模型 (中等推理)
-# 5-10 GB → 1.5B 模型 (保底推理)
+# > 14 GB → 7B AWQ 量化 (最强, 需提前下载)
+# 8-14 GB → 3B 模型 (中等推理, 已缓存)
+# 5-8 GB  → 1.5B 模型 (保底推理)
 # < 5 GB  → 报错退出
-# 模型候选池（专为共享 GPU 优化：仅需 ~6-8 GB 显存，避免锁死大块显存引发 OOM）
+# 格式: "模型名|显存比例|最大上下文|额外vLLM参数(可选)"
 MODEL_CANDIDATES=(
-    "Qwen/Qwen2.5-1.5B-Instruct|0.35|4096"   # 1.5B 保底：显存比例 0.25 (~10GB 预留上限)，上下文 4k
+    "/home/kasm-user/LLM/mo/models/Qwen--Qwen2.5-7B-Instruct-AWQ/snapshots/master|0.25|8192|--quantization awq"  # 7B AWQ 4-bit: 本地权重 ~5.3GB
+    "/home/kasm-user/LLM/mo/models/Qwen--Qwen2.5-3B-Instruct|0.20|8192"                                           # 3B 保底: 待下载
+    "/home/kasm-user/LLM/mo/models/Qwen--Qwen2.5-1.5B-Instruct|0.20|4096"                                         # 1.5B 保底: 待下载
 )
 MIN_FREE_MEMORY_MIB=5120   # 5 GB — 最低门槛，低于此值无法部署任何模型
 
@@ -283,22 +285,21 @@ start_vllm() {
     local free_gb
     free_gb=$(awk "BEGIN {printf \"%.1f\", ${free_mib:-0} / 1024}")
 
-    local selected_model="" selected_gpu_mem="" selected_max_len=""
+    local selected_model="" selected_gpu_mem="" selected_max_len="" selected_extra_flags=""
     for candidate in "${MODEL_CANDIDATES[@]}"; do
-        local model_name="${candidate%%|*}"
-        local rest="${candidate#*|}"
-        local gpu_mem="${rest%%|*}"
-        local max_len="${rest##*|}"
+        # 解析候选字段: model|gpu_mem|max_len|extra_flags(可选)
+        IFS='|' read -r model_name gpu_mem max_len extra_flags <<< "$candidate"
         local min_free_mib=0
         case "$model_name" in
-            *7B*) min_free_mib=18432 ;;   # > 18 GB
-            *3B*)  min_free_mib=10240 ;;   # > 10 GB
+            *7B*)  min_free_mib=14336 ;;   # AWQ 4-bit ~8GB, 预留 14GB 含下载
+            *3B*)   min_free_mib=8192  ;;   # > 8 GB
             *1.5B*) min_free_mib=5120 ;;   # > 5 GB
         esac
         if [ "${free_mib:-0}" -ge "$min_free_mib" ]; then
             selected_model="$model_name"
             selected_gpu_mem="$gpu_mem"
             selected_max_len="$max_len"
+            selected_extra_flags="$extra_flags"
             log_info "🎯 动态模型选择: ${BOLD}${selected_model}${NC} (空闲: ${free_gb} GB ≥ ${min_free_mib} MiB)"
             break
         fi
@@ -317,17 +318,21 @@ start_vllm() {
     log_detail "显存限制:   ${selected_gpu_mem} (gpu-memory-utilization)"
     log_detail "上下文长度: ${selected_max_len} (max-model-len)"
 
-    local vllm_log="/tmp/vllm_newspage_$(date +%Y%m%d_%H%M%S).log"
+    local vllm_log="/home/kasm-user/LLM/logs/vllm_newspage_$(date +%Y%m%d_%H%M%S).log"
+    mkdir -p /home/kasm-user/LLM/logs
     log_detail "日志文件:   ${vllm_log}"
 
-    CUDA_VISIBLE_DEVICES=${selected_gpu} HF_HUB_OFFLINE=1 python -m vllm.entrypoints.openai.api_server \
+    # 🔴 ModelScope 镜像: 当 HuggingFace 不可用时自动从 ModelScope 拉取模型
+    export VLLM_USE_MODELSCOPE=true
+
+    CUDA_VISIBLE_DEVICES=${selected_gpu} python -m vllm.entrypoints.openai.api_server \
         --model "${selected_model}" \
         --served-model-name "${selected_model}" \
         --max-model-len "${selected_max_len}" \
         --port "${VLLM_PORT}" \
         --gpu-memory-utilization "${selected_gpu_mem}" \
         --trust-remote-code \
-        --enforce-eager \
+        ${selected_extra_flags} \
         > "$vllm_log" 2>&1 &
     VLLM_PID=$!
 
@@ -346,16 +351,21 @@ start_fastapi() {
     log_step "第 2 步：启动 NewsPage FastAPI 后端"
 
     if ! check_port $FASTAPI_PORT "FastAPI"; then
-        log_warn "端口 ${FASTAPI_PORT} 已被占用，后端可能已在运行"
+        # 🔴 v4 修复: 端口被占用时，先检测是否为可用的 FastAPI
         local http_code
         http_code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 2 "http://localhost:${FASTAPI_PORT}/api/status" 2>/dev/null || echo "000")
         if [ "$http_code" = "200" ]; then
-            log_info "确认 NewsPage 后端在线"
-        else
-            log_error "端口 ${FASTAPI_PORT} 被非 FastAPI 进程占用，请手动处理"
+            log_info "端口 ${FASTAPI_PORT} 上已有健康的 FastAPI 后端在运行，跳过启动"
+            return 0
+        fi
+        # 端口被非 FastAPI 进程占用，或 FastAPI 不健康 → 强制释放
+        log_warn "端口 ${FASTAPI_PORT} 被占用且服务不健康，强制释放..."
+        fuser -k ${FASTAPI_PORT}/tcp 2>/dev/null
+        sleep 2
+        if ! check_port $FASTAPI_PORT "FastAPI"; then
+            log_error "无法释放端口 ${FASTAPI_PORT}，请手动处理"
             return 1
         fi
-        return 0
     fi
 
     eval "$(conda shell.bash hook)"

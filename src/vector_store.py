@@ -48,7 +48,7 @@
 import os
 import re
 import logging
-from typing import List, Optional, Any, Tuple
+from typing import List, Optional, Any, Tuple, Dict
 
 from langchain_core.documents import Document
 from langchain_chroma import Chroma
@@ -159,7 +159,7 @@ def _create_embedding_function():
         logger.info(f"正在加载 HuggingFace 嵌入模型: {EMBEDDING_MODEL_NAME}")
         embedding_fn = HuggingFaceEmbeddings(
             model_name=EMBEDDING_MODEL_NAME,
-            model_kwargs={"device": EMBEDDING_DEVICE},
+            model_kwargs={"device": "cpu"},  # CPU 模式，规避 libnvrtc.so.13 冲突
             encode_kwargs={"normalize_embeddings": True},
         )
 
@@ -513,20 +513,59 @@ def load_vector_store(
 
     embedding_fn = get_embedding_function()
 
+    # ── v4 优先: 尝试加载 rag_v4_child（函数级精粒度索引）──
+    try:
+        vector_store = Chroma(
+            persist_directory=persist_dir,
+            embedding_function=embedding_fn,
+            collection_name="rag_v4_child",
+        )
+        count = vector_store._collection.count()
+        if count > 0:
+            logger.info(f"✅ 已加载 v4 向量库 (rag_v4_child)，共 {count} 条记录")
+            return vector_store
+    except Exception:
+        logger.debug("v4 向量库未找到，回退 v3")
+
+    # ── v3 回退: 加载旧 rag_documents ──
     try:
         vector_store = Chroma(
             persist_directory=persist_dir,
             embedding_function=embedding_fn,
             collection_name="rag_documents",
         )
-        # 验证 Collection 中确实有数据
         count = vector_store._collection.count()
         if count == 0:
             return None
-        logger.info(f"✅ 已加载向量库，共 {count} 条记录")
+        logger.info(f"✅ 已加载 v3 向量库 (rag_documents)，共 {count} 条记录")
+        # ── v4 MD5 记录自动恢复 (ADR-16) ──
+        _init_md5_store_from_chroma(persist_dir)
+
         return vector_store
     except Exception as e:
         logger.warning(f"加载向量库失败: {e}")
+        return None
+
+
+def load_vector_store_from_name(
+    collection_name: str,
+    persist_dir: str = CHROMA_PERSIST_DIR,
+) -> Optional[Chroma]:
+    """
+    按 Collection 名称加载指定向量库（用于 v4 Parent/Child 分离访问）。
+    """
+    embedding_fn = _create_embedding_function()
+    try:
+        vs = Chroma(
+            collection_name=collection_name,
+            embedding_function=embedding_fn,
+            persist_directory=persist_dir,
+        )
+        count = vs._collection.count()
+        logger.info(f"✅ 已加载向量库 '{collection_name}': {count} 条")
+        return vs
+    except Exception as e:
+        logger.warning(f"加载 '{collection_name}' 失败: {e}")
         return None
 
 
@@ -628,13 +667,16 @@ def search_similar_with_threshold(
     if product_id:
         chroma_filter = {"product_id": product_id}
     else:
-        # 🔴 防御性日志：product_id 为空意味着跨产品混合检索
-        # 正常情况下，调用方应在产品路由阶段锁定 product_id。
-        # 此日志用于捕获意外绕过产品隔离的调用路径。
-        logger.warning(
-            "⚠️  search_similar_with_threshold 未指定 product_id，"
-            "将进行跨产品混合检索（可能触发隐式路由后续纠正）"
-        )
+        # Fix 4: product_id 为空时尝试从 query 推断，否则按产品分组召回
+        _inferred = _infer_product_from_query(query)
+        if _inferred:
+            chroma_filter = {"product_id": _inferred}
+            logger.info(f"🔍 自动推断 product_id='{_inferred}' (from query)")
+        else:
+            logger.warning(
+                "⚠️  search_similar_with_threshold 未指定 product_id 且无法推断，"
+                "将进行跨产品混合检索（结果将按产品分组标注）"
+            )
 
     # 使用 similarity_search_with_score 获取带距离分数的检索结果
     # langchain-chroma 支持 filter 参数，底层转换为 ChromaDB 的 where 条件
@@ -701,6 +743,537 @@ def get_vector_store_info(vector_store: Chroma) -> dict:
         return {"document_count": count}
     except Exception:
         return {"document_count": 0}
+
+
+# ============================================================
+# v4 双 Collection 管理 — Parent-Child Dual Indexing (ADR-15)
+# ============================================================
+
+def _match_function_names(metadata_fn_str: str, query_entities: List[str]) -> bool:
+    """
+    Fix 1: 模糊匹配 function_names 元数据字符串与 query 代码实体。
+
+    消除空格/大小写差异，支持子串匹配（如 query "movl" 匹配 "robot_movl"）。
+    """
+    if not metadata_fn_str or not query_entities:
+        return False
+    stored = [s.strip().lower() for s in metadata_fn_str.split(",") if s.strip()]
+    query_lower = [q.strip().lower() for q in query_entities]
+    for qe in query_lower:
+        for sf in stored:
+            if qe == sf or qe in sf or sf in qe:
+                return True
+    return False
+
+
+def _infer_product_from_query(query: str) -> Optional[str]:
+    """Fix 4: 从 query 中推断 product_id（简单关键词匹配）。"""
+    q = query.lower()
+    if any(kw in q for kw in ("openr6", "r6", "py_dll", "windows系统")):
+        return "OpenR6"
+    if any(kw in q for kw in ("openc3", "六轴", "collrob")):
+        return "OpenC3"
+    if any(kw in q for kw in ("jaka", "zuju", "modbus", "minicab", "vbrake")):
+        return "JAKA"
+    return None
+
+
+def _extract_query_code_entities(query: str) -> List[str]:
+    """从 query 中提取代码实体（复用 CodeEntityAnchor 模式）。"""
+    import re
+    patterns = [
+        re.compile(r'\b(?:robot_|set_|get_)\w+\b', re.IGNORECASE),
+        re.compile(r'\b(?:movl|movc|movj|movp|movb)\b', re.IGNORECASE),
+        re.compile(r'\b(?:py_dll|collrob_sdk|ctypes\.CDLL)\b', re.IGNORECASE),
+        re.compile(r'\b(?:power_on|enable|brkopen|home|joint_angle|io_output)\b', re.IGNORECASE),
+    ]
+    entities = []
+    seen = set()
+    for pat in patterns:
+        for m in pat.finditer(query):
+            e = m.group(0).lower()
+            if e not in seen:
+                seen.add(e)
+                entities.append(e)
+    return entities
+
+def _embed_batched(
+    texts: List[str],
+    embedding_fn,
+    batch_size: int = None,
+) -> List[List[float]]:
+    """
+    GPU/CPU 自适应批量嵌入计算 — 手动分批调用 HF embed_documents()。
+
+    修正 ①: CPU 模式 batch_size=16，GPU 模式 64，防 CPU 耗尽。
+    """
+    if batch_size is None:
+        batch_size = 16 if EMBEDDING_DEVICE == "cpu" else 64
+    embeddings = []
+    total = len(texts)
+    for i in range(0, total, batch_size):
+        batch = texts[i:i + batch_size]
+        batch_emb = embedding_fn.embed_documents(batch)
+        embeddings.extend(batch_emb)
+        if total > batch_size and i % (batch_size * 4) == 0:
+            logger.info(f"  嵌入进度: {min(i + batch_size, total)}/{total}")
+    return embeddings
+
+
+def _sanitize_metadata(meta: dict) -> dict:
+    """
+    修正 ②: 将 metadata dict 转为 ChromaDB 兼容格式（仅 str/int/float/bool）。
+
+    ChromaDB 的 MetadataValue 不支持 list/dict/None 类型。
+    """
+    clean = {}
+    for k, v in meta.items():
+        if isinstance(v, (str, int, float, bool)):
+            clean[k] = v
+        elif isinstance(v, list):
+            clean[k] = ",".join(str(x) for x in v)
+        elif v is None:
+            clean[k] = ""
+        elif isinstance(v, dict):
+            import json
+            clean[k] = json.dumps(v, ensure_ascii=False)
+        else:
+            clean[k] = str(v)
+    return clean
+
+
+def _add_to_existing_collection(
+    collection_name: str,
+    docs: list,
+    texts: List[str],
+    embeddings: List[List[float]],
+    persist_dir: str,
+    embedding_fn,
+) -> Chroma:
+    """
+    向已有 ChromaDB Collection 增量追加文档（网络免疫版）。
+
+    使用 collection.add(embeddings=precomputed) — ChromaDB 收到预计算向量后不调用嵌入函数。
+    """
+    import chromadb
+    from chromadb.config import Settings
+
+    client = chromadb.PersistentClient(
+        path=persist_dir,
+        settings=Settings(anonymized_telemetry=False),
+    )
+    coll = client.get_or_create_collection(
+        name=collection_name,
+        metadata={"hnsw:space": "cosine"},
+    )
+    ids = [f"{collection_name[4]}_{d.metadata.get('product_id','?')}_{hash(d.page_content[:80])}" for d in docs]
+    metadatas = [_sanitize_metadata(d.metadata) for d in docs]
+    coll.add(
+        ids=ids,
+        documents=texts,
+        embeddings=embeddings,
+        metadatas=metadatas,
+    )
+    return Chroma(
+        client=client, collection_name=collection_name,
+        embedding_function=embedding_fn,
+    )
+
+
+def create_dual_collections(
+    parent_docs: list,
+    child_docs: list,
+    persist_dir: str = CHROMA_PERSIST_DIR,
+    embedding_fn=None,
+) -> Tuple[Chroma, Chroma]:
+    """
+    创建 Parent-Child 双层 ChromaDB Collection（网络免疫版）。
+
+    流程: HF 手动嵌入 → ChromaDB 原生 collection.add(embeddings=...) 写入。
+    ChromaDB 收到预计算向量后不再触发任何嵌入逻辑，彻底绕开 ONNX 下载。
+    """
+    import chromadb
+    from chromadb.config import Settings
+
+    if embedding_fn is None:
+        embedding_fn = _create_embedding_function()
+
+    client = chromadb.PersistentClient(
+        path=persist_dir,
+        settings=Settings(anonymized_telemetry=False),
+    )
+
+    # ── 删除旧 v4 Collection ──
+    for name in ["rag_v4_parent", "rag_v4_child"]:
+        try:
+            client.delete_collection(name)
+            logger.info(f"🗑️  已删除旧 Collection: {name}")
+        except Exception:
+            pass
+
+    # ── 手动批量嵌入（HF 本地模型，无 ONNX 下载）──
+    logger.info(f"🧮 计算 Parent 嵌入向量 ({len(parent_docs)} docs, batch=64)...")
+    parent_texts = [d.page_content for d in parent_docs]
+    parent_embeddings = _embed_batched(parent_texts, embedding_fn, batch_size=64)
+
+    logger.info(f"🧮 计算 Child 嵌入向量 ({len(child_docs)} docs, batch=64)...")
+    child_texts = [d.page_content for d in child_docs]
+    child_embeddings = _embed_batched(child_texts, embedding_fn, batch_size=64)
+
+    # ── 写入 Parent Collection（原生 API，传预计算向量）──
+    parent_coll = client.create_collection(
+        name="rag_v4_parent",
+        metadata={"hnsw:space": "cosine"},
+    )
+    parent_ids = [f"p_{d.metadata.get('product_id','?')}_{i}" for i, d in enumerate(parent_docs)]
+    parent_metadatas = [_sanitize_metadata(d.metadata) for d in parent_docs]
+    if parent_texts:
+        parent_coll.add(
+            ids=parent_ids,
+            documents=parent_texts,
+            embeddings=parent_embeddings,
+            metadatas=parent_metadatas,
+        )
+    logger.info(f"✅ v4 Parent Collection: {parent_coll.count()} chunks")
+
+    # ── 写入 Child Collection ──
+    child_coll = client.create_collection(
+        name="rag_v4_child",
+        metadata={"hnsw:space": "cosine"},
+    )
+    child_ids = [f"c_{d.metadata.get('product_id','?')}_{i}" for i, d in enumerate(child_docs)]
+    child_metadatas = [_sanitize_metadata(d.metadata) for d in child_docs]
+    if child_texts:
+        child_coll.add(
+            ids=child_ids,
+            documents=child_texts,
+            embeddings=child_embeddings,
+            metadatas=child_metadatas,
+        )
+    logger.info(f"✅ v4 Child Collection: {child_coll.count()} chunks")
+
+    # ── 包装为 LangChain Chroma ──
+    parent_vs = Chroma(
+        client=client, collection_name="rag_v4_parent",
+        embedding_function=embedding_fn,
+    )
+    child_vs = Chroma(
+        client=client, collection_name="rag_v4_child",
+        embedding_function=embedding_fn,
+    )
+
+    return parent_vs, child_vs
+
+
+def search_dual_index(
+    parent_vs: Chroma,
+    child_vs: Chroma,
+    query: str,
+    k: int = 5,
+    threshold: float = 0.55,
+    product_id: Optional[str] = None,
+) -> List[Any]:
+    """
+    v4 双索引检索 — Child 优先 + Parent 批量反查。
+
+    策略（高效单次查询模式）:
+      1. 在 Child Collection 中向量检索 Top-K → 得到精粒度候选
+      2. 收集候选的 parent_id → 批量反查 Parent Collection
+      3. 合并 Parent 概览 + Child 细节 → 最终结果列表
+      4. 按相似度排序，Parent 排在对应 Child 前面（提供章节上下文）
+
+    这是"Child 匹配 + parent_id 批量反查"的高效模式：
+      - 只需 2 次 Collection 查询（Child 向量 + Parent get）
+      - 不会为每个 Child 单独查 Parent
+    """
+    from langchain_core.documents import Document as LCDocument
+
+    # ── Step 1: Child 向量检索 ──
+    child_filter = {"product_id": product_id} if product_id else None
+    try:
+        child_results = child_vs.similarity_search_with_relevance_scores(
+            query, k=k * 2, filter=child_filter,
+        )
+    except Exception:
+        child_results = []
+
+    # ── Step 2: 收集唯一 parent_id ──
+    child_docs = []
+    parent_ids_to_fetch = set()
+    for doc, score in child_results:
+        if score < threshold and len(child_docs) >= k:
+            continue
+        pid = doc.metadata.get("parent_id") if hasattr(doc, "metadata") else None
+        if pid:
+            parent_ids_to_fetch.add(pid)
+        child_docs.append((doc, score))
+
+    # ── Step 3: 批量反查 Parent ──
+    parent_docs_by_id = {}
+    if parent_ids_to_fetch:
+        try:
+            parent_data = parent_vs._collection.get(
+                ids=list(parent_ids_to_fetch),
+                include=["documents", "metadatas"],
+            )
+            for i, pid in enumerate(parent_data["ids"]):
+                parent_docs_by_id[pid] = LCDocument(
+                    page_content=parent_data["documents"][i],
+                    metadata=parent_data["metadatas"][i],
+                )
+        except Exception:
+            pass
+
+    # ── Step 4: 合并结果 ──
+    merged = []
+    seen_parents = set()
+    for child_doc, score in child_docs[:k]:
+        pid = child_doc.metadata.get("parent_id") if hasattr(child_doc, "metadata") else None
+        # Parent 先插入（提供章节上下文）
+        if pid and pid in parent_docs_by_id and pid not in seen_parents:
+            seen_parents.add(pid)
+            parent_doc = parent_docs_by_id[pid]
+            merged.append(LCDocument(
+                page_content=parent_doc.page_content,
+                metadata={**parent_doc.metadata, "source_type": "parent_overview"},
+            ))
+        # Child 紧随其后
+        merged.append(LCDocument(
+            page_content=child_doc.page_content,
+            metadata={**child_doc.metadata, "source_type": "child_detail"},
+        ))
+
+    return merged
+
+
+# ============================================================
+# v4 增量更新引擎 — Upsert + MD5 去重 (ADR-16)
+# ============================================================
+
+_product_md5_store: Dict[str, str] = {}  # {product_id: md5_hex}
+
+
+def _init_md5_store_from_chroma(persist_dir: str = CHROMA_PERSIST_DIR):
+    """从 ChromaDB Collection metadata 恢复 MD5 记录（系统重启后自动初始化）。"""
+    global _product_md5_store
+    try:
+        import chromadb
+        from chromadb.config import Settings
+        client = chromadb.PersistentClient(
+            path=persist_dir,
+            settings=Settings(anonymized_telemetry=False),
+        )
+        for coll_name in ["rag_v4_parent", "rag_v4_child"]:
+            try:
+                coll = client.get_collection(coll_name)
+                md5_data = coll.metadata.get("product_md5", "{}")
+                if md5_data:
+                    import json
+                    stored = json.loads(md5_data)
+                    _product_md5_store.update(stored)
+            except Exception:
+                pass
+        if _product_md5_store:
+            logger.info(f"📋 MD5 记录已恢复: {len(_product_md5_store)} 产品")
+    except Exception as e:
+        logger.debug(f"MD5 恢复跳过: {e}")
+
+
+def _persist_md5_store(persist_dir: str = CHROMA_PERSIST_DIR):
+    """将 MD5 记录写入 ChromaDB Collection metadata（持久化）。"""
+    import json
+    try:
+        import chromadb
+        from chromadb.config import Settings
+        client = chromadb.PersistentClient(
+            path=persist_dir,
+            settings=Settings(anonymized_telemetry=False),
+        )
+        md5_json = json.dumps(_product_md5_store, ensure_ascii=False)
+        for coll_name in ["rag_v4_parent", "rag_v4_child"]:
+            try:
+                coll = client.get_collection(coll_name)
+                coll.modify(metadata={"product_md5": md5_json})
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def delete_product_chunks(
+    product_id: str,
+    persist_dir: str = CHROMA_PERSIST_DIR,
+) -> int:
+    """
+    级联删除指定产品的所有 Parent + Child 切片。
+
+    Returns:
+        删除的切片总数
+    """
+    import chromadb
+    from chromadb.config import Settings
+
+    client = chromadb.PersistentClient(
+        path=persist_dir,
+        settings=Settings(anonymized_telemetry=False),
+    )
+    total_deleted = 0
+    for coll_name in ["rag_v4_parent", "rag_v4_child"]:
+        try:
+            coll = client.get_collection(coll_name)
+            result = coll.delete(where={"product_id": product_id})
+            count = len(result) if isinstance(result, list) else 0
+            total_deleted += count
+            if count:
+                logger.info(f"🗑️  {coll_name}: 删除 {count} 条 (product={product_id})")
+        except Exception:
+            pass
+    return total_deleted
+
+
+def bm25_upsert_product(
+    product_id: str,
+    new_docs: list,
+    vector_store=None,
+):
+    """
+    BM25 增量同步 — 对新增文档分词并更新内存索引。
+
+    仅重建受影响产品的 BM25 索引（O(n), n=新增文档数）。
+    """
+    global _bm25_indexes, _bm25_corpus
+    from rank_bm25 import BM25Okapi
+
+    try:
+        # 分词新文档
+        new_tokens = [_tokenize_for_bm25(
+            d.page_content if hasattr(d, "page_content") else str(d)
+        ) for d in new_docs]
+
+        if product_id in _bm25_corpus and product_id in _bm25_indexes:
+            # 追加模式
+            _bm25_corpus[product_id].extend(
+                d.page_content if hasattr(d, "page_content") else str(d)
+                for d in new_docs
+            )
+            all_tokens = _bm25_indexes[product_id].corpus + new_tokens
+            # 重新计算 IDF（仅该产品）
+            _bm25_indexes[product_id] = BM25Okapi(all_tokens)
+        else:
+            # 新产品模式
+            _bm25_corpus[product_id] = [
+                d.page_content if hasattr(d, "page_content") else str(d)
+                for d in new_docs
+            ]
+            _bm25_indexes[product_id] = BM25Okapi(new_tokens)
+
+        logger.info(f"📊 BM25 增量同步: product={product_id}, +{len(new_docs)} docs")
+    except Exception as e:
+        logger.warning(f"BM25 增量同步失败 ({product_id}): {e}")
+
+
+def bm25_remove_product(product_id: str):
+    """BM25 级联删除 — 清除指定产品的索引。"""
+    global _bm25_indexes, _bm25_corpus
+    _bm25_indexes.pop(product_id, None)
+    _bm25_corpus.pop(product_id, None)
+    logger.info(f"📊 BM25 已移除: product={product_id}")
+
+
+def upsert_product_documents(
+    pdf_path: str,
+    product_id: str = "",
+    child_chunk_size: int = 400,
+    parent_chunk_size: int = 1000,
+    persist_dir: str = CHROMA_PERSIST_DIR,
+) -> dict:
+    """
+    增量更新单个产品的文档切片（ADR-16 核心入口）。
+
+    Returns:
+        {"status": "updated"|"skipped"|"new", "parents": N, "children": M}
+    """
+    import hashlib, os
+
+    # ── Step 1: MD5 去重 ──
+    try:
+        with open(pdf_path, "rb") as f:
+            file_md5 = hashlib.md5(f.read()).hexdigest()
+    except Exception:
+        file_md5 = ""
+
+    if not _product_md5_store:
+        _init_md5_store_from_chroma(persist_dir)
+
+    if not product_id:
+        from .pdf_loader import _resolve_product_id_from_filename
+        product_id = _resolve_product_id_from_filename(os.path.basename(pdf_path))
+
+    if product_id in _product_md5_store and _product_md5_store[product_id] == file_md5:
+        logger.info(f"⏭️  MD5 相同，跳过: {product_id} ({file_md5[:8]}...)")
+        return {"status": "skipped", "parents": 0, "children": 0, "ocr_images": 0}
+
+    # ── Step 2: 级联删除旧数据 ──
+    deleted = delete_product_chunks(product_id, persist_dir)
+    bm25_remove_product(product_id)
+
+    # ── Step 3: 重新解析 ──
+    from .pdf_loader import extract_text_from_pdf, _v4_inject_ocr_text, _v4_build_parent_child_docs
+    text = extract_text_from_pdf(pdf_path)
+    if not text.strip():
+        return {"status": "error", "error": "no_text"}
+
+    # OCR 注入
+    text = _v4_inject_ocr_text(pdf_path, text)
+    ocr_count = text.count("[OCR识别: page=")
+
+    # Parent-Child 构建
+    source = os.path.basename(pdf_path)
+    parents, children = _v4_build_parent_child_docs(
+        text, source, product_id,
+        child_chunk_size=child_chunk_size,
+        parent_chunk_size=parent_chunk_size,
+    )
+
+    # ── Step 4: 手动嵌入 + 原生 add（网络免疫，无 ONNX 下载）──
+    embedding_fn = _create_embedding_function()
+
+    # Parent Collection — 增量追加
+    parent_texts = [d.page_content for d in parents]
+    parent_embeddings = _embed_batched(parent_texts, embedding_fn, batch_size=64)
+    parent_vs = _add_to_existing_collection(
+        "rag_v4_parent", parents, parent_texts, parent_embeddings,
+        persist_dir, embedding_fn,
+    )
+
+    # Child Collection — 增量追加
+    child_texts = [d.page_content for d in children]
+    child_embeddings = _embed_batched(child_texts, embedding_fn, batch_size=64)
+    child_vs = _add_to_existing_collection(
+        "rag_v4_child", children, child_texts, child_embeddings,
+        persist_dir, embedding_fn,
+    )
+
+    # ── Step 5: BM25 同步 ──
+    bm25_upsert_product(product_id, parents + children)
+
+    # ── Step 6: 持久化 MD5 ──
+    _product_md5_store[product_id] = file_md5
+    _persist_md5_store(persist_dir)
+
+    logger.info(
+        f"✅ Upsert: {product_id} → {len(parents)}P + {len(children)}C "
+        f"(删除旧 {deleted} 条, OCR {ocr_count} 图片)"
+    )
+
+    return {
+        "status": "updated" if deleted > 0 else "new",
+        "product_id": product_id,
+        "parents": len(parents),
+        "children": len(children),
+        "ocr_images": ocr_count,
+        "deleted_old": deleted,
+    }
 
 
 # ============================================================
@@ -837,24 +1410,46 @@ def _auto_extract_and_register_terms(documents: list):
 
 def _tokenize_for_bm25(text: str) -> List[str]:
     """
-    BM25 分词器：jieba 中文分词 + 英文标识符保护。
+    BM25 分词器：jieba 中文分词 + 英文标识符保护 + CodeEntityAnchor 标签。
 
-    1. 先用正则提取所有英文标识符（如 set_move_line），防止 jieba 将
-       下划线连接的函数名切成碎片（set, _, move, _, line）。
-    2. 再从文本中移除已提取的标识符，剩余中文部分交给 jieba 分词。
-    3. 最终返回小写的 token 列表。
+    v3 增强 (ADR-14):
+      1. [CODE:entity_name] 标签 → 提取实体名作为强保护 token（双倍写入）
+      2. 先用正则提取所有英文标识符（如 set_move_line），防止 jieba 将
+         下划线连接的函数名切成碎片（set, _, move, _, line）。
+      3. 再从文本中移除已提取的标识符，剩余中文部分交给 jieba 分词。
+      4. 最终返回小写的 token 列表。
     """
     tokens = []
 
+    # 🔴 v3 Step 0: 提取 [CODE:...] 强保护标签 — 三倍写入实现 Boost=3.0 效果
+    code_entities = re.findall(r'\[CODE:([a-zA-Z_][a-zA-Z0-9_]*)\]', text)
+    for entity in code_entities:
+        entity_clean = entity.lower().strip('_')
+        if len(entity_clean) >= 2:
+            # 三倍写入 = 3× BM25 IDF 权重（对抗 PDF 原文标题错误等噪声）
+            tokens.append(entity_clean)
+            tokens.append(entity_clean)
+            tokens.append(entity_clean)
+            # 对 robot_xxx 函数名，同时也写不带前缀的短名（如 movl）
+            if '_' in entity_clean:
+                short_name = entity_clean.split('_', 1)[-1] if entity_clean.startswith('robot_') else None
+                if not short_name:
+                    parts = entity_clean.rsplit('_', 1)
+                    short_name = parts[-1] if len(parts) > 1 else None
+                if short_name and len(short_name) >= 3:
+                    tokens.append(short_name)  # 额外 boost 短名匹配
+    # 移除 [CODE:...] 标签避免污染后续分词
+    text_clean = re.sub(r'\[CODE:[a-zA-Z_][a-zA-Z0-9_]*\]', ' ', text)
+
     # 🔴 Step 1: 提取英文标识符作为不可分割的整词
-    identifiers = _IDENTIFIER_RE.findall(text)
+    identifiers = _IDENTIFIER_RE.findall(text_clean)
     for ident in identifiers:
         ident_lower = ident.lower().strip('_')
         if len(ident_lower) >= 2 and not ident_lower.startswith('0x'):
             tokens.append(ident_lower)
 
     # 🔴 Step 2: 移除标识符后再 jieba 分词中文部分
-    text_no_ident = _IDENTIFIER_RE.sub(' ', text)
+    text_no_ident = _IDENTIFIER_RE.sub(' ', text_clean)
     # 🔴 Step 2b: 提取 3-5 位数字作为原子 token（端口号 6502、密码等）
     _numeric_tokens = re.findall(r'\b(\d{3,5})\b', text_no_ident)
     for num in _numeric_tokens:

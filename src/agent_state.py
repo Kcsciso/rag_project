@@ -1,11 +1,20 @@
 """
 =============================================================================
-RAG Agent State — LangGraph 状态图状态定义（v2 — Post-Generation Control）
+RAG Agent State — LangGraph 状态图状态定义（v3 — Plan-Execute-Synthesize）
 =============================================================================
 
 定义了 RAG 管线各节点之间流转的 TypedDict 状态结构。
 
 每个图节点读取 state，返回部分更新（dict），LangGraph 自动合并。
+
+【v3 新增字段 — Plan-Execute-Synthesize 架构】（ADR-14, 2026-07-25）
+  - sub_goals:              SubGoalPlanner 拆分的子目标列表
+  - sub_results:            各子目标并行执行的结果
+  - cross_product_candidates: 跨产品检索候选
+  - attribute_intent:       动态属性意图提取结果（替代静态 KV 表）
+  - code_entities:          从 query 中提取的代码实体名列表
+  - plan_mode:              执行模式 "single"|"multi"|"cross_product"|"attribute"
+  - skip_planner:           快速路径标志 — 明确 product_id 时绕过 Planner
 
 【v2 新增字段 — 后处理控制层】（ADR-11, 2026-07-24）
   - extracted_entities: 从 Context 中提取的通用 KV 属性映射
@@ -41,6 +50,21 @@ class RAGState(TypedDict, total=False):
                             - "complete"   → 生成完成
                             - "error"      → 发生错误
 
+      ── v3 Plan-Execute-Synthesize 字段 ──
+      sub_goals:          子目标列表，每项为 dict:
+                            {"type":"product_qa"|"attribute_lookup"|"code_search"|"cross_product",
+                             "product_id":"JAKA"|None, "query":"...", "priority":1-3}
+      sub_results:        各子目标执行结果列表，每项为 dict:
+                            {"goal_index":0, "type":"...", "answer":"...", "sources":[...], "model":"..."}
+      cross_product_candidates: 跨产品检索结果，每项为 dict:
+                            {"product_id":"JAKA", "snippet":"...", "relevance":0.85}
+      attribute_intent:   动态属性意图 dict:
+                            {"query_keyword":"波特率", "extracted_value":"9600",
+                             "normalized_key":"波特率", "bm25_hits":2, "resolved":True}
+      code_entities:      从 query 提取的代码实体名列表 ["robot_movl","set_robot_power_on"]
+      plan_mode:          当前执行模式: "single" | "multi" | "cross_product" | "attribute"
+      skip_planner:       True = 快速路径，绕过 SubGoalPlanner
+
       ── v2 后处理控制字段 ──
       extracted_entities: 从 Context 中扫描提取的通用 KV 属性映射，
                           格式 {"端口": "6502", "波特率": "9600"}。
@@ -68,9 +92,21 @@ class RAGState(TypedDict, total=False):
     model: str
     route_status: str
 
+    # ── v3 Plan-Execute-Synthesize 字段 ──
+    sub_goals: List[Dict[str, Any]]
+    sub_results: List[Dict[str, Any]]
+    cross_product_candidates: List[Dict[str, Any]]
+    attribute_intent: Dict[str, Any]
+    code_entities: List[str]
+    plan_mode: str
+    skip_planner: bool
+
     # ── v2 后处理控制字段 ──
     extracted_entities: Dict[str, str]
     feedback: str
     retry_count: int
     context_text: str
     raw_llm_answer: str
+    # ── v2.1 Agentic RAG 控制字段 ──
+    retrieval_retry: int
+    doc_sufficient: bool

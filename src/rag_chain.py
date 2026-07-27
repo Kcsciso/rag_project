@@ -379,6 +379,8 @@ def _stream_llm(
 
 import re
 
+from langchain_core.documents import Document
+
 # 纯检索模式使用的 Top-K 值
 # k=2: 降级模式下只保留匹配度最高的 1-2 个核心片段，过滤噪声干扰
 DIRECT_RETRIEVAL_K = 2
@@ -420,56 +422,6 @@ _QUERY_INLINE_NOISE = [
     r'\s*那个\s*',
     r'\s*这个\s*',
 ]
-
-# 机械臂领域核心操作词权重表（用于检索加分）
-_DOMAIN_KEYWORD_WEIGHTS = {
-    # ---- 中文核心操作词（高权重） ----
-    "上电":       0.45,
-    "使能":       0.45,
-    "下电":       0.45,
-    "断电":       0.45,
-    "抱闸":       0.45,
-    "松闸":       0.45,
-    "复位":       0.40,
-    "回零":       0.40,
-    "急停":       0.45,
-    "停止":       0.35,
-    "暂停":       0.35,
-    "启动":       0.30,
-    "初始化":     0.35,
-    "连接":       0.25,
-    "断开":       0.30,
-    # ---- 机械臂本体词汇（中权重） ----
-    "机械臂":     0.25,
-    "机器人":     0.20,
-    "关节":       0.30,
-    "位姿":       0.35,
-    "姿态":       0.30,
-    "位置":       0.25,
-    "运动":       0.25,
-    "控制":       0.20,
-    "轨迹":       0.25,
-    "速度":       0.20,
-    "加速度":     0.20,
-    "坐标系":     0.25,
-    "末端":       0.20,
-    "工具":       0.15,
-    # ---- 状态/数据词（低权重） ----
-    "IO":         0.25,
-    "输入":       0.15,
-    "输出":       0.15,
-    "状态":       0.15,
-    "报错":       0.20,
-    "错误":       0.15,
-    "异常":       0.20,
-    "日志":       0.10,
-    "参数":       0.15,
-    "返回值":     0.20,
-    "示例":       0.10,
-    "代码":       0.10,
-    "函数":       0.15,
-    "接口":       0.15,
-}
 
 # 机械臂 SDK 核心函数名（高权重精确匹配）
 _DOMAIN_FUNCTION_NAMES = {
@@ -996,9 +948,8 @@ def _score_chunk_for_query(chunk_text: str, query: str) -> float:
         is_substring = False
         for other in zh_tokens_raw:
             if token != other and len(token) < len(other) and token in other:
-                if token not in _DOMAIN_KEYWORD_WEIGHTS:
-                    is_substring = True
-                    break
+                is_substring = True
+                break
         if not is_substring:
             zh_tokens.add(token)
 
@@ -1018,25 +969,7 @@ def _score_chunk_for_query(chunk_text: str, query: str) -> float:
     base_score = hits / len(all_tokens)
 
     # ================================================================
-    # 第 ② 层：机械臂领域核心操作词加权匹配
-    # ================================================================
-    domain_bonus = 0.0
-    matched_domain_keywords = set()
-
-    for keyword, weight in _DOMAIN_KEYWORD_WEIGHTS.items():
-        kw_lower = keyword.lower()
-        # 检查查询中是否包含该领域词
-        if kw_lower in query_lower:
-            # 检查切片中是否也包含（确保是真正的命中，而非查询单方面包含）
-            if kw_lower in chunk_lower:
-                domain_bonus += weight
-                matched_domain_keywords.add(keyword)
-
-    # 领域加分上限 1.0（防止堆积过多低权重词过度抬高分数）
-    domain_bonus = min(domain_bonus, 1.0)
-
-    # ================================================================
-    # 第 ③ 层：SDK 函数名精确匹配高额加分
+    # 第 ② 层：SDK 函数名精确匹配高额加分
     # ================================================================
     func_bonus = 0.0
     matched_func_names = set()
@@ -1063,14 +996,12 @@ def _score_chunk_for_query(chunk_text: str, query: str) -> float:
     func_bonus = min(func_bonus, 1.0)
 
     # ================================================================
-    # 综合得分 = 基础分 + 领域分 + 函数分（上限 1.0）
+    # 综合得分 = 基础分 + 函数分（上限 1.0）
     #
-    # 设计原则：采用加法模型。领域词和函数名命中直接叠加到基础分上，
-    # 确保核心操作词（如"上电"domain_bonus=0.45）能独立"拯救"
-    # 一个不含泛词（如"机械臂"）的技术函数切片。
-    # 乘法模型的问题：低 base_score × 高 bonus = 仍低，无法纠正。
+    # Agentic RAG 重构：移除静态领域关键词权重，依赖 DocGrader +
+    # ParentSectionExpand 动态环路保障召回完整性。
     # ================================================================
-    final_score = base_score + domain_bonus + func_bonus
+    final_score = base_score + func_bonus
     final_score = min(final_score, 1.0)
 
     return final_score
@@ -1547,13 +1478,71 @@ API 接口、开发指南和使用手册的问题。
 - 下标用 _{\\text{...}}，上标用 ^{...}，单位用 \\text{V} 或 \\text{Ω}
 
 🔗 通信协议隔离规范（不可覆盖）：
-- **Modbus TCP**（以太网通信）：基于 TCP/IP 协议栈，参数为 IP 地址与端口号。
-  严禁将"波特率 9600"、"数据位 8"、"停止位 1"等串口参数与 Modbus TCP 混为一谈。
-- **Modbus RTU**（串口通信）：基于 RS-485/RS-232 物理层，必须配置波特率、数据位长度、
-  停止位长度、校验方式。严禁将"端口号 502/6502"等 TCP 参数与 Modbus RTU 混为一谈。
-- 🔴 回答 Modbus 相关问题时，必须先判断用户问的是 TCP 还是 RTU，再引用对应参数。
-  若用户未明确，请主动询问"请问您使用的是 Modbus TCP（网线）还是 Modbus RTU（串口）？"
-- 🔴 严禁将两种协议的参数在同一句话中并列输出。
+- 不同通信协议（如 Modbus TCP / Modbus RTU / Profinet / EtherCAT）的参数体系相互独立，
+  严禁将一类协议的参数（如串口的波特率、数据位）与另一类协议的参数（如 TCP 的 IP/端口）
+  混为一谈。
+- 🔴 回答通信相关问题时，必须先判断用户询问的具体协议类型，再引用该协议对应的参数。
+  若用户未明确指定协议，请主动询问澄清。
+- 🔴 严禁将不同协议的参数在同一句话或同一段中并列输出。
+
+🔢 多值参数完整披露（不可覆盖）：
+- 当参考资料中记载了**同一属性的多个不同数值或用途**时（例如 Modbus TCP 端口 6502
+  与末端传感器端口 49152），必须**按功能分类完整列出所有数值及其对应用途**。
+- 🚫 严禁只输出第一个数值，将局部端口当作设备的唯一端口。
+- 🔴 若参考资料中存在多个同名参数属于不同子系统，必须在回答中逐一说明各数值的归属与用途，
+  帮助用户区分不同功能模块的参数配置。
+
+📋 操作流程完整性（不可覆盖）：
+- 回答任何设备的操作流程时，必须**严格按照参考资料中章节记载的先后顺序**，
+  完整提取并列出所有的操作动作、点击按钮/菜单项与设备指示灯/状态变化。
+- 🚫 严禁跳过中间步骤、省略前置条件或遗漏状态确认环节。
+- 🔴 若参考资料仅描述了部分步骤，如实说明"参考资料中仅记载了以下步骤"，
+  严禁自行补充推测的步骤或过渡状态。
+
+🔧 SDK 代码命名规范约束（不可覆盖）：
+- 所有 SDK 函数调用**必须严格使用参考资料中记载的准确函数名**，包括完整的前缀（如 `set_`、`get_`、`robot_`）和大小写。
+- 🚫 严禁省略任何前缀、后缀或改变函数名的大小写拼写。
+- 🔴 函数名必须与参考资料**逐字符一致**，此规则优先级高于所有通用编程命名惯例。
+
+🔧 信息提取模式 Extract Mode（最高优先级 — 代码/步骤/参数类查询必须遵守）：
+- 当用户询问以下任一类问题时，**禁止**直接写完整答案，必须输出 JSON 提取块：
+  - SDK 函数名 / API 调用 / 代码示例
+  - 操作步骤 / 设置流程
+  - 硬件参数 / 运行环境 / 配置要求
+- JSON 格式（只输出参考资料中逐字出现的内容）：
+  ```
+  【提取】
+  {
+    "doc": "完整文档名",
+    "section": "章节标题",
+    "functions": [{"name": "函数名", "signature": "完整签名", "dll": "DLL文件名"}],
+    "steps": ["步骤原文1", "步骤原文2"],
+    "params": {"属性词": "数值"},
+    "hardware": {"配置项": "原文描述"}
+  }
+  【提取结束】
+  ```
+- 🚫 只填参考资料中**逐字存在**的字段，没有的字段不填。
+- 🚫 functions 中的函数名/签名/DLL 必须**逐字复制**，严禁改写。例如原文 `robot_movl(POSE pose, float vel, int block)` → 必须原样输出 `"signature": "robot_movl(POSE pose, float vel, int block)"`，严禁写成 `move_linear(x, y, z)`。
+- 🚫 steps 必须按原文顺序、原文措辞，不增减步骤、不加时间/颜色/位置修饰词。
+- 🚫 params/hardware 的数值必须与原文一致（原文 i3 就是 i3，不准写成 i5）。
+- 🔴 如果无法从参考资料中提取到具体字段，输出 `{"doc": "...", "section": "...", "note": "参考资料未记载此细节"}`。
+
+🔢 数值硬绑定规则（不可覆盖）：
+- 回答中的所有端口、波特率、电压、IP 地址、从站 ID、功率等数值必须 **100% 严格复述**
+  【参考资料】中的数字，严禁使用任何预训练常识数字（如 502、8080、admin、123456 等）
+  覆盖资料中的真实数据。
+- 🔴 只有【参考资料】中**逐字出现**的数值才能被引用。例如资料写"端口号 6502"才能说 6502，
+  资料写"输入电压 24V"才能说 24V。任何资料未记载的数值一律拒答。
+
+🖥️ 界面/图表文本严格锁定（不可覆盖）：
+- 当参考资料包含界面截图描述、图表说明或 OCR 提炼项目时，**只能列出参考资料中明确写出的
+  文字列表项**，绝对禁止推测或补充任何未提及的设备状态、属性与指标。
+- 🚫 严禁自行添加的典型错误示例：
+  - 资料只有截图标签"设置界面" → 禁止描述"界面顶部有电池电量 85%、CPU 温度 42°C"
+  - 资料只有 OCR 文字"JAKA 关闭 设置 帮助" → 禁止补充"底部状态栏显示运行时间"
+  - 资料描述了步骤但无具体数值 → 禁止添加"约需 3 秒"、"大约 50%" 等推测数据
+- 🔴 界面描述只复述 OCR 文字和明确标注项，绝不脑补"通常/一般/应该"等推测性文字。
 
 📎 章节与出处溯源规范（不可覆盖）：
 - 🔴 当依据检索到的文档片段回答问题时，**必须**在回答开头显式标注完整引用来源。
@@ -1873,8 +1862,57 @@ def _build_messages(
     if _contains_injection_pattern(query):
         logger.warning(f"⚠️  检测到可能的 Prompt 注入模式: {query[:120]}...")
 
+    # ── Fix 2: 强化防幻觉 — 仅 SDK 代码查询 + 无上下文时才硬拦截 ──
+    _cond_constraint = ""
+    _force_no_code = False
+    _is_explicit_code = _has_explicit_code_demand(query)
+    if _is_sdk_code_query(query):
+        _has_func_in_context = False
+        _has_procedure_in_context = False
+        _ctx_func_names = set()
+        _ctx_has_numbers = False  # Bug Fix 2: 检查上下文是否含数字参数
+        for _doc in context_docs:
+            _ct = _doc.page_content if hasattr(_doc, 'page_content') else str(_doc)
+            _found = re.findall(r'\b([a-z_][a-z0-9_]*_[a-z0-9_]+)\s*\(', _ct, re.IGNORECASE)
+            if _found:
+                _has_func_in_context = True
+                _ctx_func_names.update(f.lower() for f in _found)
+            if re.search(r'(点击|选择|进入|设置|配置|连接|启动|停止|打开|关闭|按下|输入)', _ct):
+                _has_procedure_in_context = True
+            if re.search(r'\b\d{2,}\b', _ct):  # 上下文含数字 → 有实质内容
+                _ctx_has_numbers = True
+            _meta_fn = ""
+            if hasattr(_doc, 'metadata'):
+                _meta_fn = _doc.metadata.get("function_names", "")
+            if _meta_fn:
+                _ctx_func_names.update(f.strip().lower() for f in _meta_fn.split(",") if f.strip())
+
+        # Bug Fix 2: 仅当用户明确要写代码 且 上下文完全无函数/步骤/数字时 才硬拦截
+        if _is_explicit_code and not _has_func_in_context and not _has_procedure_in_context and not _ctx_func_names:
+            _force_no_code = True
+            _cond_constraint = (
+                '【🚫 强制约束 — 最高优先级】\n'
+                '检索结果中未找到该 SDK 的任何函数签名或操作步骤。\n'
+                '你必须严格遵守以下规则：\n'
+                '1. 只允许回复: "参考文档中未包含此功能的记载,建议联系技术支持或查阅最新文档。"\n'
+                '2. 严禁输出任何 Python/ctypes/C 代码(包括代码块)\n'
+                '3. 严禁编造任何函数名(如 robot_xxx, set_xxx)\n'
+                '4. 严禁提供任何替代方案或"你可以尝试"的建议\n'
+                '5. 回复长度不得超过 50 字\n\n'
+            )
+            logger.info(
+                f"🚫 SDK 查询无函数/步骤上下文 → 硬拦截代码生成 "
+                f"(query_entities={_extract_query_code_entities(query)})"
+            )
+        elif not _has_func_in_context and _ctx_func_names:
+            # 仅 metadata 有函数名但文本中未出现 → 弱约束（可能是子串匹配）
+            _cond_constraint = (
+                "【⚠️ 注意】参考资料文本中未明确包含该 SDK 的函数签名。"
+                "如果确实不包含，请诚实拒答，不要编造。\n\n"
+            )
+
     # ---- 构建当前轮次的用户消息（含明确边界标记） ----
-    current_user_message = f"""【参考资料】
+    current_user_message = f"""{_cond_constraint}【参考资料】
 {context_text}
 
 ---
@@ -1884,8 +1922,18 @@ def _build_messages(
 请基于以上参考资料回答问题。如果参考资料不足以回答，请明确说明。"""
 
     # ---- 组装完整消息列表 ----
+    _system_content = RAG_SYSTEM_PROMPT
+    if _force_no_code:
+        _system_content = (
+            "【🚫 本次对话的最高指令 — 覆盖所有其他规则】\n"
+            "当前检索结果中不包含任何真实的 SDK 函数名。你的唯一任务是回复："
+            '"参考文档中未包含此功能的记载，建议联系技术支持或查阅最新文档。"\n'
+            "绝对禁止：输出任何代码块、编造函数名、提供替代方案。\n"
+            "回复长度不得超过 50 字。\n\n"
+            + _system_content
+        )
     messages = [
-        {"role": "system", "content": RAG_SYSTEM_PROMPT},
+        {"role": "system", "content": _system_content},
     ]
 
     # 🪟 滑动窗口 + 安全校验
@@ -2025,7 +2073,80 @@ def _chitchat_response_stream() -> Generator[str, None, None]:
         yield _IDENTITY_RESPONSE[i:i + chunk_size]
 
 
-def _autocut_knee(rrf_scores: List[float]) -> int:
+_SDK_CODE_QUERY_RE = re.compile(
+    r'(?:函数怎么写|代码示例|ctypes|CDLL|\.dll|py_dll|collrob_sdk|'
+    r'(?:^|\s)(?:robot_|set_|get_)\w+|编写.*函数|调用.*函数|'
+    r'怎么写.*函数|代码.*怎么写|SDK.*函数|api.*调用)',
+    re.IGNORECASE,
+)
+
+# Bug Fix 2: APP UI 操作查询模式 — 即使匹配 SDK 模式也豁免硬拦截
+_APP_UI_QUERY_RE = re.compile(
+    r'(?:APP|界面|配置|升级|版本|IO\s*配置|Modbus\s*参数|'
+    r'通讯设置|安全区域|坐标系|四点法|拖动示教|'
+    r'怎么(?:升级|设置|配置|连接|操作|使用)|'
+    r'在哪里|在哪里点|界面.*哪里|哪个菜单)',
+    re.IGNORECASE,
+)
+
+
+def _is_sdk_code_query(query: str) -> bool:
+    """
+    Bug Fix 2: 精确区分 SDK 代码查询 vs APP 界面操作查询。
+    仅当 query 明确要求编写/调用代码且不涉及 APP 界面操作时，才触发 SDK 硬拦截。
+    """
+    is_sdk = bool(_SDK_CODE_QUERY_RE.search(query))
+    is_app_ui = bool(_APP_UI_QUERY_RE.search(query))
+    # APP UI 操作查询豁免 SDK 硬拦截
+    if is_app_ui and not _has_explicit_code_demand(query):
+        return False
+    return is_sdk
+
+
+def _has_explicit_code_demand(query: str) -> bool:
+    """query 是否明确要求写代码（函数怎么写、代码示例、ctypes、CDLL）"""
+    return bool(re.search(
+        r'(?:函数怎么写|代码示例|ctypes|CDLL|\.dll|编写.*代码|调用.*函数)',
+        query, re.IGNORECASE,
+    ))
+
+
+def _match_function_names(metadata_fn_str: str, query_entities: list) -> bool:
+    """
+    Fix 1: 模糊匹配 function_names 元数据字符串与 query 代码实体。
+    消除空格/大小写差异，支持子串匹配（如 query "movl" 匹配 "robot_movl"）。
+    """
+    if not metadata_fn_str or not query_entities:
+        return False
+    stored = [s.strip().lower() for s in metadata_fn_str.split(",") if s.strip()]
+    query_lower = [q.strip().lower() for q in query_entities if q.strip()]
+    for qe in query_lower:
+        for sf in stored:
+            if qe == sf or qe in sf or sf in qe:
+                return True
+    return False
+
+
+def _extract_query_code_entities(query: str) -> list:
+    """Fix 1: 从 query 中提取代码实体模式（复用 CodeEntityAnchor 模式）。"""
+    _patterns = [
+        re.compile(r'\b(?:robot_|set_|get_)\w+\b', re.IGNORECASE),
+        re.compile(r'\b(?:movl|movc|movj|movp|movb)\b', re.IGNORECASE),
+        re.compile(r'\b(?:py_dll|collrob_sdk|ctypes\.CDLL)\b', re.IGNORECASE),
+        re.compile(r'\b(?:power_on|enable|brkopen|home|joint_angle|io_output)\b', re.IGNORECASE),
+    ]
+    entities = []
+    seen = set()
+    for pat in _patterns:
+        for m in pat.finditer(query):
+            e = m.group(0).lower()
+            if e not in seen:
+                seen.add(e)
+                entities.append(e)
+    return entities
+
+
+def _autocut_knee(rrf_scores: List[float], max_k: int = None) -> int:
     """
     基于 RRF 融合分数的断崖/跳变点检测，动态确定最佳截断位置。
 
@@ -2033,41 +2154,44 @@ def _autocut_knee(rrf_scores: List[float]) -> int:
       1. 计算相邻分数的差值: diffs[i] = scores[i] - scores[i+1]
       2. 寻找最大差值位置（Knee Point）— 这是分数下降最剧烈的地方
       3. 在 knee point 处截断（保留 knee point 及之前的所有切片）
-      4. 钳制在 [_AUTOCUT_MIN_K, _AUTOCUT_MAX_K] 范围内
-
-    直觉：
-      高相关切片（RRF ~0.02-0.03）→ 急剧下降到低相关（RRF ~0.005-0.01）
-      → knee 就是那个"断崖"位置，之后的切片噪声居多。
+      4. 钳制在 [_AUTOCUT_MIN_K, max_k] 范围内
 
     Args:
         rrf_scores: 按 RRF 得分降序排列的分数列表
+        max_k: 动态上限（默认取 _AUTOCUT_MAX_K），由调用方传入 k 值控制
 
     Returns:
         动态确定的截断位置（保留前 N 个切片的数量）
     """
+    if max_k is None:
+        max_k = _AUTOCUT_MAX_K
+    # 🔴 v2.2: 上限动态跟随传入的 k 值
+    effective_max = max(_AUTOCUT_MIN_K + 1, max_k)
+
     n = len(rrf_scores)
     if n <= _AUTOCUT_MIN_K:
         return n
 
-    # 计算相邻差值
+    # 计算相邻差值 — 扫描范围跟随 effective_max
     diffs = []
-    for i in range(min(n - 1, _AUTOCUT_MAX_K)):
+    scan_limit = min(n - 1, effective_max)
+    for i in range(scan_limit):
         diff = rrf_scores[i] - rrf_scores[i + 1]
-        diffs.append((diff, i + 1))  # (差值, 截断位置=保留前i+1个)
+        diffs.append((diff, i + 1))
 
     if not diffs:
-        return min(n, _AUTOCUT_MAX_K)
+        return min(n, effective_max)
 
     # 找最大差值位置
     diffs.sort(key=lambda x: x[0], reverse=True)
     best_diff, knee_pos = diffs[0]
 
-    # 钳制
-    cut = max(_AUTOCUT_MIN_K, min(knee_pos + 1, _AUTOCUT_MAX_K, n))
+    # 钳制 — 上限使用动态 effective_max
+    cut = max(_AUTOCUT_MIN_K, min(knee_pos + 1, effective_max, n))
 
     logger.info(
         f"🔪 Autocut: {n} 个候选 → max_diff={best_diff:.4f} @ pos={knee_pos} "
-        f"→ cut={cut} (clamped [{_AUTOCUT_MIN_K}, {_AUTOCUT_MAX_K}])"
+        f"→ cut={cut} (clamped [{_AUTOCUT_MIN_K}, {effective_max}], k={max_k})"
     )
     return cut
 
@@ -2112,8 +2236,12 @@ def _hybrid_retrieve(
         Top-K 个重排序后的 Document 列表
     """
     try:
-        # 第 1 步：向量搜索 — 扩大候选池（阈值硬上限 0.70，防止复合查询语义稀释后全量被误杀）
-        fetch_k = k * fetch_factor
+        # 第 1 步：向量搜索 — 扩大候选池（Fix 3: 代码实体查询 fetch_factor=8 → top-40 候选池）
+        _query_code_entities = _extract_query_code_entities(query)
+        _effective_fetch_factor = fetch_factor
+        if _query_code_entities:
+            _effective_fetch_factor = max(fetch_factor, 8)  # 代码查询扩大候选池
+        fetch_k = k * _effective_fetch_factor
         # 🔴 relaxed_threshold 硬上限 0.70：严禁放宽后超过 0.714 误杀全部候选切片
         # 下限保护：不低于主阈值 0.68，确保边缘相关切片（distance 0.68-0.70）可进入候选池
         relaxed_threshold = min(threshold * 1.05, 0.70) if threshold else None
@@ -2183,11 +2311,22 @@ def _hybrid_retrieve(
             cleaned_content = _truncate_noise_content(doc.page_content)
             if cleaned_content != doc.page_content:
                 doc.page_content = cleaned_content
-            # 🔴 关键词评分仅用于最低阈值过滤（保留所有语义相关的切片）
+            # 🔴 关键词评分过滤 — v2 宽松版：保留 SDK 函数切片 + 防止全部过滤
             kw_score = _score_chunk_for_query(doc.page_content, query)
-            if kw_score < 0.05:
-                filtered_count += 1
-                continue
+            # 检查是否包含 function_names 元数据（API 原子块保护）
+            _has_fn_meta = bool(
+                hasattr(doc, 'metadata') and doc.metadata.get("function_names", "")
+            )
+            # 放宽条件：kw_score >= 0.03 或 含函数名元数据 或 含代码实体 → 保留
+            if kw_score < 0.03 and not _has_fn_meta:
+                _txt = doc.page_content.lower()
+                _has_code = any(
+                    kw in _txt for kw in ('robot_', 'set_', 'get_', 'ctypes', 'cdll',
+                                           'py_dll', 'collrob_sdk', 'movl', 'movc', 'movj')
+                )
+                if not _has_code:
+                    filtered_count += 1
+                    continue
             kept_docs.append(doc)
 
         if noise_filtered > 0:
@@ -2195,7 +2334,15 @@ def _hybrid_retrieve(
         if image_noise_filtered > 0:
             logger.info(f"🖼️  图片描述噪声过滤: {image_noise_filtered} 个（纯 OCR 标注切片）")
         if filtered_count > 0:
-            logger.info(f"🧹 低关键词分过滤: {filtered_count} 个（score < 0.05）")
+            logger.info(f"🧹 低关键词分过滤: {filtered_count} 个")
+
+        # 🔴 安全网：全部被过滤 → 恢复向量 Top-3（防止 LLM 空上下文幻觉）
+        if not kept_docs:
+            logger.warning("⚠️  过滤后 kept_docs 为空！恢复向量 Top-3 保底")
+            _fallback = search_similar_with_threshold(
+                vector_store, query, k=3, threshold=None, product_id=product_id,
+            )
+            kept_docs = list(_fallback) if _fallback else []
 
         # 第 3 步：BM25 关键词检索（精确函数名匹配，零显存开销）
         bm25_results = []
@@ -2225,9 +2372,60 @@ def _hybrid_retrieve(
             # 按 RRF 得分降序排列
             fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
 
+            # ── 🔴 v3.0 Entity Anchor 实体强锚定重排 ──
+            # 提取 query 中的具体数字和专有名词，对物理包含这些实体的切片置顶
+            _query_anchors = set()
+            for _m in re.finditer(r'\b(\d{2,})\b', query):
+                _query_anchors.add(_m.group(1))
+            for _m in re.finditer(
+                r'(?:Modbus|Profinet|EtherCAT|TCP|RTU|RS485|RS232|'
+                r'波特率|端口号|IP地址|寄存器|从站|主站|末端传感器)',
+                query, re.IGNORECASE,
+            ):
+                _query_anchors.add(_m.group(0).lower())
+
+            if _query_anchors:
+                _anchor_boost = 0.05
+                _boosted_count = 0
+                for _doc_id, _score in fused:
+                    _doc_content = doc_map.get(_doc_id, None)
+                    if _doc_content is None:
+                        continue
+                    _text = _doc_content.page_content.lower() if hasattr(_doc_content, 'page_content') else str(_doc_content).lower()
+                    for _anchor in _query_anchors:
+                        if _anchor.lower() in _text:
+                            rrf_scores[_doc_id] += _anchor_boost
+                            _boosted_count += 1
+                            break
+                if _boosted_count:
+                    logger.info(f"  ⚓ Entity Anchor: {len(_query_anchors)} 锚点 → {_boosted_count} chunks boost")
+                fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+
+            # ── Fix 1: function_names 元数据 boost ──
+            # 利用 v4 child chunk 的 function_names 结构化字段做精确函数名加权
+            if _query_code_entities:
+                _fn_boost = 0.08  # 函数名匹配加权 > 普通锚点
+                _fn_boosted = 0
+                for _doc_id, _score in fused:
+                    _doc = doc_map.get(_doc_id, None)
+                    if _doc is None:
+                        continue
+                    _meta_fn = ""
+                    if hasattr(_doc, 'metadata'):
+                        _meta_fn = _doc.metadata.get("function_names", "")
+                    if _match_function_names(_meta_fn, _query_code_entities):
+                        rrf_scores[_doc_id] += _fn_boost
+                        _fn_boosted += 1
+                if _fn_boosted:
+                    logger.info(
+                        f"  🔧 Function Names Boost: {len(_query_code_entities)} entities → "
+                        f"{_fn_boosted} chunks boosted"
+                    )
+                fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+
             # 🔪 Autocut 动态截断：检测 RRF 分数断崖点，自适应确定最佳 K
             rrf_score_list = [score for _, score in fused]
-            autocut_k = _autocut_knee(rrf_score_list)
+            autocut_k = _autocut_knee(rrf_score_list, max_k=k)
             top_docs = [doc_map[doc_id] for doc_id, _ in fused[:autocut_k]]
 
             logger.info(
@@ -2432,8 +2630,36 @@ def rag_chat(
         logger.critical("❌ Prompt 构建失败且 Layer 3 也未产出内容 → 终极兜底")
         return _hard_refusal_response()
 
-    # 🔴 数字请求无上下文硬防护 + 第二机会直接文本搜索
+    # 🔴 数字请求无上下文硬防护 + KV 属性检索 + 第二机会直接文本搜索
     if _last_numeric_context_missing:
+        # ── 第零机会: KV 属性存储检索 (ADR-13) ──
+        # 在硬拒答前，先查离线提取的结构化属性（端口号、密码、波特率等）
+        _kv_resolved = False
+        try:
+            from .kv_extractor import lookup_attribute as _kv_lookup
+            _kv_result = _kv_lookup(query, product_id=product_id)
+            if _kv_result:
+                logger.info(f"✅ KV 属性检索命中 → 注入 Context: {_kv_result}")
+                # 🔴 将 KV 结果作为高优先级事实注入 system prompt 而不是普通 context
+                _kv_fact = (
+                    f"\n\n【⚠️ 系统属性库 — 高优先级已知事实，优先于检索结果】\n"
+                    f"{_kv_result}\n"
+                )
+                _system_msg_idx = None
+                for _i, _m in enumerate(messages):
+                    if _m["role"] == "system":
+                        _system_msg_idx = _i
+                        break
+                if _system_msg_idx is not None:
+                    messages[_system_msg_idx]["content"] = (
+                        _kv_fact + messages[_system_msg_idx]["content"]
+                    )
+                _last_numeric_context_missing = False
+                _kv_resolved = True
+        except Exception as _kv_err:
+            logger.debug(f"KV 属性检索跳过: {_kv_err}")
+
+    if _last_numeric_context_missing and not _kv_resolved:
         # 第二机会：Query 中的数字可能在 OCR 切片中（向量排名低但 BM25 文本匹配强）
         _query_nums = re.findall(r'\b(\d{2,})\b', query)
         _found_second_chance = False
@@ -2704,7 +2930,26 @@ def rag_chat_stream(
         yield from _hard_refusal_stream()
         return
 
-    # 🔴 数字请求无上下文硬防护（流式版）+ 第二机会直接文本搜索
+    # 🔴 数字请求无上下文硬防护（流式版）+ KV 属性检索 + 第二机会直接文本搜索
+    if _last_numeric_context_missing:
+        # ── 第零机会: KV 属性存储检索 (ADR-13) ──
+        try:
+            from .kv_extractor import lookup_attribute as _kv_lookup_s
+            _kv_result_s = _kv_lookup_s(query, product_id=product_id)
+            if _kv_result_s:
+                logger.info(f"✅ KV 属性检索命中（流式）→ 注入 Context: {_kv_result_s}")
+                _kv_doc_s = Document(
+                    page_content=_kv_result_s,
+                    metadata={"source": "kv_attribute_store", "product_id": product_id or "?"},
+                )
+                context_docs.insert(0, _kv_doc_s)
+                try:
+                    messages = _build_messages(query, context_docs, chat_history)
+                    _last_numeric_context_missing = False
+                except Exception:
+                    pass
+        except Exception:
+            pass
     if _last_numeric_context_missing:
         _query_nums = re.findall(r'\b(\d{2,})\b', query)
         for _num in _query_nums:

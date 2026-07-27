@@ -1,0 +1,134 @@
+{
+  "description": "RAG v4 统一回归评测用例集 — 合并所有旧测试脚本 (GT + robot + human + multidoc)",
+  "version": "4.2",
+  "cases": [
+    {
+      "id": "GT-1", "category": "数字参数·GT", "query": "JAKA端口号是多少",
+      "product_id": "JAKA", "must_contain": ["6502"], "must_not_contain": ["49152", "502"],
+      "description": "JAKA Modbus端口号必须是6502，严禁将49152当端口"
+    },
+    {
+      "id": "GT-2", "category": "操作流程·GT", "query": "JAKA怎么上电",
+      "product_id": "JAKA", "must_contain": ["电控柜", "使能"],
+      "must_not_contain": ["两个启动按钮"], "description": "JAKA上电步骤必须含电控柜/使能，严禁脑补按钮"
+    },
+    {
+      "id": "GT-3", "category": "SDK函数·GT", "query": "OpenC3 机械臂在 SDK 中走直线的函数名是什么",
+      "product_id": "OpenC3", "must_contain": ["robot_movl"],
+      "must_not_contain": ["move_linear", "robot_movc是"],
+      "description": "OpenC3走直线API必须是robot_movl，严禁伪API或输出movc当直线"
+    },
+    {
+      "id": "GT-4", "category": "跨产品·GT", "query": "OpenC3 和 OpenR6 上电调用的 SDK 函数有什么区别",
+      "product_id": null, "must_contain": ["collrob_sdk", "py_dll"],
+      "must_not_contain": [],
+      "description": "多产品SDK对比 — 两份文档DLL必须同时出现"
+    },
+    {
+      "id": "GT-5", "category": "运行环境·GT", "query": "JAKA 机械臂的运行环境与硬件配置要求",
+      "product_id": "JAKA", "must_contain": ["Windows", "Android"],
+      "must_not_contain": [], "description": "JAKA运行环境 — 必须含操作系统信息"
+    },
+    {
+      "id": "GT-6", "category": "数字参数·GT", "query": "6502这个数字在JAKA中是什么意思",
+      "product_id": "JAKA", "must_contain": ["端口"],
+      "must_not_contain": ["系统变量"],
+      "description": "6502概念精准 — 必须关联端口，严禁胡诌系统变量"
+    },
+    {
+      "id": "E01", "category": "产品路由", "query": "请问上电函数怎么写？",
+      "product_id": null, "expect_clarification": true,
+      "must_contain": ["OpenR6", "OpenC3"], "must_not_contain": ["ctypes.CDLL"],
+      "description": "未指定产品 — 必须反问澄清，绝不盲猜代码"
+    },
+    {
+      "id": "E02", "category": "SDK函数", "query": "OpenR6 SDK 里的上电和回零函数怎么写？",
+      "product_id": null, "must_contain": ["set_robot_power_on", "set_robot_arm_home"],
+      "must_not_contain": ["collrob_sdk", "robot_Power_on"],
+      "description": "OpenR6 必须包含 py_dll 系上电/回零函数"
+    },
+    {
+      "id": "E03", "category": "SDK函数", "query": "collrob_sdk 里面 movl 怎么用？",
+      "product_id": null, "must_contain": ["robot_movl", "POSE"],
+      "must_not_contain": ["set_move_line", "py_dll"],
+      "description": "OpenC3 movl 必须 robot_movl + POSE，不串到 OpenR6"
+    },
+    {
+      "id": "E04", "category": "SDK函数", "query": "OpenC3 六轴机械臂打开抱闸和使能的函数是什么？",
+      "product_id": null, "must_contain": ["brkopen", "enable"],
+      "must_not_contain": ["set_robot_power_on", "py_dll", "robot_Power_on("],
+      "description": "OpenC3 抱闸+使能(robot_brkopen/robot_enable)，不得出现OpenR6函数"
+    },
+    {
+      "id": "E05", "category": "数字参数", "query": "JAKA 机器人做 Modbus TCP 服务器时默认端口号是多少？",
+      "product_id": "JAKA", "must_contain": ["6502"],
+      "must_not_contain": ["502", "8080"], "description": "JAKA Modbus 端口 6502，不得编造 502"
+    },
+    {
+      "id": "E06", "category": "数字参数", "query": "JAKA 软件登录时管理员的默认密码是多少？",
+      "product_id": "JAKA", "must_contain": ["jakazuadmin"],
+      "must_not_contain": ["123456", "password"],
+      "description": "JAKA 管理员密码 jakazuadmin，不得编造通用密码"
+    },
+    {
+      "id": "E07", "category": "数字参数", "query": "JAKA 机器人初始化波特率 9600 用于什么通信？",
+      "product_id": "JAKA", "must_contain": ["Modbus", "RTU"],
+      "must_not_contain": [],
+      "description": "波特率 9600 → Modbus RTU 通信"
+    },
+    {
+      "id": "E08", "category": "防幻觉·APP", "query": "JAKA 怎么版本升级？",
+      "product_id": "JAKA", "must_contain": ["APP", "升级"],
+      "must_not_contain": ["ctypes", "CDLL", "py_dll", "collrob_sdk", "robot_version"],
+      "description": "JAKA版本升级是APP UI操作，严禁臆造ctypes代码"
+    },
+    {
+      "id": "E09", "category": "防幻觉", "query": "JAKA 的 set_robot_power_on 函数怎么用？",
+      "product_id": "JAKA", "must_contain": ["未包含", "未记载"],
+      "must_not_contain": ["```python", "ctypes", "CDLL"],
+      "description": "JAKA无set_robot_power_on — 必须拒答，不准编造代码"
+    },
+    {
+      "id": "E10", "category": "SDK函数", "query": "OpenR6 获取所有关节角度",
+      "product_id": null, "must_contain": ["get_robot_joint_angle_all"],
+      "must_not_contain": ["get_robot_joint_all", "collrob"],
+      "description": "OpenR6关节角度函数 — 不得串到OpenC3"
+    },
+    {
+      "id": "E11", "category": "操作流程", "query": "JAKA 机械臂关机和断电的正确顺序是什么？",
+      "product_id": "JAKA", "must_contain": ["关机", "断电"],
+      "must_not_contain": ["ctypes", "CDLL"],
+      "description": "JAKA关机流程是APP操作，不涉及ctypes代码"
+    },
+    {
+      "id": "E12", "category": "操作流程", "query": "JAKA 机器人 TCP 四点法设置步骤是什么？",
+      "product_id": "JAKA", "must_contain": ["四点法", "TCP"],
+      "must_not_contain": ["collrob_sdk", "py_dll"],
+      "description": "JAKA TCP校准 — 不串入SDK代码"
+    },
+    {
+      "id": "E13", "category": "防幻觉·APP", "query": "JAKA 安全区域如何设置？",
+      "product_id": "JAKA", "must_contain": ["安全区域"],
+      "must_not_contain": ["ctypes", "CDLL", "未详细记载具体的SDK函数"],
+      "description": "JAKA安全区域是APP界面操作，绝不套SDK拒答模版"
+    },
+    {
+      "id": "E14", "category": "防幻觉·APP", "query": "JAKA 怎么配置 Modbus IO？",
+      "product_id": "JAKA", "must_contain": ["Modbus", "IO"],
+      "must_not_contain": ["未详细记载具体的SDK函数", "ctypes", "CDLL"],
+      "description": "JAKA Modbus IO配置是APP操作，提供参数干货，不套SDK拒答"
+    },
+    {
+      "id": "E15", "category": "口语化", "query": "这个机械臂咋上电啊老哥",
+      "product_id": null, "must_contain": ["上电", "电"],
+      "must_not_contain": [],
+      "description": "口语化噪音查询 — 应能正确识别意图并回答"
+    },
+    {
+      "id": "E16", "category": "跨产品", "query": "OpenR6 上电函数怎么写？",
+      "product_id": null, "must_contain": ["set_robot_power_on", "py_dll"],
+      "must_not_contain": ["collrob_sdk", "robot_Power_on"],
+      "description": "OpenR6查询 — 不串到OpenC3"
+    }
+  ]
+}

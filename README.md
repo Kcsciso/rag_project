@@ -20,7 +20,16 @@
 - **产品级物理隔离**（ADR-6）：入库自动打标 → 检索 `where={"product_id":"OpenR6"}` → 未指定时主动反问。
 
 ### 🧠 智能上下文扩展与防幻觉（ADR-9/ADR-10/ADR-11）
-- **LangGraph v2 后处理控制层**（ADR-11）：通用属性对齐节点 (`extract_align_node`) 基于 50+ 物理属性词库 + 正则扫描，自动检测并修正模型输出中的属性词颠倒（如将"端口号 6502"误写为"从站地址 6502"），零特定数字硬编码；SDK 代码自纠错条件环路 (`sdk_verify_node`) 检测 `set_` 前缀/`ctypes.CDLL`/`argtypes` 缺失后触发定向重试（上限 2 次）。
+- **LangGraph v3 Plan-Execute-Synthesize 架构**（ADR-14）：SubGoalPlanner 任务分解 + CrossProductRetrieval 全库检索 + Synthesize 多路融合 + CodeEntityAnchor 代码实体锚定。
+- **v4 切片机制升级**（ADR-15）：API 原子切分 + 标题感知 + Parent-Child 双层索引（70P + 488C，59 个 API 原子块）。
+- **多模态增量更新 + GPU 加速**（ADR-16）：RapidOCR 图片文本抽取 → 切片注入 + MD5 去重 + 级联 Upsert + BM25 动态同步 + GPU 批量嵌入。
+- **检索幻觉修复**（v4.1）：function_names 元数据模糊匹配 + 放宽关键词过滤 + kept_docs 安全网 + `_force_no_code` 防幻觉硬拦截 + 产品自动推断隔离。
+- **Extract-Render 两层分离架构**（ADR-12）：**信息提取模式** — 1.5B 模型只从 Context 提取结构化 JSON 实体，代码/步骤/引用由 Python 确定性渲染器生成，从根源消除伪 API 编造、步骤泛化与引用缺失。
+- **SemanticDedup 语义去重**: trigram overlap 检测段落级重复生成并自动截断。
+- **Multi-Product Intent Classifier**: 多产品对比查询自动拆分检索 + 交错合并。
+- **Entity Anchor 实体锚定重排**: 查询含具体数字/专有词时置顶物理包含切片的 RRF 权重。
+- **ABSTAIN 硬弃答网关**: Context 中实体缺失时直接返回诚实拒答，零 LLM 调用（26ms）。
+- **Contextual Prefixing**: 每个切片注入 `[文档: X | 章节: Y]` 前缀，从物理切片源头隔离参数概念。
 - **父子切片上下文扩展**（Parent-Child Chunking）：检索命中子切片时，自动按章节 ID 捞取同章节兄弟切片，补充完整流程上下文，彻底解决 TCP 四点法、关机步骤等长流程因截断导致总结不完整的问题。
 - **柔性 Grounding 提示**：动态检测 query 中含数字请求（密码/端口/IP），若 Context 中无具体数值则自动追加诚实提示，引导模型明确告知"文档未记载"而非猜测 `admin`、`502` 等通用默认值。
 - **多轮对话 Citation 前缀清洗**：剥离 chat_history 中助理回复的章节溯源长前缀（`根据《X》第 Y.Z 节【...】`），防止后续轮次复读背景幻觉。
@@ -46,11 +55,17 @@
 rag_project/
 ├── src/
 │   ├── config.py              # 全局配置中心 + GPU 智能探测 API
-│   ├── agent_state.py         # LangGraph v2 RAGState 状态定义（14 字段，含后处理控制层）
-│   ├── graph_rag.py           # LangGraph v2 状态图引擎（6 节点 + 3 条件边 + 自纠错环路）
+│   ├── agent_state.py         # LangGraph v3 RAGState（21 字段，PES 架构）
+│   ├── graph_rag.py           # LangGraph v3 状态图引擎（9 节点 + 5 条件边）
+│   ├── attribute_tool.py      # 动态属性意图工具（v3，LLM 提取 + BM25 搜索）
+│   ├── kv_extractor.py        # 离线 KV 属性提取器（phase-out 中）
+│   ├── pdf_loader.py          # v4 PDF 加载器（API 原子切分 + OCR 注入 + Parent-Child）
 │   ├── pdf_loader.py          # PDF 解析与递归字符级文本分块
 │   ├── vector_store.py        # ChromaDB 向量库（HF→ONNX 双轨嵌入）
 │   ├── multimodal_loader.py   # 多模态解析（PyMuPDF + pdfplumber 表格→Markdown）
+│   ├── attribute_tool.py      # 动态属性意图工具（v3）
+│   ├── kv_extractor.py        # 离线 KV 属性提取器
+│   ├── rebuild_v4.py          # v4 向量库重建脚本
 │   └── rag_chain.py           # RAG 四层容灾 + 混合检索 + 口语化预处理 + 安全防御
 ├── templates/
 │   └── index.html             # NewsPage 聊天与文档交互主页面
@@ -207,3 +222,170 @@ export VLLM_GPU_ID=0                                      # 手动指定 GPU
 ## 📝 开发与排错日志
 
 有关环境排查、兼容补丁、四层容灾、GPU 自适应、安全加固、混合检索、人类模拟测试等 20 个章节的详细开发记录与架构决策（ADR），请参阅 [dev_log.md](./dev_log.md)。
+
+经过从 2026-07-20 到 07-24 的多轮迭代，NewsPage RAG 系统已经从早期的“单向线性 RAG 管道”**完全演进为**基于 LangGraph 的“Plan-Execute-Synthesize + Extract-Render”确定性 Agent 状态图架构。
+
+系统彻底废弃了针对特定数字/函数的硬编码补丁，形成了具备**高容灾、多产品隔离、语义精准对齐与确定性代码生成**的产品级 RAG 架构。
+
+---
+
+## 🏛️ 升级后系统整体架构拓扑
+
+整体架构分为**接入防护层**、**LangGraph 智能调度控制层**、**双轨混合检索层**、**确定性渲染层**与**四层金字塔容灾底座**。
+
+```
+                              ┌──────────────────────────────────┐
+                              │  前端 WebUI / FastAPI Gateway    │
+                              │ (输入清洗 / 路径防御 / SSE 异步) │
+                              └────────────────┬─────────────────┘
+                                               │
+                                               ▼
+                              ┌──────────────────────────────────┐
+                              │    第 0 步：Product Router       │
+                              │ (产品意图识别 / 未指定主动反问)  │
+                              └────────────────┬─────────────────┘
+                                               │
+                                               ▼
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                        LangGraph 状态图引擎 (RAGState v3.0)                             │
+│                                                                                        │
+│  ┌──────────────────────┐    ┌───────────────────────┐    ┌──────────────────────────┐ │
+│  │  Sub-Goal Planner    │ ──►│    ABSTAIN Gateway    │ ──►│   Hybrid Retrieval Node  │ │
+│  │ (Map-Reduce 多产品)  │    │  (Context缺失硬弃答)   │    │  (Dense+BM25+Autocut)    │ │
+│  └──────────────────────┘    └───────────────────────┘    └────────────┬─────────────┘ │
+│                                                                        │               │
+│  ┌──────────────────────┐    ┌───────────────────────┐                 │               │
+│  │ Extract-Render Node  │◄───│  llm_generation_node  │◄────────────────┘               │
+│  │(确定性代码/步骤渲染) │    │  (小模型结构化 JSON)  │                                 │
+│  └──────────┬───────────┘    └───────────┬───────────┘                                 │
+│             │                            │ (SDK代码校验失败)                            │
+│             │                            ▼                                             │
+│             │                ┌───────────────────────┐                                 │
+│             │                │    SDK_VerifyNode     │ ──► (回环重试 max_retries=2)     │
+│             │                │  (前缀/CDLL/参数自纠) │                                 │
+│             │                └───────────┬───────────┘                                 │
+│             │                            │                                             │
+│             ▼                            ▼                                             │
+│  ┌───────────────────────────────────────────────────┐                                 │
+│  │                 ExtractAlignNode                  │                                 │
+│  │      (通用物理属性词与数值对齐 / 防属性词颠倒)     │                                 │
+│  └───────────────────────────┬───────────────────────┘                                 │
+└──────────────────────────────┼─────────────────────────────────────────────────────────┘
+                               │
+                               ▼
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                             四层金字塔容灾底座 (Failover)                               │
+│  ┌───────────────────┐  ┌────────────────────┐  ┌──────────────────┐  ┌──────────────┐ │
+│  │ Layer 1: 本地vLLM │─►│ Layer 2: 云端 API  │─►│ Layer 3: 结构化  │─►│ Layer 4: 503 │ │
+│  │  (GPU 智能选择)   │  │ (GLM-4.7-Flash)    │  │ CPU 直出模式     │  │ 友好错误提示 │ │
+│  └───────────────────┘  └────────────────────┘  └──────────────────┘  └──────────────┘ │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+
+```
+
+---
+
+## 🧩 核心模块与架构升级细节
+
+### 1. 核心控制层：LangGraph 状态图与 Agent 工作流
+
+系统核心调度完全基于 `LangGraph` 状态图（`RAGState` 扩展至 14 个控制字段），实现逻辑剥离与决策可逆：
+
+* **Product Router (第 0 步路由)**：
+根据 `PRODUCT_ROUTER_RULES` 自动匹配用户 Query 意图。若未提及产品，不盲目全库搜索，而是触发 `_build_clarification_response()` 主动反问澄清。
+* **Sub-Goal Planner (Map-Reduce 规划器)**：
+当识别到跨产品对比（如 OpenC3 与 OpenR6 对比）时，自动将 Query 拆解为平行子目标，并行触发单库检索后再进行交错融合（Reduce）。
+* **ABSTAIN Gateway (硬弃答网关)**：
+当 Query 中包含的实体在 Context 中完全不存在时，直接触发硬弃答，零开销拦截幻觉，不调用 LLM。
+* **Extract-Render 两层分离架构 (ADR-12)**：
+* **抽取层**：System Prompt 约束 LLM 仅输出结构化 JSON 提取块（包含函数名、参数、步骤原文）。
+* **确定性渲染层**：由 Python 渲染器通过代码模板渲染 Python ctypes 代码、编号步骤与出处引用。避免 1.5B 小模型在自由文本生成时语法错乱。
+
+
+* **后处理自纠错环路 (ADR-11)**：
+* **`SDK_VerifyNode`**：自动扫描生成代码中的 `set_` 前缀缺失、CDLL 加载缺失与 `.argtypes` 声明缺失。未通过时带反馈触发 `llm_generation` 重试（最多 2 次）。
+* **`ExtractAlignNode`**：使用 50+ 领域物理属性词库，扫描数值与其前后 20 字符窗口，强制用 Context 原词修正 LLM 颠倒或篡改的属性词。
+
+
+
+---
+
+### 2. 数据解析与物理隔离机制
+
+* **多模态增强解析 (`multimodal_loader.py`)**：
+结合 `pdfplumber` 表格提取与 `PyMuPDF` 图片 Caption 注入；自动化提取 PDF 中的 C 函数名并执行 Header Injection（`[Functions: xxx]`），提升代码检索敏感度。
+* **动态产品打标与 100% 物理隔离**：
+入库时通过 `PRODUCT_MAPPING_RULES` 自动将切片打上 `product_id` 标签；检索时通过 ChromaDB 的 `where={"product_id": "..."}` 实现物理隔离，杜绝跨产品代码张冠李戴。
+
+---
+
+### 3. 双轨混合检索与上下文工程
+
+* **Code-Aware BM25 分词器**：
+自定义正则在 jieba 分词前预提取 `set_move_line`、`robot_brkopen` 等 C/Python 变量和函数，确保 SDK 接口名不被切碎。
+* **Dense + Sparse RRF 混合检索**：
+向量检索（ChromaDB Cosine）与 BM25 结合，放大 candidate 池后通过 RRF 融合。
+* **Autocut 动态自适应截断**：
+基于 RRF 得分断崖点（Knee Point）自动截断无用切片，将召回数自适应钳制在 2~8 片之间。
+* **父子切片上下文扩展 (Parent-Child Expansion)**：
+提取已命中切片的 `[章节: X.Y.Z]` 标识，自动捞取同章节兄弟切片，解决长步骤跨块被截断的问题。
+* **保底召回机制 (Fallback Retrieval)**：
+当阈值过滤或噪声拦截导致 0 结果时，自动强行保留原始向量 Top-3 切片，不直接硬拦截，确保后续 LLM 读写能力生效。
+
+---
+
+### 4. 四层金字塔容灾底座 (Failover Pyramid)
+
+系统具备应对 GPU 卡死、网络断连、API 限流与向量库异常的全自动平滑降级能力：
+
+| 容灾层级 | 运行环境 | 触发条件 | 输出形式 |
+| --- | --- | --- | --- |
+| **Layer 1: 本地 vLLM** | GPU (Qwen2.5-1.5B/7B) | 主通道健康且获得线程锁 | 智能对话 + 完整代码渲染 |
+| **Layer 2: 云端 API** | Cloud (智谱 GLM-4.7-Flash) | 本地 vLLM 超时 (2s/12s)、OOM 或未启动 | 无缝无感切换云端 LLM 输出 |
+| **Layer 3: 结构化直出** | CPU-Only (零显存/零 API 费) | vLLM 与云端 API 均不可用 | 智能提取函数/参数/示例，Markdown 结构化直出 |
+| **Layer 4: 优雅错误** | API Gateway | 向量库损坏等极端故障 | 503 HTTP 响应 + 中文友好提示 JSON |
+
+---
+
+### 5. 基础设施、安全与运维工具链
+
+* **智能 GPU 动态探测**：`start_services.sh` 与 `src/config.py` 实时扫描所有 GPU 空闲显存，自动绑定空闲显存最大的 GPU 节点（如自动识别绑定 GPU 0 或 GPU 1）。
+* **纵深防御安全体系**：
+* 路径遍历清洗（`sanitize_filename`）；
+* Prompt 注入启发式检测（防 DAN 越狱、角色扮演、指令覆盖）；
+* Null 字节与控制字符清洗（`sanitize_query`）。
+
+
+* **异步非阻塞 SSE 与并发保护**：
+* 使用 `asyncio.Queue` (maxsize=256) 隔离线程池与主事件循环；
+* `_vllm_lock` 互斥锁防止 GPU 多线程并发 OOM；
+* 客户端断开自动捕获 `CancelledError` 停止 GPU 算力浪费。
+
+
+* **运维工具链**：
+* `check_status.py`：实时服务健康检查与 GPU 显存/温度轮询（v4 支持双索引统计）；
+* `start_services.sh`：一键自动探测 GPU、检查端口并拉起服务（含端口冲突自动修复）；
+* `rebuild_v4.py`：v4 Parent-Child 双索引向量库离线重建脚本。
+
+---
+
+## 🏗️ 企业级架构审查
+
+完整审查报告见 **[ARCHITECTURE_REVIEW.md](ARCHITECTURE_REVIEW.md)**（评分 B+/82）。
+
+### 核心发现
+
+| 等级 | 数量 | 关键问题 |
+|------|------|----------|
+| 🔴 P0 安全红线 | 5 | API Key 硬编码泄露、零认证鉴权、文件上传无魔数校验、全局变量并发不安全、SSE 线程泄漏 |
+| 🟡 P1 可靠性 | 6 | 31 处裸 `except Exception`、ChromaDB 连接泄漏、嵌入 GPU 未启用、BM25 无持久化、日志无动态控制、LLM 调用无重试 |
+| 🟢 P2 架构增强 | 10 | 多用户会话、Prometheus 监控、A/B 测试、用户反馈闭环、Docker 化、向量版本管理等 |
+
+### 优先修复路线
+
+| 阶段 | 内容 | 预估 |
+|------|------|------|
+| Week 1 | 删除硬编码 API Key + API 鉴权中间件 + 文件魔数校验 | 3d |
+| Week 2 | 全局状态并发锁 + SSE 线程追踪 + ChromaDB 连接池 | 3d |
+| Week 3 | 异常处理规范化 + 嵌入 GPU 修复 + 动态日志 + LLM 超时重试 | 3d |
+| Week 4+ | P2 架构增强（按需选做） | N/A |

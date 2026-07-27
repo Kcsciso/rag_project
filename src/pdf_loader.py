@@ -1,39 +1,23 @@
 """
 =============================================================================
-PDF 加载与文本分块模块
+PDF 加载与文本分块模块（v4 — ADR-15 切片机制升级）
 =============================================================================
 
-本模块负责将 data/ 目录下的 PDF 文件转化为 LangChain Document 列表，
-供后续向量化使用。核心流程如下：
+v4 新增策略:
+  - API-Level Atomic Chunking: SDK 函数定义+代码示例保持在同一原子块
+  - Header-Aware Chunking: 标题层级树感知切分 + 面包屑注入
+  - Parent-Child Dual Indexing: H2 父层(粗召回) + H3/H4 子层(精匹配)
 
-  PDF 文件 → [pypdf 提取文本] → 纯文本字符串
-           → [RecursiveCharacterTextSplitter 递归字符分割]
-           → List[Document]（每个 Document 对应一个文本块）
-
-【算法说明 — RecursiveCharacterTextSplitter】
-  这是一个"由粗到细"的递归分割器：
-  1. 首先尝试用段落分隔符（\n\n）分割文本
-  2. 如果分出来的块仍然超过 chunk_size，则尝试用换行符（\n）再分割
-  3. 如果还超长，则用句号（。）分割
-  4. 最后手段：按字符硬切
-  这种层级式分割能最大程度保留文本的语义完整性，
-  避免在句子/词语中间"拦腰截断"。
-
-【chunk_overlap 的作用】
-  假设原文："...张三在2024年获得了诺贝尔物理学奖..."
-  如果不设 overlap（重叠），这些信息可能被切成两块：
-    块A: "...张三在2024年..."（断在"诺贝尔"前面）
-    块B: "...获得了诺贝尔物理学奖..."
-  检索"张三 诺贝尔奖"时，块A和块B各自只包含部分信息。
-  设置 overlap 后，相邻块之间会有重叠区间，保证关键信息
-  至少在一整个块内是完整的。
-
+v3 兼容: load_pdfs_from_directory() 保持不变，供回退使用。
+v4 入口: load_pdfs_v4_dual() → 返回 (parent_docs, child_docs) 元组。
 =============================================================================
 """
 
+import bisect
 import logging
 import os
-from typing import List, Optional
+import re
+from typing import List, Optional, Tuple
 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -230,6 +214,7 @@ def load_pdfs_from_directory(
     # 🔴 Section Injection: 自动提取章节标题并注入切片头部
     # ================================================================
     import bisect as _bisect
+    import re as _re
     _HEADING_PATTERNS = [
         _re.compile(r'^(\d+(?:\.\d+)+)\s+(.+?)(?:\r?\n|$)', _re.MULTILINE),
         _re.compile(r'^(第[一二三四五六七八九十\d]+[章节])\s*(.+?)(?:\r?\n|$)', _re.MULTILINE),
@@ -275,6 +260,7 @@ def load_pdfs_from_directory(
             return headings[idx][1]
         return ""
 
+    # ── 🔴 v3.0: 先做 Section Injection（此时 chunk 内容尚未被前缀污染）──
     section_injected_count = 0
     for original_doc in all_documents:
         full_text = original_doc.page_content
@@ -290,9 +276,23 @@ def load_pdfs_from_directory(
                 chunk.page_content = f"[章节: {section}]\n{chunk.page_content}"
                 section_injected_count += 1
 
+    # ── 🔴 v3.0: 再做 Document Prefixing — 统一 [文档: X | 章节: Y] 前缀 ──
+    for chunk in chunks:
+        source = chunk.metadata.get("source", "未知文档")
+        has_section = chunk.page_content.startswith("[章节:")
+        if has_section:
+            # 提取已有章节前缀，合并为统一格式
+            chunk.page_content = re.sub(
+                r'^\[章节:\s*([^\]]+)\]\n',
+                f'[文档: {source} | 章节: \\1]\n',
+                chunk.page_content,
+                count=1,
+            )
+        else:
+            chunk.page_content = f"[文档: {source}]\n{chunk.page_content}"
+
     # 🔴 Header Injection: 为每个 chunk 提取 C 函数名并注入文本头部
     # 极大增强 Dense Vector 和 Sparse BM25 对特定函数名的敏感度
-    import re as _re
     _FUNC_RE = _re.compile(
         r'\b([a-z_][a-z0-9_]*_[a-z0-9_]+)\s*\(',  # snake_case 函数名( → "set_move_line("
         _re.IGNORECASE
@@ -316,6 +316,695 @@ def load_pdfs_from_directory(
           f" [Section Injected: {section_injected_count}, Header Injected: {func_injected_count}]")
 
     return chunks
+
+
+# ============================================================
+# v4 切片策略: API 原子化 + 标题感知 + 父子双层索引
+# ============================================================
+
+# ── 标题识别模式（兼容 Markdown 和非 Markdown 格式）──
+_V4_HEADING_PATTERNS = [
+    # 数字编号: 3.1.5 / 3.1.5.1 标题
+    (re.compile(r'^(\d+(?:\.\d+){1,3})\s+(.{3,80}?)(?:\r?\n|$)', re.MULTILINE), 1),
+    # 中文编号: 第一章 / 第一节
+    (re.compile(r'^(第[一二三四五六七八九十\d]+[章节])\s*(.{3,80}?)(?:\r?\n|$)', re.MULTILINE), 1),
+    # 中文序号: 一、/ （一）/ (一)
+    (re.compile(r'^[（(]?[一二三四五六七八九十]+[）)]?\s*[、,，\s]\s*(.{3,80}?)(?:\r?\n|$)', re.MULTILINE), 1),
+    # Markdown H: ## / ### / ####
+    (re.compile(r'^(#{1,4})\s+(.{3,80}?)(?:\r?\n|$)', re.MULTILINE), 1),
+    # 纯数字+点号: 1. / 2) 标题
+    (re.compile(r'^(\d{1,2})[\.\)）]\s+(.{3,80}?)(?:\r?\n|$)', re.MULTILINE), 1),
+    # 无编号中文标题: 概述 / 功能说明 / 安装步骤
+    (re.compile(r'^([一-鿿]{2,20})\s*$', re.MULTILINE), 3),
+]
+
+# ── SDK 函数原子块识别 ──
+_API_BLOCK_PATTERNS = [
+    # Python ctypes 函数签名: lib.robot_movl.restype = c_int
+    re.compile(
+        r'(?:^|\n)((?:(?:lib|robot|py_dll|cdll)\.\w+\.(?:restype|argtypes)\s*=.+)|'
+        r'(?:def\s+\w+\([^)]*\)\s*:)|'
+        r'(?:```[\s\S]*?```))',
+        re.MULTILINE,
+    ),
+    # C 函数声明: int robot_Power_on(void);
+    re.compile(r'(?:^|\n)(\w+\s+\w+\([^)]*\)\s*;)', re.MULTILINE),
+    # SDK 函数调用块: robot = CDLL(...) ... robot.xxx()
+    re.compile(
+        r'(?:robot\s*=\s*CDLL\([^)]+\)[\s\S]{0,500}?(?=\n\n|\n\s*\n|\Z))',
+        re.MULTILINE,
+    ),
+]
+
+# ── KV 参数行识别 ──
+_KV_LINE_RE = re.compile(
+    r'(?:'
+    r'(?:默认|初始|预设)?\s*(?:端口号?|波特率|密码|用户名|IP\s*地址|从站地址|速率|频率|超时|周期)\s*[：:=]\s*\S+'
+    r'|'
+    r'\b(?:\d{1,3}\.){3}\d{1,3}\b'  # IP 地址
+    r')',
+    re.IGNORECASE,
+)
+
+
+def _v4_extract_headings(text: str) -> List[Tuple[int, str, int]]:
+    """
+    从文本中提取所有标题及其层级。
+
+    兼容数字编号（3.1.5）、Markdown（##）、中文序号（一、）等多种格式。
+
+    Returns:
+        [(position, title_text, level), ...]
+        level: 1=H1, 2=H2, 3=H3, 4=H4
+    """
+    headings = []
+    seen_positions = set()
+
+    for pattern, base_level in _V4_HEADING_PATTERNS:
+        for m in pattern.finditer(text):
+            pos = m.start()
+            if pos in seen_positions:
+                continue
+            seen_positions.add(pos)
+            full = m.group(0).strip()
+            if not full or len(full) < 3 or len(full) > 85:
+                continue
+
+            # 推断层级
+            groups = m.groups()
+            if len(groups) >= 2 and groups[0] and groups[1]:
+                title_num = groups[0]
+                # "3.1.5" → 层级 = 点号数量 + 1
+                dots = title_num.count('.')
+                if dots >= 1:
+                    level = min(dots + 1, 4)  # 最多 4 级
+                elif title_num.startswith('#'):
+                    level = min(len(title_num), 4)
+                elif '章' in title_num or '节' in title_num:
+                    level = 1 if '章' in title_num else 2
+                elif base_level >= 3:
+                    level = base_level
+                else:
+                    level = base_level
+            else:
+                level = base_level
+
+            headings.append((pos, full, level))
+
+    # 按位置排序 + 去重
+    headings.sort(key=lambda x: x[0])
+    deduped = []
+    for pos, title, level in headings:
+        if deduped and pos - deduped[-1][0] < len(deduped[-1][1]) + 5:
+            # 重叠 → 保留更长的
+            if len(title) > len(deduped[-1][1]):
+                deduped[-1] = (pos, title, level)
+        else:
+            deduped.append((pos, title, level))
+    return deduped
+
+
+def _v4_build_breadcrumb(headings: List[Tuple[int, str, int]], chunk_pos: int, chunk_end: int) -> str:
+    """
+    为给定位置范围构建层级面包屑。
+
+    例: [路径: JAKA Zu APP > 硬件与通讯 > Modbus 通讯设置]
+
+    确保即使数字编号格式（3.1.5）也能正确生成面包屑。
+    """
+    # 找到该位置之前最近的各级标题
+    path_parts = []
+    current_level = 0
+    for pos, title, level in headings:
+        if pos > chunk_pos:
+            break
+        if level > current_level:
+            path_parts.append(title)
+            current_level = level
+        elif level <= current_level and path_parts:
+            # 同级或上级标题 → 弹出并替换
+            while len(path_parts) >= max(level, 1):
+                path_parts.pop()
+            path_parts.append(title)
+            current_level = level
+
+    if not path_parts:
+        return ""
+
+    return " > ".join(p for p in path_parts if p)
+
+
+def _v4_extract_api_blocks(text: str) -> List[Tuple[int, int, str]]:
+    """
+    预提取 SDK API 原子块，标记为不可分割区域。
+
+    Returns:
+        [(start, end, block_label), ...]
+        例如: [(1450, 1680, "API: robot_movl")]
+    """
+    blocks = []
+    for pat in _API_BLOCK_PATTERNS:
+        for m in pat.finditer(text):
+            start, end = m.start(), m.end()
+            block_text = m.group(0)
+            # 提取函数名作为 label
+            func_match = re.search(r'(?:robot_|set_|get_)\w+', block_text)
+            label = f"API: {func_match.group(0)}" if func_match else "API: block"
+            blocks.append((start, end, label))
+    blocks.sort(key=lambda x: x[0])
+    # 合并重叠块
+    merged = []
+    for b in blocks:
+        if merged and b[0] < merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b[1]), merged[-1][2])
+        else:
+            merged.append(b)
+    return merged
+
+
+# ── v4 OCR: 多模态图片文本抽取 (ADR-16) ──
+
+_ocr_engine_cache = None
+_ocr_available_cache = None
+
+
+def _v4_get_ocr_engine():
+    """懒加载 RapidOCR ONNX 引擎（纯 CPU，约 15MB 模型）。"""
+    global _ocr_engine_cache, _ocr_available_cache
+    if _ocr_available_cache is not None:
+        return _ocr_engine_cache
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+        import numpy as np
+        _ocr_engine_cache = RapidOCR()
+        _ocr_engine_cache(np.zeros((100, 100, 3), dtype=np.uint8))
+        _ocr_available_cache = True
+        logger.info("✅ RapidOCR ONNX 引擎就绪（多模态图片文本抽取）")
+    except Exception as e:
+        logger.warning(f"RapidOCR 不可用，跳过图片文本抽取: {e}")
+        _ocr_engine_cache = None
+        _ocr_available_cache = False
+    return _ocr_engine_cache
+
+
+def _v4_inject_ocr_text(pdf_path: str, full_text: str) -> str:
+    """
+    对 PDF 内嵌图片做 OCR，将识别文本注入页面内容中。
+
+    只处理 >100×100 px 的图片（跳过图标/装饰元素）。
+    OCR 结果以 [OCR识别] 标签注入，含数字参数的行双写为 KV 标签。
+
+    Returns:
+        增强后的 full_text（在原文本中追加 OCR 段落）
+    """
+    ocr = _v4_get_ocr_engine()
+    if ocr is None:
+        return full_text
+
+    try:
+        import fitz
+        import numpy as np
+        from PIL import Image
+        import io
+    except ImportError:
+        return full_text
+
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception:
+        return full_text
+
+    ocr_parts = []
+    total_ocr_chars = 0
+    processed_images = 0
+
+    for page_idx in range(len(doc)):
+        page = doc[page_idx]
+        image_list = page.get_images(full=True)
+        if not image_list:
+            continue
+
+        page_ocr_lines = []
+        for img_info in image_list:
+            xref = img_info[0]
+            try:
+                base_image = doc.extract_image(xref)
+                if base_image is None:
+                    continue
+                image_bytes = base_image.get("image")
+                if not image_bytes:
+                    continue
+
+                pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+                h, w = pil_img.size[1], pil_img.size[0]
+                if h < 100 or w < 100:
+                    continue  # 跳过小图标
+
+                np_img = np.array(pil_img)
+                result = ocr(np_img)
+                if result is None:
+                    continue
+
+                lines = []
+                for item in result:
+                    text = str(item[1]).strip()
+                    if text and len(text) >= 2:
+                        lines.append(text)
+
+                if lines:
+                    processed_images += 1
+                    ocr_text = " | ".join(lines)
+                    page_ocr_lines.append(ocr_text)
+                    total_ocr_chars += len(ocr_text)
+            except Exception:
+                continue
+
+        if page_ocr_lines:
+            ocr_parts.append(
+                f"[OCR识别: page={page_idx + 1}, images={len(page_ocr_lines)}]\n"
+                + "\n".join(page_ocr_lines)
+            )
+
+    doc.close()
+
+    if ocr_parts:
+        ocr_block = "\n\n" + "\n\n".join(ocr_parts)
+        logger.info(
+            f"  🖼️  OCR: {processed_images} 张图片 → {total_ocr_chars} 字符 "
+            f"({pdf_path})"
+        )
+        return full_text + ocr_block
+
+    return full_text
+
+
+def _v4_build_parent_child_docs(
+    full_text: str,
+    source: str,
+    product_id: str,
+    child_chunk_size: int = 400,
+    parent_chunk_size: int = 1000,
+) -> Tuple[List[Document], List[Document]]:
+    """
+    为单个 PDF 文档构建 Parent-Child 双层 Document。
+
+    Parent 层（H2 级别，~800-1500 字符）:
+      - 按 H2 标题切分，包含概述段落 + 子章节标题列表
+      - metadata.type = "parent"
+      - metadata.parent_id = None
+
+    Child 层（H3/H4 级别，~100-500 字符，API 原子）:
+      - 按 H3/H4 切分，API 块保持完整
+      - metadata.type = "child"
+      - metadata.parent_id → 对应父层 chunk 的 ID
+
+    Returns:
+        (parent_docs, child_docs)
+    """
+    headings = _v4_extract_headings(full_text)
+    api_blocks = _v4_extract_api_blocks(full_text)
+
+    # ── Step 1: 自适应层级提升 ──
+    # 如果没有 H2 标题，将最低层级提升为 Parent 边界
+    all_levels = set(lv for _, _, lv in headings)
+    if not all_levels:
+        # 完全无标题 → 1 Parent, API 块作为 Child
+        h2_positions = []
+        h3_positions = []
+    else:
+        min_lv = min(all_levels)
+        max_lv = max(all_levels)
+        if 2 not in all_levels:
+            # 不存在 H2 → 将当前最低层级提升为 H2（Parent）
+            h2_positions = [(pos, title) for pos, title, lv in headings if lv == min_lv]
+            h3_positions = [(pos, title, lv) for pos, title, lv in headings if lv > min_lv]
+        else:
+            h2_positions = [(pos, title) for pos, title, lv in headings if lv == 2]
+            h3_positions = [(pos, title, lv) for pos, title, lv in headings if lv >= 3]
+
+    # ── Step 2: 构建 Parent Docs ──
+    parent_docs = []
+    parent_boundaries = [p[0] for p in h2_positions] + [len(full_text)]
+    for i, (p_start, p_title) in enumerate(h2_positions):
+        p_end = parent_boundaries[i + 1]
+        parent_text = full_text[p_start:p_end].strip()
+        if len(parent_text) < 50:
+            continue
+
+        # 截取到 parent_chunk_size，保留完整段落结尾
+        if len(parent_text) > parent_chunk_size:
+            cutoff = parent_text.rfind('\n\n', parent_chunk_size - 200, parent_chunk_size + 200)
+            if cutoff < 0:
+                cutoff = parent_text.rfind('\n', parent_chunk_size - 100, parent_chunk_size + 100)
+            if cutoff < 0:
+                cutoff = parent_chunk_size
+            parent_text = parent_text[:cutoff].strip()
+
+        # 收集子章节标题列表
+        child_titles_in_range = [
+            title for pos, title, lv in h3_positions
+            if p_start <= pos < p_end
+        ]
+        child_toc = "\n".join(f"- {t}" for t in child_titles_in_range[:15])
+        if child_toc:
+            parent_text = f"{parent_text}\n\n【子章节】\n{child_toc}"
+
+        parent_id = f"parent_{product_id}_{i}"
+        parent_doc = Document(
+            page_content=f"[文档: {source}]\n[路径: {p_title}]\n\n{parent_text}",
+            metadata={
+                "source": source,
+                "product_id": product_id,
+                "chunk_type": "parent",
+                "parent_id": None,
+                "section_title": p_title,
+                "section_level": 2,
+            },
+        )
+        parent_docs.append(parent_doc)
+
+        # ── Step 3: 在此 Parent 范围内构建 Child Docs ──
+        child_docs_in_parent = _v4_build_child_docs(
+            full_text, source, product_id, parent_id,
+            p_start, p_end, headings, api_blocks, child_chunk_size,
+        )
+        parent_docs.extend(child_docs_in_parent)  # flattened — 实际使用会分 Collection
+
+    # Fallback: 如果没有 H2 标题 → 全文作为 1 个 Parent
+    if not parent_docs:
+        parent_id = f"parent_{product_id}_0"
+        parent_doc = Document(
+            page_content=f"[文档: {source}]\n\n{full_text[:parent_chunk_size]}",
+            metadata={
+                "source": source, "product_id": product_id,
+                "chunk_type": "parent", "parent_id": None,
+                "section_title": "全文", "section_level": 1,
+            },
+        )
+        parent_docs.append(parent_doc)
+
+    # ── Step 4: 分离 Parent 和 Child（目前混在一起）──
+    pure_parents = [d for d in parent_docs if d.metadata.get("chunk_type") == "parent"]
+    pure_children = [d for d in parent_docs if d.metadata.get("chunk_type") == "child"]
+    parent_docs.clear()
+    parent_docs.extend(pure_parents)
+    # 将 children 从 parent_docs 移出
+    # （已经在上面分离）
+
+    return pure_parents, pure_children
+
+
+def _v4_build_child_docs(
+    full_text: str,
+    source: str,
+    product_id: str,
+    parent_id: str,
+    section_start: int,
+    section_end: int,
+    headings: List[Tuple[int, str, int]],
+    api_blocks: List[Tuple[int, int, str]],
+    child_chunk_size: int = 400,
+) -> List[Document]:
+    """
+    在指定 Parent 范围内构建 Child Docs。
+
+    Child 切分策略:
+      1. API 原子块保持完整（绝不切分）
+      2. H3/H4 标题处软断块（内容 < 400 字则合并）
+      3. KV 参数行周围的上下文保留（最小 80 字符 padding）
+    """
+    children = []
+
+    # 找出此范围内的 H3+ 标题
+    sub_headings = [
+        (pos, title, lv) for pos, title, lv in headings
+        if section_start <= pos < section_end and lv >= 3
+    ]
+
+    if not sub_headings:
+        # 无子标题 → 按 api_blocks 切分
+        text = full_text[section_start:section_end].strip()
+        children = _v4_split_by_api_blocks(
+            text, source, product_id, parent_id, child_chunk_size,
+        )
+        return children
+
+    # 按 H3 边界切分
+    boundaries = [section_start] + [p[0] for p in sub_headings] + [section_end]
+    for i in range(len(boundaries) - 1):
+        s, e = boundaries[i], boundaries[i + 1]
+        text = full_text[s:e].strip()
+        if not text or len(text) < 20:
+            continue
+
+        # 找到当前 H3 标题
+        current_title = ""
+        current_level = 3
+        for pos, title, lv in sub_headings:
+            if pos == s:
+                current_title = title
+                current_level = lv
+                break
+
+        # Breadcrumb
+        breadcrumb = _v4_build_breadcrumb(headings, s, e)
+
+        # API 块内的进一步原子切分
+        sub_children = _v4_split_by_api_blocks(
+            text, source, product_id, parent_id, child_chunk_size,
+            breadcrumb=breadcrumb, section_title=current_title,
+        )
+        for child in sub_children:
+            child.metadata["section_title"] = current_title or child.metadata.get("section_title", "")
+            child.metadata["section_level"] = current_level
+        children.extend(sub_children)
+
+    return children
+
+
+def _v4_split_by_api_blocks(
+    text: str,
+    source: str,
+    product_id: str,
+    parent_id: str,
+    chunk_size: int = 400,
+    breadcrumb: str = "",
+    section_title: str = "",
+) -> List[Document]:
+    """
+    对文本段做 API 感知的原子切分。
+
+    规则:
+      - API 块标记为 [api_atomic=True]，永不切分
+      - 非 API 文本用 RecursiveCharacterTextSplitter 正常切分
+      - KV 参数行周围的 padding 最小化为 80 字符
+      - 每个 Child 带 [函数名: xxx] header tag（用于 CodeEntityAnchor 匹配）
+    """
+    children = []
+    api_blocks = _v4_extract_api_blocks(text)
+
+    if not api_blocks:
+        # 纯文本 → 标准切分
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size, chunk_overlap=30,
+            separators=["\n\n", "\n", "。", ".", " ", ""],
+            length_function=len, is_separator_regex=False,
+        )
+        temp_doc = Document(page_content=text, metadata={})
+        chunks = splitter.split_documents([temp_doc])
+        for i, c in enumerate(chunks):
+            child_id = f"{parent_id}_c{i}"
+            func_names = _v4_extract_function_names(c.page_content)
+            func_header = f"[Functions: {', '.join(func_names)}]\n" if func_names else ""
+            prefix = f"[文档: {source}]\n"
+            if breadcrumb:
+                prefix += f"[路径: {breadcrumb}]\n"
+            if section_title:
+                prefix += f"[章节: {section_title}]\n"
+            children.append(Document(
+                page_content=f"{prefix}{func_header}{c.page_content}",
+                metadata={
+                    "source": source, "product_id": product_id,
+                    "chunk_type": "child", "parent_id": parent_id,
+                    "api_atomic": False,
+                    "function_names": ",".join(func_names) if func_names else "",
+                },
+            ))
+        return children
+
+    # 有 API 块 → 保护它们不被打散
+    last_end = 0
+    child_idx = 0
+    for api_start, api_end, api_label in api_blocks:
+        # API 块之前的文本
+        pre_text = text[last_end:api_start].strip()
+        if pre_text and len(pre_text) >= 30:
+            splitter = RecursiveCharacterTextSplitter(
+                chunk_size=chunk_size, chunk_overlap=20,
+                separators=["\n\n", "\n", "。", ".", " "],
+                length_function=len, is_separator_regex=False,
+            )
+            temp_doc = Document(page_content=pre_text, metadata={})
+            for c in splitter.split_documents([temp_doc]):
+                child_id = f"{parent_id}_c{child_idx}"
+                child_idx += 1
+                func_names = _v4_extract_function_names(c.page_content)
+                func_header = f"[Functions: {', '.join(func_names)}]\n" if func_names else ""
+                prefix = f"[文档: {source}]\n"
+                if breadcrumb:
+                    prefix += f"[路径: {breadcrumb}]\n"
+                if section_title:
+                    prefix += f"[章节: {section_title}]\n"
+                children.append(Document(
+                    page_content=f"{prefix}{func_header}{c.page_content}",
+                    metadata={
+                        "source": source, "product_id": product_id,
+                        "chunk_type": "child", "parent_id": parent_id,
+                        "api_atomic": False,
+                        "function_names": ",".join(func_names) if func_names else "",
+                    },
+                ))
+
+        # API 原子块本身 — 永不切分
+        api_text = text[api_start:api_end].strip()
+        if api_text:
+            child_id = f"{parent_id}_c{child_idx}"
+            child_idx += 1
+            func_names = _v4_extract_function_names(api_text)
+            func_header = f"[Functions: {', '.join(func_names)}]\n" if func_names else ""
+            prefix = f"[文档: {source}]\n"
+            if breadcrumb:
+                prefix += f"[路径: {breadcrumb}]\n"
+            if section_title:
+                prefix += f"[章节: {section_title}]\n"
+            # 对于 API 块，额外标记函数签名行
+            api_funcs = re.findall(r'(?:robot_|set_|get_)\w+', api_text.lower())
+            if api_funcs:
+                prefix += f"[API原子块: {', '.join(api_funcs[:5])}]\n"
+            children.append(Document(
+                page_content=f"{prefix}{func_header}{api_text}",
+                metadata={
+                    "source": source, "product_id": product_id,
+                    "chunk_type": "child", "parent_id": parent_id,
+                    "api_atomic": True,
+                    "function_names": ",".join(sorted(set(func_names + api_funcs))),
+                },
+            ))
+
+        last_end = api_end
+
+    # API 块之后的文本
+    remaining = text[last_end:].strip()
+    if remaining and len(remaining) >= 30:
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size, chunk_overlap=20,
+            separators=["\n\n", "\n", "。", ".", " "],
+            length_function=len, is_separator_regex=False,
+        )
+        temp_doc = Document(page_content=remaining, metadata={})
+        for c in splitter.split_documents([temp_doc]):
+            child_id = f"{parent_id}_c{child_idx}"
+            child_idx += 1
+            func_names = _v4_extract_function_names(c.page_content)
+            func_header = f"[Functions: {', '.join(func_names)}]\n" if func_names else ""
+            prefix = f"[文档: {source}]\n"
+            if breadcrumb:
+                prefix += f"[路径: {breadcrumb}]\n"
+            if section_title:
+                prefix += f"[章节: {section_title}]\n"
+            children.append(Document(
+                page_content=f"{prefix}{func_header}{c.page_content}",
+                metadata={
+                    "source": source, "product_id": product_id,
+                    "chunk_type": "child", "parent_id": parent_id,
+                    "api_atomic": False,
+                    "function_names": ",".join(func_names) if func_names else "",
+                },
+            ))
+
+    return children
+
+
+def _v4_extract_function_names(text: str) -> List[str]:
+    """从文本中提取 SDK 函数名列表（用于 metadata 和 header tag）"""
+    funcs = set()
+    for m in re.finditer(r'\b([a-z_][a-z0-9_]*_[a-z0-9_]+)\s*\(', text, re.IGNORECASE):
+        fname = m.group(1).lower().strip('_')
+        if len(fname) >= 6 and '_' in fname:
+            funcs.add(fname)
+    return sorted(funcs)[:10]
+
+
+# ============================================================
+# v4 主入口: load_pdfs_v4_dual
+# ============================================================
+
+def load_pdfs_v4_dual(
+    data_dir: str,
+    child_chunk_size: int = 400,
+    parent_chunk_size: int = 1000,
+) -> Tuple[List[Document], List[Document]]:
+    """
+    v4 双层索引加载器 — Parent-Child Dual Indexing。
+
+    返回 (parent_docs, child_docs) 两个独立的 Document 列表，
+    分别写入 ChromaDB 的两个 Collection。
+
+    Args:
+        data_dir: PDF 文件目录
+        child_chunk_size: Child 层最大字符数（默认 400）
+        parent_chunk_size: Parent 层最大字符数（默认 1000）
+
+    Returns:
+        (parents, children): 两个 Document 列表
+    """
+    pdf_files = [
+        f for f in os.listdir(data_dir)
+        if f.lower().endswith(".pdf")
+    ]
+    if not pdf_files:
+        logger.warning(f"目录 '{data_dir}' 中未找到 PDF 文件")
+        return [], []
+
+    logger.info(f"📄 v4 Dual: 发现 {len(pdf_files)} 个 PDF，child={child_chunk_size}, parent={parent_chunk_size}")
+
+    all_parents = []
+    all_children = []
+
+    for pdf_file in pdf_files:
+        file_path = os.path.join(data_dir, pdf_file)
+        try:
+            text = extract_text_from_pdf(file_path)
+            if not text.strip():
+                logger.warning(f"  ⚠️  {pdf_file}: 无有效文本")
+                continue
+
+            # ── v4 OCR: 多模态图片文本注入 ──
+            text = _v4_inject_ocr_text(file_path, text)
+
+            product_id = _resolve_product_id_from_filename(pdf_file)
+            parents, children = _v4_build_parent_child_docs(
+                text, pdf_file, product_id,
+                child_chunk_size=child_chunk_size,
+                parent_chunk_size=parent_chunk_size,
+            )
+            all_parents.extend(parents)
+            all_children.extend(children)
+            logger.info(
+                f"  ✅ {pdf_file}: {len(parents)} parents + {len(children)} children "
+                f"(product={product_id})"
+            )
+        except Exception as e:
+            logger.error(f"  ❌ {pdf_file}: {e}")
+
+    # 统计
+    api_atomic = sum(1 for d in all_children if d.metadata.get("api_atomic"))
+    with_funcs = sum(1 for d in all_children if d.metadata.get("function_names"))
+    logger.info(
+        f"✅ v4 Dual 加载完成: {len(all_parents)} parents + {len(all_children)} children "
+        f"(api_atomic={api_atomic}, with_funcs={with_funcs})"
+    )
+    return all_parents, all_children
 
 
 # ============================================================

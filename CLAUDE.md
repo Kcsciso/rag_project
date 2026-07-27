@@ -8,9 +8,13 @@
   - 自动选择**剩余显存最大的 GPU**（过滤空闲 < 5 GB 的 GPU）。
   - 手动覆盖方式：`--gpu <id>` 参数 或 `VLLM_GPU_ID` 环境变量。
 - **默认分配**（自动检测无结果时的回退）:
-  - GPU 1（端口 **8001**）：本地 vLLM 推理服务，当前模型 **Qwen2.5-1.5B-Instruct**（~3.7 GB）。
+  - GPU 1（端口 **8001**）：本地 vLLM 推理服务，当前模型 **Qwen2.5-3B-Instruct**（已缓存 ~4.6GB，`--gpu-memory-utilization 0.20`）。升级目标：**Qwen2.5-7B-Instruct-AWQ**（4-bit 量化 ~8GB，待下载权重 ~15GB）。
   - GPU 0：向量检索引擎（ChromaDB / PyTorch 嵌入计算）。**注意**：GPU 0 为多人共享，高峰期空闲仅 ~16 MB。
-- **GPU 升级路径**：空闲 ≥15 GB 时，通过 `LLM_MODEL_NAME=Qwen/Qwen2.5-7B-Instruct` + `--gpu-memory-utilization 0.40` 升级。
+- **GPU 升级路径**：当前默认 `Qwen2.5-3B-Instruct`（已缓存）。升级至 7B AWQ 需先下载权重：
+  ```bash
+  VLLM_USE_MODELSCOPE=true python -c "from vllm import LLM; LLM(model='Qwen/Qwen2.5-7B-Instruct-AWQ', quantization='awq')"
+  ```
+  下载完成后将 `src/config.py` 中 MODEL_NAME 改为 `Qwen/Qwen2.5-7B-Instruct-AWQ`。空闲 < 5GB 时自动降级至 1.5B。
 - **核心操作**：启动推理或训练脚本前必须显式指定 `CUDA_VISIBLE_DEVICES`（优先使用自动检测结果）。
 
 ## 2. 核心依赖红线（严禁升级）
@@ -30,7 +34,7 @@
 
 - **可用框架**: LangChain、LangGraph、ChromaDB、faiss-gpu。
 - **LLM 推理引擎**: 本地 `vllm` OpenAI 兼容服务。
-  - **Layer 1（主模型）**: `Qwen/Qwen2.5-1.5B-Instruct`，`http://localhost:8001/v1`，GPU 自适应，`--gpu-memory-utilization 0.20`，`--max-model-len 4096`，`--enforce-eager`。
+  - **Layer 1（主模型）**: `Qwen/Qwen2.5-3B-Instruct`（已缓存），`http://localhost:8001/v1`，GPU 自适应，`--gpu-memory-utilization 0.20`，`--max-model-len 8192`，`--enforce-eager`。升级目标：`Qwen/Qwen2.5-7B-Instruct-AWQ`（4-bit 量化，用 `VLLM_USE_MODELSCOPE=true` 从 ModelScope 下载）。
   - **Layer 2（云端降级）**: `glm-4.7-flash`（智谱 GLM-4.7-Flash），端点 `https://open.bigmodel.cn/api/paas/v4`，认证 `ZHIPU_API_KEY`。
   - **超时策略**: `connect=2.0s / read=12.0s / write=12.0s / pool=2.0s`（激进失败 → 快速降级）。
 - **嵌入模型**: `all-MiniLM-L6-v2`（384 维），可切换 `BAAI/bge-small-zh-v1.5`（512 维，中文专优）。HuggingFace → ONNX 自动回退。
@@ -123,6 +127,184 @@ START → query_fusion → product_routing → hybrid_retrieval → llm_generati
 - ✅ **自纠错不中断**：SDK 重试上限 2 次，超限后放弃修复进入对齐，绝不卡死
 - ✅ **所有既有 API 兼容**：`run_graph()` / `run_graph_stream()` 签名不变，`app.py` 零改动
 
+## 5.6 Extract-Render 两层分离架构（ADR-12，2026-07-24）
+
+针对 1.5B 小模型的根本局限——token 概率分布中预训练模式始终压倒 Context 信号——将生成管线从"自由文本生成"改为"提取 + 确定性渲染"两层分离。
+
+- **System Prompt Extract Mode**: 要求模型输出 `【提取】{JSON}【提取结束】` 块，只做实体提取不写完整答案。
+- **`render_node`** (`src/graph_rag.py`): 解析 JSON → 确定性渲染 ctypes 代码/编号步骤/强制引用 `根据《{doc}》【{section}】的记载：`。
+- **降级容错**: JSON 解析失败或不存在 → 透传原始回答，不中断服务。
+- **已知限制**: 1.5B 模型对 JSON 格式指令遵循不稳定；升级至 7B+ 模型预期可显著提升提取模式触发率。
+
+## 5.7 Plan-Execute-Synthesize 三层架构（ADR-14，2026-07-25）
+
+针对 7B 模型在工业文档 RAG 中的 4 类架构级缺陷——静态 KV 无泛化、单库路由拦截跨产品对比、代码实体 Embedding 湮灭、product_id=None 空响应——将 LangGraph 管线从线性链重构为"规划→并行执行→融合"三层架构。
+
+### 5.7.1 架构设计
+
+```
+SubGoalPlanner → [Parallel: QA | Attribute | CodeSearch] → Synthesize
+     ↑ Fast Path: 单产品简单查询 100% 绕过 Planner
+```
+
+**核心原则**:
+- ✅ **Fast Path 零延迟**: 有明确 product_id 的单产品查询绝不触发 Planner
+- ✅ **防崩兜底**: Planner Markdown 解析失败 → 自动降级标准单路检索
+- ✅ **product_id=None 不反问**: CrossProductRetrievalNode 全库 Top-K 检索 + 综合回答
+- ✅ **零硬编码**: 属性意图由 LLM 动态提取，CodeEntityAnchor 正则做软加权非硬过滤
+
+### 5.7.2 新增节点（graph_rag.py）
+
+| 节点 | 功能 |
+|------|------|
+| `subgoal_planner_node` | LLM 轻量调用（max_tokens=256），拆分子目标；Fast Path 判断内置 |
+| `cross_product_retrieval_node` | product_id=None 时，对所有已注册产品并行检索 |
+| `synthesize_node` | 多路结果融合：透传/对比/反问/综合 |
+
+### 5.7.3 新增模块
+
+| 文件 | 功能 |
+|------|------|
+| `src/attribute_tool.py` | 动态属性意图工具 — LLM 提取属性关键词 → BM25 精准搜索 → 正则提取值。替代静态 KV 正则表。 |
+| `src/kv_extractor.py` | 离线属性提取器 — 从 ChromaDB 文本 + 手动校准构建 KV 属性 JSON。phase-out 中，逐步被 attribute_tool 替代。 |
+
+### 5.7.4 v3 AgentState 扩展
+
+`agent_state.py` → `RAGState` 新增 7 个 Plan-Execute-Synthesize 字段：
+- `sub_goals: List[Dict]` — SubGoalPlanner 拆分的子目标列表
+- `sub_results: List[Dict]` — 各子目标并行执行的结果
+- `cross_product_candidates: List[Dict]` — 跨产品检索候选
+- `attribute_intent: Dict` — 动态属性意图提取结果
+- `code_entities: List[str]` — CodeEntityAnchor 提取的代码实体名
+- `plan_mode: str` — "single" | "multi" | "cross_product" | "attribute"
+- `skip_planner: bool` — Fast Path 标志
+
+### 5.7.5 v3 图结构
+
+```
+START → query_fusion → product_routing
+                          │
+          ┌───────────────┼───────────────┐
+          │               │               │
+      chitchat/       clarify/        generate/
+      refuse          (→ planner)     (→ planner)
+          │                               │
+          ▼                       ┌───────┴───────┐
+   build_direct_response          │               │
+          │                   plan_mode=      plan_mode=
+          ▼                    single      cross_product
+         END                       │               │
+                                   ▼               ▼
+                            hybrid_retrieval  cross_product_retrieval
+                                   │               │
+                                   ▼               ▼
+                            llm_generation   llm_generation
+                                   │               │
+                                   └─── synthesize ──┘
+                                            │
+                              ┌─────────────┼─────────────┐
+                              │                           │
+                         sdk_verify                 extract_align
+                              │                           │
+                         (retry ≤ 2)                    END
+                              │
+                         extract_align → END
+```
+
+### 5.7.6 设计原则与已知限制
+
+- ✅ **Fast Path 零开销**: skip_planner=True 时 SubGoalPlanner 直接返回，不调 LLM
+- ✅ **防崩兜底**: Planner 解析失败 → 降级标准单路检索，绝不死锁
+- ✅ **全库检索不反问**: CrossProductRetrievalNode 输出候选+反问，不 Only 反问
+- ⚠️ **已知限制**: SubGoalPlanner 对 1.5B 模型的指令遵循不稳定，需 7B+ 模型充分释放能力；CodeEntityAnchor 的正则初筛需与 BM25 tokenizer 集成才能达到最大效果
+
+## 5.8 切片机制架构升级（ADR-15，2026-07-25）
+
+针对固定字符切片（chunk_size=300）导致的 SDK 函数签名割裂、章节锚点错位、KV 参数语义稀释三大问题，重构为 API 原子化 + 标题感知 + 父子双层索引的 v4 切片策略。
+
+### 5.8.1 核心策略
+- **API-Level Atomic Chunking**: 用正则预分割器识别函数定义边界（C 签名/Python ctypes/Markdown 代码块），标记为 `api_atomic=True`，永不切分
+- **Header-Aware Chunking**: 沿标题层级树切分，每个切片注入完整面包屑 `[路径: H1 > H2 > H3]`，兼容数字编号（3.1.5）和非 Markdown 格式
+- **Parent-Child Dual Indexing**:
+  - Parent Collection (`rag_v4_parent`): H2 章节级粗粒度切片，用于粗召回
+  - Child Collection (`rag_v4_child`): H3/H4 函数级精粒度切片，带 `metadata.function_names`，API 原子块完整保留
+
+### 5.8.2 关键函数（pdf_loader.py）
+| 函数 | 功能 |
+|------|------|
+| `_v4_extract_headings()` | 多格式标题识别（数字编号/中文序号/Markdown/纯数字） |
+| `_v4_build_breadcrumb()` | 层级面包屑生成（非 Markdown 兼容） |
+| `_v4_extract_api_blocks()` | SDK 函数原子块识别与保护 |
+| `_v4_build_parent_child_docs()` | Parent-Child 双层 Document 构建 |
+| `load_pdfs_v4_dual()` | v4 主入口，返回 `(parents, children)` |
+
+### 5.8.3 双 Collection 检索（vector_store.py）
+| 函数 | 功能 |
+|------|------|
+| `create_dual_collections()` | 创建 Parent + Child ChromaDB Collection |
+| `search_dual_index()` | Child 优先 + Parent 批量反查（高效单次查询模式） |
+
+### 5.8.4 配置
+```python
+CHUNK_MODE = "v4_dual"    # "v4_dual" | "v3_legacy"
+PARENT_CHUNK_SIZE = 1000   # H2 章节级父层
+CHILD_CHUNK_SIZE = 400     # H3/H4 函数级子层（API 原子）
+```
+
+## 5.9 多模态增量更新与 GPU 批量加速（ADR-16，2026-07-25）
+
+针对全量覆盖 O(N) 重建、OCR 文本盲区、CPU Embedding 串行慢三大痛点，构建增量引擎 + 多模态 OCR + GPU 批处理。
+
+### 5.9.1 增量引擎（vector_store.py）
+| 函数 | 功能 |
+|------|------|
+| `upsert_product_documents()` | 增量 Upsert 核心入口：MD5 去重 → 级联删除 → OCR 解析 → GPU 嵌入 → BM25 同步 |
+| `delete_product_chunks()` | 按 product_id 级联清理 Parent + Child Collection |
+| `_init_md5_store_from_chroma()` | 系统重启时从 ChromaDB metadata 自动恢复 MD5 记录 |
+| `_persist_md5_store()` | 将 MD5 记录持久化到 Collection metadata |
+| `bm25_upsert_product()` | BM25 增量同步 — 仅重建受影响产品索引 O(n) |
+| `bm25_remove_product()` | BM25 级联删除 |
+
+### 5.9.2 OCR 图文抽取（pdf_loader.py）
+| 函数 | 功能 |
+|------|------|
+| `_v4_get_ocr_engine()` | RapidOCR ONNX 引擎懒加载（~15MB 模型，纯 CPU） |
+| `_v4_inject_ocr_text()` | 遍历 PDF 内嵌图片 → OCR 识别 → `[OCR识别]` 标签注入切片正文 |
+
+### 5.9.3 GPU 批量加速
+- `EMBEDDING_BATCH_SIZE = 64`: SentenceTransformer 自动 GPU 批处理，A100 上 10-40× 加速
+- `load_vector_store_from_name()`: 按 Collection 名称加载（支持 v4 Parent/Child 分离访问）
+
+### 5.9.4 API 改造
+- `POST /api/upload`: 从全量重建改为增量 Upsert（MD5 去重 + 级联清理 + OCR + BM25 同步）
+- 返回新增字段: `parents`, `children`, `ocr_images`, `deleted_old`, `status`
+
+## 5.10 检索幻觉修复与产品隔离强化（2026-07-25）
+
+针对 v4 上线后暴露的 API 捏造（`set_robot_connect`/`robot_move_arc`）、跨产品函数混淆、检索盲区三大问题。
+
+### 5.10.1 function_names 元数据检索增强
+- **`_match_function_names()`** (`rag_chain.py`): 逗号分隔字符串 ↔ query 代码实体的模糊匹配（strip/lower/子串），解决 list→str 后的检索失效
+- **`_extract_query_code_entities()`** (`rag_chain.py`): 从 query 中提取代码实体模式，用于 RRF boost 和 function_names 匹配
+- **RRF 加权**: 匹配 function_names 的 Child doc 获得 0.08 RRF 加分（高于普通锚点 0.05）
+
+### 5.10.2 检索过滤放宽 + 安全网
+- **关键词分阈值**: 从 0.05 降至 0.03，含 `function_names` 元数据或代码关键词（robot_/set_/ctypes）的切片豁免过滤
+- **安全网**: `kept_docs` 全空时自动恢复向量 Top-3 保底（防止 LLM 空上下文后激活幻觉代码生成）
+- **候选池扩大**: 代码实体查询 `fetch_factor=8`（→ ~40 候选），boost 重排后截断至 top-k
+
+### 5.10.3 防幻觉硬拦截
+- **三层判断** (`_build_messages`): 检查 context 中是否有 (a) 真实函数签名 (b) 操作步骤 (c) metadata function_names
+- **`_force_no_code`**: 三条件全空时在 system prompt 头部注入硬指令："禁止代码/禁止编造函数名/只允许拒答/限制 50 字"
+- **条件约束**: 仅 metadata 有函数名但文本中无 → 弱约束提示
+
+### 5.10.4 产品推断与隔离
+- **`_infer_product_from_query()`** (`vector_store.py`): 从 query 关键词自动推断 product_id
+- **`search_similar_with_threshold()`**: product_id 为空时自动推断，无法推断时按产品分组标注
+- **`_is_sdk_code_query()`** (`rag_chain.py`): 本地 SDK 代码查询检测（避免跨模块循环导入）
+
+- 🔴 **测试红线（v4.2）**: 每次修改 `rag_chain.py` 或 `graph_rag.py` 后，必须先运行 `python tests/run_eval.py --verbose` 并确保 **100% PASS**（含 4 项硬质量断言），才能交付。禁止跳过。
+- 旧测试脚本: `test_robot_rag.py` 和 `test_multidoc_simulation.py` 已删除，用例已合并至 `tests/eval_cases.json`。`test_rag_eval.py` / `test_human_simulation.py` / `test_unified_suite.py` / `test_stability.py` 保留向后兼容。
 - 在执行破坏性 Bash 命令或安装软件包之前，必须征得用户的明确授权。
 - 所有重大架构调整、Ablation 实验及 Git 提交必须记录在 `dev_log.md` 中。
 - 严禁删除 Conda 环境 `site-packages/pyairports/` 下的 Shim 适配层。
@@ -153,11 +335,12 @@ conda activate rag_agent
 export HF_ENDPOINT=https://hf-mirror.com
 export PYTHONUNBUFFERED=1
 CUDA_VISIBLE_DEVICES=1 python -m vllm.entrypoints.openai.api_server \
-    --model Qwen/Qwen2.5-1.5B-Instruct \
-    --served-model-name Qwen/Qwen2.5-1.5B-Instruct \
-    --max-model-len 4096 \
+    --model Qwen/Qwen2.5-7B-Instruct-AWQ \
+    --served-model-name Qwen/Qwen2.5-7B-Instruct-AWQ \
+    --max-model-len 8192 \
     --port 8001 \
-    --gpu-memory-utilization 0.20 \
+    --gpu-memory-utilization 0.25 \
+    --quantization awq \
     --trust-remote-code \
     --enforce-eager
 ```
@@ -165,9 +348,10 @@ CUDA_VISIBLE_DEVICES=1 python -m vllm.entrypoints.openai.api_server \
 | 参数 | 值 | 理由 |
 |------|-----|------|
 | `CUDA_VISIBLE_DEVICES` | `1`（或自动检测结果） | 隔离 GPU，避免与其他用户进程冲突 |
-| `--port` | **8001** | FastAPI 占用 8000，vLLM 使用独立端口 |
-| `--gpu-memory-utilization` | `0.20` | 1.5B 模型仅需 ~3.7 GB，20% 安全裕量 |
-| `--max-model-len` | `4096` | RAG 5-chunk + system prompt ≈ 1500 tokens |
+| `--port` | **8001** | FastAPI 占用 7860，vLLM 使用独立端口 |
+| `--gpu-memory-utilization` | `0.25` | 7B AWQ 4-bit ~8GB，25% 硬锁定，不霸占共享显存 |
+| `--quantization` | `awq` | 4-bit 量化，显存从 28GB → 8GB |
+| `--max-model-len` | `8192` | 7B 模型支持更长上下文，适配多切片+系统 Prompt |
 | `--enforce-eager` | 启用 | 跳过 CUDA Graph 编译，加速冷启动 |
 | `PYTHONUNBUFFERED` | `1` | vLLM 日志实时输出 |
 
@@ -211,9 +395,14 @@ conda run -n rag_agent python tunnel.py --token <YOUR_NGROK_AUTHTOKEN>
 | `src/config.py` | **全局配置中心** — 双通道 LLM（vLLM :8001 / 智谱 GLM-4.7-Flash）、GPU 智能探测 API（`detect_best_gpu` / `get_all_gpu_info` / `VLLM_GPU_ID`）、ChromaDB 路径、嵌入模型双轨回退、检索参数（600/100/5/0.75） |
 | `src/pdf_loader.py` | **PDF 加载** — pypdf 逐页提取 → RecursiveCharacterTextSplitter 13 级递归分块 → **Header Injection**（自动提取 C 函数名 `[Functions: xxx]` 注入切片头部） |
 | `src/vector_store.py` | **向量知识库** — bge-small-zh-v1.5 (512维) + ONNX 回退双轨嵌入；**BM25 稀疏检索**（jieba 分词 + 正则标识符保护 + 自定义 SDK 函数词典）；`search_similar_with_threshold()` 阈值过滤；`cleanup_vector_store()` 资源释放 |
-| `src/rag_chain.py` | **RAG 核心管线** — 四层金字塔容灾；`_preprocess_query` 口语噪音剥离；`_hybrid_retrieve` **BM25+向量 RRF 融合 + Autocut 动态截断**；`_score_chunk_for_query` 三层加权打分；`_resolve_vllm_model()` 动态模型解析；防退化采样参数；Prompt 注入防御（含 Few-Shot 示例 Rule 12）；`shutdown_clients()` |
-| `src/agent_state.py` | **LangGraph 状态定义 (v2)** — `RAGState` TypedDict（14 字段），含 5 个后处理控制字段：`extracted_entities`、`feedback`、`retry_count`、`context_text`、`raw_llm_answer` |
-| `src/graph_rag.py` | **LangGraph 状态图引擎 (v2)** — 6 节点 + 3 条件边 + 自纠错环路；`extract_align_node` 通用属性对齐（零特定数字补丁）；`sdk_verify_node` SDK 代码自纠错条件环路（上限 2 次回环）；`_extract_generic_kv_entities()` 通用 KV 实体提取器；`run_graph()` / `run_graph_stream()` 兼容旧 API |
+| `src/rag_chain.py` | **RAG 核心管线 (v4.1)** — 四层金字塔容灾；`_hybrid_retrieve` BM25+向量 RRF 融合 + `_match_function_names()` 元数据 boost + `_extract_query_code_entities()` 实体提取 + 放宽关键词过滤 + `kept_docs` 安全网；`_build_messages()` 含 `_force_no_code` 防幻觉硬拦截；`_is_sdk_code_query()` 本地 SDK 检测 |
+| `src/agent_state.py` | **LangGraph 状态定义 (v3)** — `RAGState` TypedDict（21 字段），含 5 个 v2 后处理控制 + 7 个 v3 Plan-Execute-Synthesize 字段 |
+| `src/graph_rag.py` | **LangGraph 状态图引擎 (v3)** — 9 节点 + 5 条件边 + 自纠错环路；v3 新增 `subgoal_planner_node`、`cross_product_retrieval_node`、`synthesize_node`；`_extract_code_entities()` CodeEntityAnchor；`run_graph()` / `run_graph_stream()` API 完全兼容 |
+| `src/attribute_tool.py` | **动态属性意图工具 (v3)** — LLM 提取属性关键词 → BM25 精准搜索 → 正则提取值。替代静态 KV 正则表 |
+| `src/kv_extractor.py` | **离线属性提取器** — 从 ChromaDB 文本切片 + 手动校准数据构建 KV JSON 存储。phase-out 中 |
+| `src/pdf_loader.py` | **PDF 加载与分块 (v4)** — 保留 v3 `load_pdfs_from_directory()`；v4 新增 `load_pdfs_v4_dual()` API 原子切分 + `_v4_inject_ocr_text()` OCR 图文抽取 + 标题面包屑 + Parent-Child 双层索引 |
+| `src/vector_store.py` | **向量知识库 (v4)** — 双 Collection 管理、`search_dual_index()` 高效检索、`upsert_product_documents()` 增量 Upsert、`delete_product_chunks()` 级联删除、`bm25_upsert_product()` BM25 动态同步；v4.1 新增 `_match_function_names()` 模糊匹配、`_infer_product_from_query()` 产品推断、`_sanitize_metadata()` ChromaDB 类型清洗 |
+| `rebuild_v4.py` | **v4 向量库重建脚本** — 独立运行，用 v4 切分策略重新解析所有 PDF 并写入 Parent + Child Collection |
 | `app.py` | **FastAPI 主入口 (7860)** — 5 条路由 + 安全中间件；SSE 防泄露；`shutdown` 事件；产品路由（`product_id` + `GET /api/products`）|
 | `src/multimodal_loader.py` | **多模态解析** — PyMuPDF + pdfplumber 表格→Markdown、图片→Caption 注入、智能路由（纯文本→标准 pypdf） |
 | `frontend_server.py` | **前端 UI 服务 (8501)** — Jinja2 模板渲染 + `/api/*` 反向代理到 7860 后端 |
@@ -383,7 +572,7 @@ conda run -n rag_agent python test_stability.py       # 稳定性压力测试（
 ```python
 # Layer 1: 本地 vLLM
 BASE_URL     = "http://localhost:8001/v1"
-MODEL_NAME   = "Qwen/Qwen2.5-1.5B-Instruct"
+MODEL_NAME   = "Qwen/Qwen2.5-7B-Instruct-AWQ"
 
 # Layer 2: 智谱 GLM-4.7-Flash（云端降级）
 DEEPSEEK_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
