@@ -1,6 +1,6 @@
 """
 =============================================================================
-NewsPage Streamlit 前端 — 端口 8501
+比邻星 (ProximaRAG) Streamlit 前端 — 端口 8501
 =============================================================================
 """
 import streamlit as st
@@ -10,7 +10,7 @@ import json
 API_BASE = "http://localhost:7860"
 
 st.set_page_config(
-    page_title="NewsPage — 湖南比邻星科技",
+    page_title="比邻星 (ProximaRAG) — 湖南比邻星科技",
     page_icon="⬡",
     layout="wide",
 )
@@ -24,7 +24,7 @@ if "selected_product" not in st.session_state:
 # ── 侧边栏 ──
 with st.sidebar:
     st.image("https://via.placeholder.com/60x60.png?text=⬡", width=60)
-    st.title("NewsPage")
+    st.title("比邻星 (ProximaRAG)")
     st.caption("湖南比邻星科技 · 文档智能问答")
 
     # 产品标签
@@ -66,7 +66,7 @@ with st.sidebar:
     st.caption("支持 OpenR6 / OpenC3 SDK 文档查询")
 
 # ── 主区域：对话历史 ──
-st.title("⬡ NewsPage 文档智能问答")
+st.title("⬡ 比邻星 文档智能问答")
 
 for msg in st.session_state.chat_history:
     with st.chat_message(msg["role"]):

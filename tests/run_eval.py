@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """
 =============================================================================
-RAG v4 统一回归评测器 (v4.2 — 全量整合版)
+比邻星 (ProximaRAG) 统一回归评测器 (v4.3 — 全量量化版)
 =============================================================================
 
 特性:
   - 直接调用 LangGraph run_graph()（无需 FastAPI）
+  - 支持多轮对话 chat_history 传入
   - --quick: 仅检索不调 LLM（秒级）
   - --filter GT-1,E09: 按 ID 过滤
   - --verbose: 详细输出
-  - 4 项硬质量断言（触发任一 → FAIL）
+  - 5 项硬质量断言 + 4 维 RAG 量化指标汇总
 
 硬断言规则:
   ① JSON 泄露检查: 答案含【提取】或 "steps": [ → FAIL
   ② 重复检查: 连续两段完全相同文本 → FAIL
   ③ 界面套话检查: JAKA APP查询含"未详细记载具体的SDK函数" → FAIL
   ④ 规则匹配: SDK函数名/入参与文档不完全匹配 → FAIL
+  ⑤ 提示词泄露: 包含 RAG_SYSTEM_PROMPT 或系统指令源码 → FAIL
 
 运行: python tests/run_eval.py [--quick] [--verbose] [--filter ID1,ID2]
 =============================================================================
@@ -42,7 +44,7 @@ def load_eval_cases() -> List[Dict]:
 
 
 # ═══════════════════════════════════════════════════════════
-# 4 项硬质量断言
+# 5 项硬质量断言
 # ═══════════════════════════════════════════════════════════
 
 def _fatal_json_leak(answer: str) -> bool:
@@ -79,10 +81,8 @@ def _fatal_app_sdk_boilerplate(query: str, answer: str, product_id: str = None) 
 def _fatal_wrong_signature(query: str, answer: str) -> bool:
     """④ 函数签名错误: 无参函数被写成有参"""
     checks = [
-        # OpenC3 robot_Power_on() 是无参函数
         (r'(?:Power_on|power_on)\s*\(', r'(?:Power_on|power_on)\s*\(\s*(?:ip|port|address)',
          "robot_Power_on() 是无参函数"),
-        # OpenR6 set_robot_power_on() 是无参函数
         (r'set_robot_power_on\s*\(', r'set_robot_power_on\s*\(\s*(?:ip|port|address)',
          "set_robot_power_on() 是无参函数"),
     ]
@@ -90,6 +90,12 @@ def _fatal_wrong_signature(query: str, answer: str) -> bool:
         if re.search(_pos_pattern, answer, re.IGNORECASE) and re.search(_neg_pattern, answer, re.IGNORECASE):
             return True
     return False
+
+
+def _fatal_prompt_leak(answer: str) -> bool:
+    """⑤ 提示词泄露: 包含系统 Prompt 变量名或注入泄露"""
+    leak_keywords = ["RAG_SYSTEM_PROMPT", "系统提示词如下", "Ignore previous instructions", "系统指令源码"]
+    return any(kw.lower() in answer.lower() for kw in leak_keywords)
 
 
 def run_fatal_assertions(case: dict, answer: str) -> List[str]:
@@ -103,6 +109,8 @@ def run_fatal_assertions(case: dict, answer: str) -> List[str]:
         errors.append("③ 界面套话: JAKA APP查询含SDK拒答套话")
     if _fatal_wrong_signature(case["query"], answer):
         errors.append("④ 函数签名错误: 无参函数被写成有参")
+    if _fatal_prompt_leak(answer):
+        errors.append("⑤ 提示词泄露: 答案泄露了系统 Prompt 源码")
     return errors
 
 
@@ -112,12 +120,8 @@ def run_fatal_assertions(case: dict, answer: str) -> List[str]:
 
 def run_single_case(case: dict, quick: bool = False) -> dict:
     from src.graph_rag import run_graph, set_graph_vector_store
-    from src.vector_store import (
-        load_vector_store, build_bm25_from_chromadb,
-        search_similar_with_threshold, _match_function_names, _extract_query_code_entities,
-    )
+    from src.vector_store import load_vector_store, build_bm25_from_chromadb
     from src.config import CHROMA_PERSIST_DIR, RETRIEVAL_K
-    from src.rag_chain import _is_noise_chunk
 
     vs = load_vector_store(CHROMA_PERSIST_DIR)
     if not vs:
@@ -130,10 +134,12 @@ def run_single_case(case: dict, quick: bool = False) -> dict:
         "query": case["query"], "description": case.get("description", ""),
         "status": "PASS", "elapsed_ms": 0, "answer": "", "model": "",
         "checks": {}, "fatal_errors": [], "errors": [],
+        "kw_total": len(case.get("must_contain", [])), "kw_hits": 0
     }
 
     t0 = time.time()
     pid = case.get("product_id")
+    chat_history = case.get("chat_history", [])  # ✅ 修复 Bug: 读取用例的多轮历史
 
     try:
         if quick:
@@ -142,7 +148,7 @@ def run_single_case(case: dict, quick: bool = False) -> dict:
             answer = "\n\n".join(d.page_content[:300] for d in docs)
             model = "retrieval-only"
         else:
-            r = run_graph(case["query"], [], product_id=pid)
+            r = run_graph(case["query"], chat_history, product_id=pid)  # ✅ 修复 Bug: 传入 chat_history
             answer = r.get("answer", "")
             model = r.get("model", "?")
     except Exception as e:
@@ -159,8 +165,11 @@ def run_single_case(case: dict, quick: bool = False) -> dict:
     for kw in case.get("must_contain", []):
         hit = kw.lower() in answer.lower()
         result["checks"][f"含'{kw}'"] = hit
-        if not hit:
+        if hit:
+            result["kw_hits"] += 1
+        else:
             result["errors"].append(f"缺少关键词'{kw}'")
+            
     for kw in case.get("must_not_contain", []):
         hit = kw.lower() in answer.lower()
         result["checks"][f"不含'{kw}'"] = not hit
@@ -174,7 +183,7 @@ def run_single_case(case: dict, quick: bool = False) -> dict:
         if not is_clarify:
             result["errors"].append("期望澄清反问")
 
-    # ── 4 项硬断言 ──
+    # ── 5 项硬断言 ──
     fatal = run_fatal_assertions(case, answer)
     result["fatal_errors"] = fatal
     result["errors"].extend(fatal)
@@ -189,7 +198,7 @@ def print_header(title: str):
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="RAG v4 统一回归评测器")
+    parser = argparse.ArgumentParser(description="比邻星 (ProximaRAG) 统一回归评测器")
     parser.add_argument("--quick", "-q", action="store_true", help="仅检索不调LLM")
     parser.add_argument("--verbose", "-v", action="store_true", help="详细输出(含answer)")
     parser.add_argument("--filter", "-f", type=str, help="用例ID过滤(如 GT-1,E02)")
@@ -200,7 +209,7 @@ def main():
         ids = set(args.filter.split(","))
         cases = [c for c in cases if c["id"] in ids]
 
-    print_header(f"RAG v4 统一回归评测 ({len(cases)} 用例)")
+    print_header(f"比邻星 (ProximaRAG) v4 回归评测 ({len(cases)} 用例)")
     print(f"  模式: {'快速(仅检索)' if args.quick else '完整(含LLM)'}")
 
     results = []
@@ -219,11 +228,27 @@ def main():
             print(f"       answer: {r['answer'][:300]}")
 
     # ── 汇总 ──
-    print_header("评测汇总")
+    print_header("评测汇总与 RAG 量化指标")
     total = len(results)
     passed = sum(1 for r in results if r["status"] == "PASS")
     failed = total - passed
-    print(f"\n  总计: {total}  通过: {passed}  失败: {failed}  通过率: {passed/total*100:.0f}%")
+    
+    # ── 计算 4 维量化指标 ──
+    total_kw_expected = sum(r.get("kw_total", 0) for r in results)
+    total_kw_hits = sum(r.get("kw_hits", 0) for r in results)
+    context_recall = (total_kw_hits / total_kw_expected * 100) if total_kw_expected > 0 else 100.0
+    
+    clean_cases = sum(1 for r in results if not any("① JSON" in e or "② 重复" in e for e in r.get("fatal_errors", [])))
+    cleanliness_rate = (clean_cases / total * 100) if total > 0 else 100.0
+    
+    isolation_cases = sum(1 for r in results if not any("含禁止词" in e for e in r.get("errors", [])))
+    isolation_rate = (isolation_cases / total * 100) if total > 0 else 100.0
+
+    print(f"\n  📊 RAG 核心质量指标:")
+    print(f"     • [Context Recall 检索召回率]: {context_recall:.1f}% ({total_kw_hits}/{total_kw_expected} 关键词)")
+    print(f"     • [Product Isolation 隔离合格率]: {isolation_rate:.1f}%")
+    print(f"     • [Format Cleanliness 渲染纯净率]: {cleanliness_rate:.1f}%")
+    print(f"     • [Overall Pass Rate 总评测通过率]: {passed/total*100:.1f}% ({passed}/{total})\n")
 
     for cat in sorted(set(r["category"] for r in results)):
         cr = [r for r in results if r["category"] == cat]
@@ -248,7 +273,7 @@ def main():
 
     print(f"\n{'='*70}")
     if passed == total:
-        print("🏆 100% PASS — 全部用例通过 (含 4 项硬断言)")
+        print("🏆 100% PASS — 全部用例通过 (含 5 项硬断言)")
     else:
         print(f"❌ {failed} FAILED — 请修复后重新运行")
 

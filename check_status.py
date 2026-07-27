@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 =============================================================================
-NewsPage 统一服务健康状态检查脚本 (v4)
+比邻星 (ProximaRAG) 统一服务健康状态检查脚本 (v4)
 =============================================================================
 
 检查范围：
   1. 本地 vLLM 推理服务（端口 8001）— 在线状态、已加载模型名称
-  2. FastAPI 后端（NewsPage，端口 7860）— 在线状态、向量库文档数
+  2. FastAPI 后端（比邻星，端口 7860）— 在线状态、向量库文档数
   3. v4 Parent-Child 双索引 — rag_v4_parent / rag_v4_child chunk 数量
   4. CUDA GPU 显存占用 — GPU 0 & GPU 1 的实时显存、温度、功率
 
@@ -229,7 +229,7 @@ def _get_gpu_name_by_index(index: int) -> Optional[str]:
 
 def check_fastapi() -> Dict[str, Any]:
     """
-    检查 NewsPage FastAPI 后端 (http://localhost:8000)。
+    检查 比邻星 (ProximaRAG) FastAPI 后端 (http://localhost:8000)。
 
     Returns:
         {
@@ -413,7 +413,7 @@ def print_header():
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print()
     print(bold(blue("╔══════════════════════════════════════════════════════════╗")))
-    print(bold(blue("║")) + bold("        NewsPage 系统健康检查报告                        ") + bold(blue("║")))
+    print(bold(blue("║")) + bold("      比邻星 (ProximaRAG) 系统健康检查报告               ") + bold(blue("║")))
     print(bold(blue("╠══════════════════════════════════════════════════════════╣")))
     print(bold(blue("║")) + dim(f"  检查时间: {now}") + " " * (26 - len(now)) + bold(blue("║")))
     print(bold(blue("╚══════════════════════════════════════════════════════════╝")))
@@ -503,7 +503,7 @@ def print_service_section(vllm: Dict, fastapi: Dict, v4: Dict = None):
     api_lat     = f"{fastapi.get('latency_ms', 0)}ms"
     api_err     = fastapi.get("error", "")
 
-    print(f"│ {'NewsPage 后端':<16} {api_status:<18} {dim(f'({api_lat})'):<10} │")
+    print(f"│ {'比邻星 后端':<16} {api_status:<18} {dim(f'({api_lat})'):<10} │")
     print(f"│   └ 端口          {cyan(f'{FASTAPI_BASE_URL}'):<30} │")
     if fastapi["online"]:
         print(f"│   └ 向量库        {api_ready:<24} {api_docs:<15} │")
@@ -540,7 +540,7 @@ def print_summary(vllm: Dict, fastapi: Dict, gpus: List[Dict]):
     elif fastapi["online"] and not fastapi["ready"]:
         print(f"│  {yellow('⚠️  后端在线但向量库为空 — 请上传 PDF 文档')}" + " " * 17 + "│")
     else:
-        print(f"│  {red('❌ 系统不可用 — NewsPage 后端离线')}" + " " * 36 + "│")
+        print(f"│  {red('❌ 系统不可用 — 比邻星 后端离线')}" + " " * 36 + "│")
 
     # GPU 建议（所有 GPU 均不足时发出警告）
     if gpus:
@@ -596,7 +596,7 @@ def run_check():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="NewsPage 统一服务健康状态检查脚本",
+        description="比邻星 (ProximaRAG) 统一服务健康状态检查脚本",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:

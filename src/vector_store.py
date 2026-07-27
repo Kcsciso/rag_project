@@ -1218,7 +1218,7 @@ def upsert_product_documents(
     bm25_remove_product(product_id)
 
     # ── Step 3: 重新解析 ──
-    from .pdf_loader import extract_text_from_pdf, _v4_inject_ocr_text, _v4_build_parent_child_docs
+    from .pdf_loader import extract_text_from_pdf, _v4_inject_ocr_text, _v4_build_parent_child_docs, _clean_pdf_text
     text = extract_text_from_pdf(pdf_path)
     if not text.strip():
         return {"status": "error", "error": "no_text"}
@@ -1226,6 +1226,9 @@ def upsert_product_documents(
     # OCR 注入
     text = _v4_inject_ocr_text(pdf_path, text)
     ocr_count = text.count("[OCR识别: page=")
+
+    # ── 🔴 PDF 文本清洗: 连字替换 + 括号空格规范化 ──
+    text = _clean_pdf_text(text)
 
     # Parent-Child 构建
     source = os.path.basename(pdf_path)

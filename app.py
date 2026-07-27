@@ -1,6 +1,6 @@
 """
 =============================================================================
-NewsPage — RAG 知识库对话系统 FastAPI 主入口
+比邻星 (ProximaRAG) — RAG 知识库对话系统 FastAPI 主入口
 =============================================================================
 
 启动方式：
@@ -11,7 +11,7 @@ NewsPage — RAG 知识库对话系统 FastAPI 主入口
   python app.py
 
 API 路由一览：
-  GET  /                → 渲染 NewsPage 主页面
+  GET  /                → 渲染 比邻星 主页面
   POST /api/chat        → RAG 对话（支持流式 SSE）
   POST /api/upload      → 上传 PDF 并重建向量库
   GET  /api/status      → 获取向量库状态
@@ -161,7 +161,7 @@ def validate_chat_history(history: list) -> list:
 # FastAPI 应用初始化
 # ============================================================
 app = FastAPI(
-    title="NewsPage",
+    title="比邻星 (ProximaRAG)",
     description="湖南比邻星科技 — 官方开发与使用文档智能问答系统",
     version="1.0.0",
 )
@@ -183,7 +183,7 @@ vector_store = None
 async def startup_event():
     """应用启动时：加载已有向量库，并进行配置校验"""
     global vector_store
-    logger.info("🚀 NewsPage — 湖南比邻星科技文档智能问答系统 正在启动...")
+    logger.info("🚀 比邻星 (ProximaRAG) — 湖南比邻星科技文档智能问答系统 正在启动...")
 
     # ---- 配置校验：智谱 GLM-4.7-Flash API Key 降级通道可用性 ----
     from src.config import DEEPSEEK_API_KEY, BASE_URL
@@ -223,7 +223,7 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """应用关闭时：释放 LLM 客户端连接池、BM25 索引、嵌入模型等资源"""
-    logger.info("🛑 NewsPage 正在关闭...")
+    logger.info("🛑 比邻星 (ProximaRAG) 正在关闭...")
     try:
         shutdown_clients()
         logger.info("✅ LLM 客户端连接池已释放")
@@ -243,10 +243,10 @@ async def shutdown_event():
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     """
-    渲染 NewsPage 主页面（湖南比邻星科技文档智能问答系统）。
+    渲染 比邻星 主页面（湖南比邻星科技文档智能问答系统）。
 
     使用 Jinja2 模板引擎将 index.html 渲染为完整 HTML 页面。
-    页面标题在 <title> 和 header 中均设为 "NewsPage"。
+    页面标题在 <title> 和 header 中均设为 "比邻星"。
     """
     return templates.TemplateResponse(request, "index.html", {"request": request})
 

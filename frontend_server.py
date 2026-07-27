@@ -1,6 +1,6 @@
 """
 =============================================================================
-NewsPage 前端 UI 服务 — 端口 8501（HTML 模板渲染 + API 反向代理）
+比邻星 (ProximaRAG) 前端 UI 服务 — 端口 8501（HTML 模板渲染 + API 反向代理）
 =============================================================================
 """
 import httpx
@@ -11,7 +11,7 @@ from fastapi.templating import Jinja2Templates
 
 API_BACKEND = "http://localhost:7860"
 
-app = FastAPI(title="NewsPage Frontend")
+app = FastAPI(title="比邻星 (ProximaRAG) Frontend")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 

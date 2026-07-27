@@ -294,20 +294,20 @@ def load_pdfs_from_directory(
     # 🔴 Header Injection: 为每个 chunk 提取 C 函数名并注入文本头部
     # 极大增强 Dense Vector 和 Sparse BM25 对特定函数名的敏感度
     _FUNC_RE = _re.compile(
-        r'\b([a-z_][a-z0-9_]*_[a-z0-9_]+)\s*\(',  # snake_case 函数名( → "set_move_line("
-        _re.IGNORECASE
+        r'\b([a-zA-Z_][a-zA-Z0-9_]*_[a-zA-Z0-9_]+)\s*\(',  # snake_case 函数名( → "set_move_line("
+        # 🔴 保留原始大小写，检索匹配端统一 .lower()
     )
     func_injected_count = 0
     for chunk in chunks:
         funcs = set()
         for m in _FUNC_RE.finditer(chunk.page_content):
-            fname = m.group(1).lower().strip('_')
+            fname = m.group(1).strip('_')
             # 过滤掉明显不是 SDK 函数的短名
             if len(fname) >= 6 and ('_' in fname):
-                funcs.add(fname)
+                funcs.add(fname)  # 🔴 保留原始大小写，不做 .lower()
         if funcs:
-            funcs_sorted = sorted(funcs)[:10]  # 最多 10 个，避免过长
-            header = f"[Functions: {', '.join(funcs_sorted)}]\n"
+            funcs_sorted = sorted(funcs, key=lambda x: x.lower())[:10]  # 最多 10 个，避免过长
+            header = f"[Functions: {', '.join(f.lower() for f in funcs_sorted)}]\n"  # header tag 用小写保持一致性
             chunk.page_content = header + chunk.page_content
             func_injected_count += 1
 
@@ -354,6 +354,23 @@ _API_BLOCK_PATTERNS = [
         r'(?:robot\s*=\s*CDLL\([^)]+\)[\s\S]{0,500}?(?=\n\n|\n\s*\n|\Z))',
         re.MULTILINE,
     ),
+    # ── 🔴 中文 SDK 手册格式: 函数名称 / 函数说明 / 功能描述 段落边界 ──
+    # 匹配以 "函数名称 xxx" 开头直到下一个函数边界或空行的连续段落，
+    # 防止 robot_movj 和 robot_movl 两个紧邻函数混入同一切片
+    re.compile(
+        r'(?:^|\n)(?:函数名称|函数名)\s+(\w+)\s*\(?[^)]*\)?\s*'
+        r'(?:(?:功能描述|函数说明|功能说明|参数说明|返回值|返回值说明|'
+        r'注意事项|调用示例|示例代码)[\s\S]{0,800}?)'
+        r'(?=\n(?:函数名称|函数名)\s+\w+|'
+        r'\n\s*\n(?:函数名称|函数名)|\n\n\n|\Z)',
+        re.MULTILINE,
+    ),
+    # ── 🔴 中文 SDK 手册: 独立的 "函数名称" 行作为原子块起点 ──
+    # 匹配单行 "函数名称 robot_xxx" 格式（简化版），确保至少该行不被切碎
+    re.compile(
+        r'^函数名称\s+(\w+(?:\([^)]*\))?)',
+        re.MULTILINE,
+    ),
 ]
 
 # ── KV 参数行识别 ──
@@ -365,6 +382,91 @@ _KV_LINE_RE = re.compile(
     r')',
     re.IGNORECASE,
 )
+
+
+# ── PDF 文本清洗：连字替换 + 函数括号空格规范化 ──
+# PDF 内部编码中常见的连字（ligature）字符，在文本提取时不会被自动分解，
+# 会导致 SDK 函数名匹配失败（如 "oﬀ" ≠ "off"）
+
+_LIGATURE_MAP = {
+    # Latin 连字 → 分解形式
+    'ﬀ': 'ff',    # ﬀ (U+FB00) → ff
+    'ﬁ': 'fi',    # ﬁ (U+FB01) → fi
+    'ﬂ': 'fl',    # ﬂ (U+FB02) → fl
+    'ﬃ': 'ffi',   # ﬃ (U+FB03) → ffi
+    'ﬄ': 'ffl',   # ﬄ (U+FB04) → ffl
+    'ﬅ': 'ft',    # ﬅ (U+FB05) → ft  (少见)
+    'ﬆ': 'st',    # ﬆ (U+FB06) → st  (少见)
+    # 常见 Unicode 等价替换
+    '–': '-',     # – (EN DASH) → -
+    '—': '--',    # — (EM DASH) → --
+    '‘': "'",     # ' (LEFT SINGLE QUOTE) → '
+    '’': "'",     # ' (RIGHT SINGLE QUOTE) → '
+    '“': '"',     # " (LEFT DOUBLE QUOTE) → "
+    '”': '"',     # " (RIGHT DOUBLE QUOTE) → "
+    ' ': ' ',     # NBSP → 普通空格
+}
+_LIGATURE_TRANS_TABLE = str.maketrans(_LIGATURE_MAP)
+
+# 函数括号内外多余空格清洗正则（3 种模式）
+# ① "函数名 ( args )" → "函数名(args)"
+_FUNC_PAREN_SPACE_RE = re.compile(
+    r'(?:'
+    r'(\w+)\s+\(\s+'          # 函数名后跟空格+左括号+空格 → 函数名(
+    r'|'
+    r'\s+\)'                   # 空格+右括号 → )
+    r'|'
+    r'\(\s+([^)\n]{1,200}?)\s+\)'  # ( 空格 args 空格 ) → (args)
+    r')',
+)
+
+def _clean_pdf_text(text: str) -> str:
+    """
+    对 PDF 提取文本做规范化清洗。
+
+    处理步骤:
+      1. PDF 连字替换: oﬀ→off, ﬁ→fi, ﬂ→fl 等（防止函数名匹配失败）
+      2. Unicode 符号规范化: EN/EM DASH, 智能引号, NBSP
+      3. 函数括号内外多余空格清洗:
+         - "robot_Power_on ( )" → "robot_Power_on()"
+         - "robot_movl ( POSE pose , float vel )" → "robot_movl(POSE pose, float vel)"
+      4. 参数列表内多余空格压缩: ",  " → ", "
+
+    Args:
+        text: PDF 原始提取文本
+
+    Returns:
+        清洗后的规范化文本
+    """
+    if not text:
+        return text
+
+    # Step 1+2: 连字 + Unicode 符号替换（单次 str.translate）
+    cleaned = text.translate(_LIGATURE_TRANS_TABLE)
+
+    # Step 3: 函数括号空格清洗 — 多轮迭代至收敛
+    _max_iter = 3
+    for _ in range(_max_iter):
+        prev = cleaned
+        # 3a: "函数名 ( args )" → "函数名(args)"
+        cleaned = re.sub(r'(\w+)\s+\(\s+', r'\1(', cleaned)
+        # 3b: " )" → ")"（孤立右括号前的空格）
+        cleaned = re.sub(r'\s+\)', ')', cleaned)
+        # 3c: "( args , args )" → "(args, args)"
+        cleaned = re.sub(r'\(\s+', '(', cleaned)
+        # 3d: 压缩参数列表内多余空格: ",  " → ", "
+        cleaned = re.sub(r'\s*,\s*', ', ', cleaned)
+        # 3e: 压缩连续空格
+        cleaned = re.sub(r'  +', ' ', cleaned)
+        if cleaned == prev:
+            break
+
+    # Step 4: 移除 null 字节
+    cleaned = cleaned.replace('\x00', '')
+
+    logger.debug(f"🧹 PDF 文本清洗: {len(text)} → {len(cleaned)} 字符"
+                 f" (连字={text != cleaned})")
+    return cleaned
 
 
 def _v4_extract_headings(text: str) -> List[Tuple[int, str, int]]:
@@ -458,6 +560,12 @@ def _v4_extract_api_blocks(text: str) -> List[Tuple[int, int, str]]:
     """
     预提取 SDK API 原子块，标记为不可分割区域。
 
+    支持多种 SDK 文档格式:
+      - Python ctypes 代码块
+      - C 函数声明
+      - CDLL 加载块
+      - 中文 SDK 手册格式（函数名称 + 功能描述段落）
+
     Returns:
         [(start, end, block_label), ...]
         例如: [(1450, 1680, "API: robot_movl")]
@@ -467,9 +575,21 @@ def _v4_extract_api_blocks(text: str) -> List[Tuple[int, int, str]]:
         for m in pat.finditer(text):
             start, end = m.start(), m.end()
             block_text = m.group(0)
-            # 提取函数名作为 label
-            func_match = re.search(r'(?:robot_|set_|get_)\w+', block_text)
-            label = f"API: {func_match.group(0)}" if func_match else "API: block"
+            # 提取函数名作为 label — 支持多种命名风格
+            func_match = re.search(
+                r'(?:robot_|set_|get_)\w+|'          # snake_case SDK 函数
+                r'(?<=函数名称\s)\w+|'                 # 中文 "函数名称 xxx"
+                r'(?<=函数名\s)\w+',                   # 中文 "函数名 xxx"
+                block_text, re.IGNORECASE,
+            )
+            if func_match:
+                label = f"API: {func_match.group(0)}"
+            elif block_text.strip().startswith("函数名称"):
+                # fallback: 从中文标签行提取
+                name_m = re.search(r'函数名称\s+(\w+)', block_text)
+                label = f"API: {name_m.group(1)}" if name_m else "API: block"
+            else:
+                label = "API: block"
             blocks.append((start, end, label))
     blocks.sort(key=lambda x: x[0])
     # 合并重叠块
@@ -513,6 +633,7 @@ def _v4_inject_ocr_text(pdf_path: str, full_text: str) -> str:
 
     只处理 >100×100 px 的图片（跳过图标/装饰元素）。
     OCR 结果以 [OCR识别] 标签注入，含数字参数的行双写为 KV 标签。
+    同时注入页面所在章节的 [路径: ...] 和 [章节: ...] 面包屑前缀。
 
     Returns:
         增强后的 full_text（在原文本中追加 OCR 段落）
@@ -533,6 +654,27 @@ def _v4_inject_ocr_text(pdf_path: str, full_text: str) -> str:
         doc = fitz.open(pdf_path)
     except Exception:
         return full_text
+
+    # ── 预计算章节标题位置，用于 OCR 面包屑注入 ──
+    headings = _v4_extract_headings(full_text)
+    # 预计算每页在 full_text 中的位置（用于面包屑定位）
+    _page_positions: List[int] = []
+    _page_fingerprints: List[str] = []
+    _cursor = 0
+    for page_idx in range(len(doc)):
+        try:
+            page_text = doc[page_idx].get_text("text")
+            fp = page_text.strip()[:80] if page_text else ""
+            pos = full_text.find(fp, _cursor) if fp else -1
+            if pos >= 0:
+                _page_positions.append(pos)
+                _cursor = pos + max(len(fp), 1)
+            else:
+                _page_positions.append(-1)
+            _page_fingerprints.append(fp)
+        except Exception:
+            _page_positions.append(-1)
+            _page_fingerprints.append("")
 
     ocr_parts = []
     total_ocr_chars = 0
@@ -580,10 +722,23 @@ def _v4_inject_ocr_text(pdf_path: str, full_text: str) -> str:
                 continue
 
         if page_ocr_lines:
-            ocr_parts.append(
-                f"[OCR识别: page={page_idx + 1}, images={len(page_ocr_lines)}]\n"
-                + "\n".join(page_ocr_lines)
-            )
+            # ── 🔴 章节面包屑注入: 为 OCR 文字添加上下文 ──
+            page_pos = _page_positions[page_idx] if page_idx < len(_page_positions) else -1
+            breadcrumb = ""
+            section_title = ""
+            if page_pos >= 0 and headings:
+                breadcrumb = _v4_build_breadcrumb(headings, page_pos, page_pos + 500)
+                # 提取最近的章节标题
+                _idx = bisect.bisect_right([h[0] for h in headings], page_pos) - 1
+                if _idx >= 0:
+                    section_title = headings[_idx][1]
+
+            _header = f"[OCR识别: page={page_idx + 1}, images={len(page_ocr_lines)}]"
+            if breadcrumb:
+                _header += f"\n[路径: {breadcrumb}]"
+            if section_title:
+                _header += f"\n[章节: {section_title}]"
+            ocr_parts.append(_header + "\n" + "\n".join(page_ocr_lines))
 
     doc.close()
 
@@ -926,13 +1081,25 @@ def _v4_split_by_api_blocks(
 
 
 def _v4_extract_function_names(text: str) -> List[str]:
-    """从文本中提取 SDK 函数名列表（用于 metadata 和 header tag）"""
-    funcs = set()
-    for m in re.finditer(r'\b([a-z_][a-z0-9_]*_[a-z0-9_]+)\s*\(', text, re.IGNORECASE):
-        fname = m.group(1).lower().strip('_')
+    """
+    从文本中提取 SDK 函数名列表（用于 metadata 和 header tag）。
+
+    保留文档原始大小写（如 robot_Power_on），检索匹配端通过 .lower()
+    实现忽略大小写比对。header tag 中输出为小写以保持一致性。
+    """
+    funcs_raw = set()
+    for m in re.finditer(r'\b([a-zA-Z_][a-zA-Z0-9_]*_[a-zA-Z0-9_]+)\s*\(', text):
+        fname = m.group(1).strip('_')  # 🔴 保留原始大小写，不做 .lower()
         if len(fname) >= 6 and '_' in fname:
-            funcs.add(fname)
-    return sorted(funcs)[:10]
+            funcs_raw.add(fname)
+    # 按小写去重 + 排序（原始大小写中的第一个出现被保留）
+    seen_lower = set()
+    funcs = []
+    for f in sorted(funcs_raw, key=lambda x: x.lower()):
+        if f.lower() not in seen_lower:
+            seen_lower.add(f.lower())
+            funcs.append(f)
+    return funcs[:10]
 
 
 # ============================================================
@@ -981,6 +1148,9 @@ def load_pdfs_v4_dual(
 
             # ── v4 OCR: 多模态图片文本注入 ──
             text = _v4_inject_ocr_text(file_path, text)
+
+            # ── 🔴 PDF 文本清洗: 连字替换 + 括号空格规范化 ──
+            text = _clean_pdf_text(text)
 
             product_id = _resolve_product_id_from_filename(pdf_file)
             parents, children = _v4_build_parent_child_docs(

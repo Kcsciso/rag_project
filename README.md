@@ -1,4 +1,4 @@
-# 📰 NewsPage — 湖南比邻星科技文档智能问答系统
+# 📰 比邻星 (ProximaRAG) — 湖南比邻星科技文档智能问答系统
 
 基于 **RAG（Retrieval-Augmented Generation）** 架构的官方技术文档与使用手册智能问答系统。专为**湖南比邻星科技有限公司**的开发者和用户打造，采用双 A100 GPU 算力底座，底层搭载 **vLLM + 开源大模型**实现完全私有化、低延迟的本地推理。
 
@@ -19,15 +19,15 @@
 - **Query 预处理**（`_preprocess_query`）：多层迭代剥离口语化噪音（25+ 模式）。
 - **产品级物理隔离**（ADR-6）：入库自动打标 → 检索 `where={"product_id":"OpenR6"}` → 未指定时主动反问。
 
-### 🧠 智能上下文扩展与防幻觉（ADR-9/ADR-10/ADR-11）
+### 🧠 智能上下文扩展与防幻觉（ADR-9/ADR-10/ADR-11/ADR-12/ADR-14/ADR-15/ADR-16）
 - **LangGraph v3 Plan-Execute-Synthesize 架构**（ADR-14）：SubGoalPlanner 任务分解 + CrossProductRetrieval 全库检索 + Synthesize 多路融合 + CodeEntityAnchor 代码实体锚定。
-- **v4 切片机制升级**（ADR-15）：API 原子切分 + 标题感知 + Parent-Child 双层索引（70P + 488C，59 个 API 原子块）。
-- **多模态增量更新 + GPU 加速**（ADR-16）：RapidOCR 图片文本抽取 → 切片注入 + MD5 去重 + 级联 Upsert + BM25 动态同步 + GPU 批量嵌入。
+- **v4 切片机制升级**（ADR-15）：API 原子切分 + PDF 连字清洗 (`_clean_pdf_text`) + 原始大小写保留 + 标题感知 + Parent-Child 双层索引（70P + 605C，101 个 API 原子块）。
+- **多模态 OCR + 面包屑注入**（ADR-16）：RapidOCR 图片文本抽取 → `[路径: H1 > H2]` + `[章节: X.Y.Z]` 章节上下文注入。
 - **检索幻觉修复**（v4.1）：function_names 元数据模糊匹配 + 放宽关键词过滤 + kept_docs 安全网 + `_force_no_code` 防幻觉硬拦截 + 产品自动推断隔离。
-- **Extract-Render 两层分离架构**（ADR-12）：**信息提取模式** — 1.5B 模型只从 Context 提取结构化 JSON 实体，代码/步骤/引用由 Python 确定性渲染器生成，从根源消除伪 API 编造、步骤泛化与引用缺失。
-- **SemanticDedup 语义去重**: trigram overlap 检测段落级重复生成并自动截断。
-- **Multi-Product Intent Classifier**: 多产品对比查询自动拆分检索 + 交错合并。
-- **Entity Anchor 实体锚定重排**: 查询含具体数字/专有词时置顶物理包含切片的 RRF 权重。
+- **Extract-Render 两层分离架构**（ADR-12）：**信息提取模式** — 模型只从 Context 提取结构化 JSON 实体，代码/步骤/引用由 Python 确定性渲染器生成。
+- **SDK 重试硬熔断防护**：3 处熔断点（`sdk_verify_node` 入口 + `llm_generation_node` 计数保留 + stream 循环顶部），最大 3 次 LLM 调用，杜绝死循环。
+- **SemanticDedup 语义去重** + **Entity Anchor 实体锚定重排**。
+- **Prompt 注入防御** + **安全注入拦截** (中文+英文双防护)。
 - **ABSTAIN 硬弃答网关**: Context 中实体缺失时直接返回诚实拒答，零 LLM 调用（26ms）。
 - **Contextual Prefixing**: 每个切片注入 `[文档: X | 章节: Y]` 前缀，从物理切片源头隔离参数概念。
 - **父子切片上下文扩展**（Parent-Child Chunking）：检索命中子切片时，自动按章节 ID 捞取同章节兄弟切片，补充完整流程上下文，彻底解决 TCP 四点法、关机步骤等长流程因截断导致总结不完整的问题。
@@ -44,7 +44,7 @@
 - **资源泄露防范**：`shutdown_clients()` 释放 LLM 连接池 + `cleanup_vector_store()` 释放嵌入模型显存，FastAPI `shutdown` 事件自动触发。
 
 ### 🎨 现代化 Web 体验
-- **NewsPage** 科技蓝深色主题，双栏布局（对话 + 上传/状态面板）。
+- **比邻星 (ProximaRAG)** 科技蓝深色主题，双栏布局（对话 + 上传/状态面板）。
 - SSE 流式打字机效果 + Markdown 实时渲染 + `highlight.js` 代码高亮。
 
 ---
@@ -68,7 +68,7 @@ rag_project/
 │   ├── rebuild_v4.py          # v4 向量库重建脚本
 │   └── rag_chain.py           # RAG 四层容灾 + 混合检索 + 口语化预处理 + 安全防御
 ├── templates/
-│   └── index.html             # NewsPage 聊天与文档交互主页面
+│   └── index.html             # 比邻星 聊天与文档交互主页面
 ├── static/
 │   ├── style.css              # 科技蓝深色主题样式
 │   └── app.js                 # SSE 流式通信 + 50ms 节流渲染
@@ -78,9 +78,11 @@ rag_project/
 ├── tunnel.py                  # ngrok 公网穿透脚本
 ├── check_status.py            # 统一服务健康检查（GPU 实时监测）
 ├── start_services.sh          # 一键自适应启动脚本（GPU 智能选择）
-├── test_robot_rag.py          # 核心 RAG 功能自动化回归测试
+├── tests/
+│   ├── eval_cases.json        # 统一评测用例集 v4.3（30 用例）
+│   ├── run_eval.py            # 统一评测运行器
+│   └── TEST_REPORT.md         # 评测报告归档
 ├── test_stability.py          # 多轮对话 + 并发 + 异常降级压力测试
-├── test_human_simulation.py   # 全场景人类模拟测试（14 用例 × 5 类别）
 ├── dev_log.md                 # 完整开发与迭代演进日志（20 章）
 ├── CLAUDE.md                  # AI 协同开发规范与系统红线
 └── README.md                  # 本文件
@@ -95,7 +97,7 @@ rag_project/
 | **硬件底座** | 2 × NVIDIA A100-PCIE-40GB（CUDA 12.4） |
 | **环境管理器** | Conda（`rag_agent`，Python 3.10） |
 | **推理引擎** | vLLM 0.16.0（OpenAI 兼容 API，端口 **8001**） |
-| **默认模型** | `Qwen/Qwen2.5-1.5B-Instruct`（~3.7 GB，GPU 自适应部署） |
+| **默认模型** | `Qwen/Qwen2.5-7B-Instruct-AWQ`（4-bit ~8 GB，GPU 自适应部署）|
 | **云端降级** | 智谱 GLM-4.7-Flash（免费模型，`open.bigmodel.cn`） |
 | **嵌入模型** | `BAAI/bge-small-zh-v1.5`（512 维，中文专优）→ ONNX 自动回退 |
 | **相似度阈值** | 0.68（cosine distance，配合 BM25+RRF 混合检索） |
@@ -149,7 +151,7 @@ CUDA_VISIBLE_DEVICES=1 python -m vllm.entrypoints.openai.api_server \
     --enforce-eager
 ```
 
-**终端 B — NewsPage FastAPI 后端 (端口 7860)**：
+**终端 B — 比邻星 (ProximaRAG) FastAPI 后端 (端口 7860)**：
 ```bash
 conda activate rag_agent
 export HF_ENDPOINT=https://hf-mirror.com
@@ -163,7 +165,7 @@ conda activate rag_agent
 python frontend_server.py
 ```
 
-访问：**`http://localhost:8501`**（页面标题：**NewsPage**）｜API 文档：`http://localhost:7860/docs`
+访问：**`http://localhost:8501`**（页面标题：**比邻星**）｜API 文档：`http://localhost:7860/docs`
 
 ### 4. 外网端口映射
 
@@ -200,11 +202,15 @@ export VLLM_GPU_ID=0                                      # 手动指定 GPU
 
 ## 🧪 自动化测试
 
+**统一评测入口**: `python tests/run_eval.py --verbose`（30 用例）
+
 | 脚本 | 覆盖范围 | 命令 |
 |------|---------|------|
-| `test_human_simulation.py` | 5 类 14 用例（口语噪音、错别字、多轮指代、长文本组合、边界攻击） | `python test_human_simulation.py` |
-| `test_robot_rag.py` | 核心 RAG 功能回归（4 题 × 双模式） | `conda run -n rag_agent python test_robot_rag.py` |
-| `test_stability.py` | 多轮对话 + 并发保护 + 7 种异常降级 | `conda run -n rag_agent python test_stability.py` |
+| `tests/run_eval.py` | 30 用例 (GT + SDK 函数 + 安全注入 + 多轮指代 + 错别字容错 + 多文档对比) | `python tests/run_eval.py --verbose` |
+| `test_stability.py` | 多轮对话 + 并发保护 + 7 种异常降级 | `python test_stability.py` |
+
+📊 **最新评测** (2026-07-27, 7B-AWQ): `tests/TEST_REPORT.md`
+Overall **33.3%** (10/30) · Context Recall **46.3%** · Product Isolation **90.0%** · Format Cleanliness **96.7%**
 
 ---
 
@@ -212,7 +218,7 @@ export VLLM_GPU_ID=0                                      # 手动指定 GPU
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| `GET` | `/` | 渲染 **NewsPage** 主页面 |
+| `GET` | `/` | 渲染 **比邻星 (ProximaRAG)** 主页面 |
 | `POST` | `/api/chat` | RAG 对话（SSE 流式）。参数：`query`（必填）、`history`（可选 JSON）、`stream`（默认 true） |
 | `POST` | `/api/upload` | 上传 PDF 并自动重建向量库 |
 | `GET` | `/api/status` | 返回向量库就绪状态与已索引文档片段数 |
@@ -223,7 +229,7 @@ export VLLM_GPU_ID=0                                      # 手动指定 GPU
 
 有关环境排查、兼容补丁、四层容灾、GPU 自适应、安全加固、混合检索、人类模拟测试等 20 个章节的详细开发记录与架构决策（ADR），请参阅 [dev_log.md](./dev_log.md)。
 
-经过从 2026-07-20 到 07-24 的多轮迭代，NewsPage RAG 系统已经从早期的“单向线性 RAG 管道”**完全演进为**基于 LangGraph 的“Plan-Execute-Synthesize + Extract-Render”确定性 Agent 状态图架构。
+经过从 2026-07-20 到 07-24 的多轮迭代，比邻星 (ProximaRAG) 已经从早期的”单向线性 RAG 管道”**完全演进为**基于 LangGraph 的”Plan-Execute-Synthesize + Extract-Render”确定性 Agent 状态图架构。
 
 系统彻底废弃了针对特定数字/函数的硬编码补丁，形成了具备**高容灾、多产品隔离、语义精准对齐与确定性代码生成**的产品级 RAG 架构。
 

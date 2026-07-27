@@ -1,4 +1,4 @@
-# NewsPage RAG 项目 — 开发日志
+# 比邻星 (ProximaRAG) — 开发日志
 
 > **日期**: 2026-07-20  
 > **开发者**: Kcsciso  
@@ -2377,3 +2377,99 @@ v4 上线后暴露 3 类严重问题：
   - `_infer_product_from_query()`: 从 query 关键词自动推断 product_id
   - `search_similar_with_threshold()`: product_id 为空时自动推断
   - `_match_function_names()` 副本
+
+---
+
+## 2026-07-27 — 数据管道重构 + 系统更名 + SDK 死循环熔断 + 测试套件瘦身
+
+### 背景
+针对全量审计排查发现的切片粘连、PDF 连字缺失清洗、系统名混乱、SDK 重试死循环四类问题执行集中修复。
+
+### 21.1 数据解析管道重构 (pdf_loader.py + vector_store.py)
+
+**ADR-15 v4 切片增强**:
+
+| 模块 | 变更 | 说明 |
+|------|------|------|
+| `_API_BLOCK_PATTERNS` | 新增 2 组中文 SDK 正则 | 匹配 "函数名称 xxx" 段落边界 + 单行函数名，防止 robot_movj/robot_movl 紧邻粘连 |
+| `_clean_pdf_text()` | 新增函数 | 7 种 Latin 连字替换 (oﬀ→off, ﬁ→fi…)、EN/EM DASH 规范化、函数括号空格 3 轮迭代清洗 |
+| `_v4_extract_function_names()` | 保留原始大小写 | 移除 `.lower()`，metadata 存储原始 `robot_Power_on`；检索端 `_match_function_names` 已有 `.lower()` 兼容 |
+| `_v4_inject_ocr_text()` | 章节面包屑注入 | OCR 文字块新增 `[路径: H1 > H2 > H3]` + `[章节: X.Y.Z]` 前缀，消除图片文本无上下文盲区 |
+
+**接入点**: `load_pdfs_v4_dual()` 和 `upsert_product_documents()` 均调用 `_clean_pdf_text()`。
+
+### 21.2 系统全量更名: NewsPage → 比邻星 (ProximaRAG)
+
+覆盖 **15 个文件**:
+- `app.py`: FastAPI title + 日志消息
+- `templates/index.html`: `<title>` + `<h1>` + 欢迎标题
+- `src/rag_chain.py`: `RAG_SYSTEM_PROMPT` + `_IDENTITY_RESPONSE`
+- `CLAUDE.md`: UI 命名规范红线
+- `start_services.sh`, `check_status.py`, `frontend_server.py`, `streamlit_app.py`, `tunnel.py`
+- `test_stability.py`, `test_human_simulation.py`, `test_unified_suite.py`
+- `README.md`, `dev_log.md`
+
+### 21.3 SDK 代码重试死循环熔断防护 (graph_rag.py)
+
+**根因**: `llm_generation_node` 每次返回时无条件 `retry_count: 0`，覆盖 `sdk_verify_node` 的递增 → 路由函数永远看到 0≤2 → 无限回环。
+
+**修复 (3 处)**:
+
+| 位置 | 变更 |
+|------|------|
+| `sdk_verify_node` (L824) | 入口硬熔断: `retry_count >= 2` → 直接 `feedback=""` 跳过校验 |
+| `llm_generation_node` (L800) | `retry_count: 0` → `retry_count: state.get("retry_count", 0)` 保留计数 |
+| `run_graph_stream` while 循环 (L1755) | 顶部熔断: `retry_count > max_retries` → `break` |
+
+**效果**: 最大 3 次 LLM 调用 (初始 + 2 重试)，绝不超过。eval 30 用例零 Hang。
+
+### 21.4 Bug 修复: `_call_llm()` 参数兼容
+
+**问题**: `subgoal_planner_node` 调用 `_call_llm(..., max_tokens=256)` 但函数签名不支持 → Planner 崩溃降级。
+
+**修复**: `_call_llm` 签名改为 `def _call_llm(client, model, messages, max_tokens=384, temperature=0.2)`。
+
+### 21.5 产品路由优化 (graph_rag.py)
+
+| 变更 | 说明 |
+|------|------|
+| `_route_after_product_routing` | `clarify` 状态直接返回 `build_direct_response`，不进入 Planner |
+| `product_routing_node` | 无产品 + 有业务意图 + 原始 query 长度 ≥12 → `route_status="generate"` 跨产品搜索；否则 → `clarify` 反问 |
+
+### 21.6 测试套件瘦身
+
+删除 4 个已统一重构的旧测试脚本:
+- `test_robot_rag.py` (已删除)
+- `test_multidoc_simulation.py` (已删除)
+- `test_human_simulation.py` → 已删除
+- `test_unified_suite.py` → 已删除
+
+`tests/` 目录保留 3 个核心文件: `eval_cases.json`, `run_eval.py`, `TEST_REPORT.md`。
+
+### 测试结果 (2026-07-27, 7B-AWQ, 30 用例)
+
+| 指标 | 数值 | 说明 |
+|------|------|------|
+| Overall Pass | 33.3% (10/30) | 含 E17-E24 新增高难度用例 |
+| Context Recall | 46.3% (25/54 关键词) | 3 切片 × 200 char 为主要瓶颈 |
+| Product Isolation | 90.0% | 仅 3 例跨产品污染 |
+| Format Cleanliness | 96.7% (29/30) | E17 JSON 泄露需修复 |
+| 安全注入防御 | 2/2 100% | E19(英文)+E20(中文) 全部拦截 |
+| 硬熔断触发 | 3 次 (E02/E09/E23) | 全部正确生效，零死循环 |
+
+详细报告: `tests/TEST_REPORT.md`
+
+### 变更文件汇总
+
+| 文件 | 变更类型 | 关键变更 |
+|------|----------|----------|
+| `src/pdf_loader.py` | 增强 | API 锚点扩展 + `_clean_pdf_text()` + 大小写保留 + OCR 面包屑 |
+| `src/vector_store.py` | 增强 | `_clean_pdf_text()` 接入 upsert 管线 |
+| `src/rag_chain.py` | 修复 | `_call_llm()` max_tokens 参数支持 |
+| `src/graph_rag.py` | 修复+增强 | SDK 熔断 (3处) + 产品路由优化 + clarify 路由修复 |
+| `app.py` | 更名 | NewsPage → 比邻星 (ProximaRAG) |
+| 15 文件 | 更名 | 全局系统标识更新 |
+| `tests/*` | 清理 | 删除 4 旧脚本，新增 TEST_REPORT.md |
+| `dev_log.md` | 文档 | 本次条目 |
+| `README.md` | 文档 | 功能描述同步 |
+| `CLAUDE.md` | 文档 | 红线与测试规则更新 |

@@ -96,7 +96,7 @@ def start_tunnel(port: int = 8000, auth_token: str = None):
 # ============================================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="NewsPage — ngrok 内网穿透工具"
+        description="比邻星 (ProximaRAG) — ngrok 内网穿透工具"
     )
     parser.add_argument(
         "--port", "-p",

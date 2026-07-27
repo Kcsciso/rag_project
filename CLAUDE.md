@@ -8,13 +8,9 @@
   - 自动选择**剩余显存最大的 GPU**（过滤空闲 < 5 GB 的 GPU）。
   - 手动覆盖方式：`--gpu <id>` 参数 或 `VLLM_GPU_ID` 环境变量。
 - **默认分配**（自动检测无结果时的回退）:
-  - GPU 1（端口 **8001**）：本地 vLLM 推理服务，当前模型 **Qwen2.5-3B-Instruct**（已缓存 ~4.6GB，`--gpu-memory-utilization 0.20`）。升级目标：**Qwen2.5-7B-Instruct-AWQ**（4-bit 量化 ~8GB，待下载权重 ~15GB）。
+  - GPU 1（端口 **8001**）：本地 vLLM 推理服务，当前模型 **Qwen2.5-7B-Instruct-AWQ**（4-bit 量化 ~8GB，`--gpu-memory-utilization 0.25`）。
   - GPU 0：向量检索引擎（ChromaDB / PyTorch 嵌入计算）。**注意**：GPU 0 为多人共享，高峰期空闲仅 ~16 MB。
-- **GPU 升级路径**：当前默认 `Qwen2.5-3B-Instruct`（已缓存）。升级至 7B AWQ 需先下载权重：
-  ```bash
-  VLLM_USE_MODELSCOPE=true python -c "from vllm import LLM; LLM(model='Qwen/Qwen2.5-7B-Instruct-AWQ', quantization='awq')"
-  ```
-  下载完成后将 `src/config.py` 中 MODEL_NAME 改为 `Qwen/Qwen2.5-7B-Instruct-AWQ`。空闲 < 5GB 时自动降级至 1.5B。
+- **GPU 升级路径**：已从 3B 升级至 **7B AWQ**。空闲 < 5GB 时自动降级至 1.5B。
 - **核心操作**：启动推理或训练脚本前必须显式指定 `CUDA_VISIBLE_DEVICES`（优先使用自动检测结果）。
 
 ## 2. 核心依赖红线（严禁升级）
@@ -34,11 +30,11 @@
 
 - **可用框架**: LangChain、LangGraph、ChromaDB、faiss-gpu。
 - **LLM 推理引擎**: 本地 `vllm` OpenAI 兼容服务。
-  - **Layer 1（主模型）**: `Qwen/Qwen2.5-3B-Instruct`（已缓存），`http://localhost:8001/v1`，GPU 自适应，`--gpu-memory-utilization 0.20`，`--max-model-len 8192`，`--enforce-eager`。升级目标：`Qwen/Qwen2.5-7B-Instruct-AWQ`（4-bit 量化，用 `VLLM_USE_MODELSCOPE=true` 从 ModelScope 下载）。
+  - **Layer 1（主模型）**: `Qwen/Qwen2.5-7B-Instruct-AWQ`（已部署），`http://localhost:8001/v1`，GPU 自适应，`--gpu-memory-utilization 0.25`，`--max-model-len 8192`，`--enforce-eager`。回退：`Qwen2.5-1.5B-Instruct`。
   - **Layer 2（云端降级）**: `glm-4.7-flash`（智谱 GLM-4.7-Flash），端点 `https://open.bigmodel.cn/api/paas/v4`，认证 `ZHIPU_API_KEY`。
   - **超时策略**: `connect=2.0s / read=12.0s / write=12.0s / pool=2.0s`（激进失败 → 快速降级）。
 - **嵌入模型**: `all-MiniLM-L6-v2`（384 维），可切换 `BAAI/bge-small-zh-v1.5`（512 维，中文专优）。HuggingFace → ONNX 自动回退。
-- **UI 命名规范**: 前端界面或网页标题（HTML `<title>` 与 header）**必须**命名为 **NewsPage**。
+- **UI 命名规范**: 前端界面或网页标题（HTML `<title>` 与 header）**必须**命名为 **比邻星**（产品代号 ProximaRAG）。
 
 ## 4. 安全开发红线（新增）
 
@@ -126,6 +122,18 @@ START → query_fusion → product_routing → hybrid_retrieval → llm_generati
 - ✅ **通用免疫**：对齐逻辑基于 Context KV 对比，而非特定产品/数字的 if-else
 - ✅ **自纠错不中断**：SDK 重试上限 2 次，超限后放弃修复进入对齐，绝不卡死
 - ✅ **所有既有 API 兼容**：`run_graph()` / `run_graph_stream()` 签名不变，`app.py` 零改动
+
+### 5.5.7 SDK 代码重试硬熔断防护（2026-07-27）
+
+针对 SDK 自纠错回环中的死循环 Bug，在 3 个关键位置增加硬熔断：
+
+| 位置 | 熔断机制 |
+|------|---------|
+| `sdk_verify_node` 入口 | `retry_count >= 2` → 直接 `feedback=""` 跳过校验 |
+| `llm_generation_node` 返回 | 保留 state 传入的 `retry_count`，不再无条件重置为 0 |
+| `run_graph_stream` while 循环顶部 | `retry_count > 2` → `break` 跳出循环 |
+
+**熔断路径**: 初始生成 → SDK 校验 (0→1) → 重试 #1 (1→2) → 重试 #2 → 硬熔断 → extract_align → END。最大 3 次 LLM 调用，绝不无限回环。
 
 ## 5.6 Extract-Render 两层分离架构（ADR-12，2026-07-24）
 
@@ -303,8 +311,8 @@ CHILD_CHUNK_SIZE = 400     # H3/H4 函数级子层（API 原子）
 - **`search_similar_with_threshold()`**: product_id 为空时自动推断，无法推断时按产品分组标注
 - **`_is_sdk_code_query()`** (`rag_chain.py`): 本地 SDK 代码查询检测（避免跨模块循环导入）
 
-- 🔴 **测试红线（v4.2）**: 每次修改 `rag_chain.py` 或 `graph_rag.py` 后，必须先运行 `python tests/run_eval.py --verbose` 并确保 **100% PASS**（含 4 项硬质量断言），才能交付。禁止跳过。
-- 旧测试脚本: `test_robot_rag.py` 和 `test_multidoc_simulation.py` 已删除，用例已合并至 `tests/eval_cases.json`。`test_rag_eval.py` / `test_human_simulation.py` / `test_unified_suite.py` / `test_stability.py` 保留向后兼容。
+- 🔴 **测试红线（v4.3）**: 每次修改 `rag_chain.py` 或 `graph_rag.py` 后，必须先运行 `python tests/run_eval.py --verbose` 并查看 `tests/TEST_REPORT.md`。**v4.3 新增要求**：评估不得出现 Hang/死循环；若硬熔断触发超过 5 次需排查根因。
+- 旧测试脚本 `test_robot_rag.py`、`test_multidoc_simulation.py`、`test_human_simulation.py`、`test_unified_suite.py` 已删除。统一评测入口：`tests/run_eval.py` + `tests/eval_cases.json`。
 - 在执行破坏性 Bash 命令或安装软件包之前，必须征得用户的明确授权。
 - 所有重大架构调整、Ablation 实验及 Git 提交必须记录在 `dev_log.md` 中。
 - 严禁删除 Conda 环境 `site-packages/pyairports/` 下的 Shim 适配层。
@@ -363,7 +371,7 @@ export HF_ENDPOINT=https://hf-mirror.com
 python app.py
 ```
 
-- 服务地址：`http://localhost:8000`（页面标题：**NewsPage**）
+- 服务地址：`http://localhost:8000`（页面标题：**比邻星 (ProximaRAG)**）
 - API 文档：`http://localhost:8000/docs`
 
 **环境变量覆盖**：
@@ -621,7 +629,7 @@ HOST = "0.0.0.0"
 PORT = 8000
 
 # API 路由
-# GET  /                → NewsPage 主页面
+# GET  /                → 比邻星 主页面
 # POST /api/chat        → RAG 对话（新增 product_id 表单参数，支持流式 SSE）
 # POST /api/upload      → 上传 PDF 并重建向量库（上传前清空旧库，返回 product_distribution）
 # GET  /api/status      → 向量库状态

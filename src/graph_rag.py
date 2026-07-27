@@ -413,11 +413,18 @@ def product_routing_node(state: RAGState) -> dict:
         elif len(all_products) == 1:
             product_id = all_products[0]
 
-    # ── 意图 3: 产品未识别 → 反问澄清 ──
+    # ── 意图 3: 产品未识别 → 反问澄清 或 跨产品搜索 ──
     if not product_id:
         from .rag_chain import _resolve_product_from_query as _resolve
         product_id = _resolve(query)
         if not product_id:
+            # 🔴 若 query 包含业务意图且原始长度足够（≥12 字符），路由到跨产品搜索。
+            # 用原始 query（pre-noise-stripping）判断长度，避免噪音剥离后的短词误入 clarify。
+            _orig_query = state.get("query", "") or query
+            if _has_business_intent(query) and len(_orig_query.strip()) >= 12:
+                logger.info("  ↳ route_status='generate' (no product but has business intent, orig_len≥12 → cross-product)")
+                return {"route_status": "generate", "product_id": None,
+                        "sources": [], "model": "cross-product-router"}
             registered = get_registered_products()
             resp = _build_clarification_response(registered)
             logger.info("  ↳ route_status='clarify'")
@@ -440,10 +447,9 @@ def _route_after_product_routing(state: RAGState) -> str:
       - 需要检索生成 → "hybrid_retrieval"
     """
     status = state.get("route_status", "generate")
-    if status in ("chitchat", "refuse"):
+    if status in ("chitchat", "refuse", "clarify"):
+        # 🔴 clarify 直接返回反问文本，不进入 Planner（避免 Planner 降级为跨产品搜索后产生幻觉代码）
         return "build_direct_response"
-    # v3: clarify 也进入 SubGoalPlanner — 由 Planner 决定是反问还是跨产品检索
-    # 仅纯拒绝/闲聊直接返回
     return "subgoal_planner"
 
 
@@ -790,8 +796,8 @@ def llm_generation_node(state: RAGState) -> dict:
         "sources": sources,
         "model": used_model,
         "route_status": "complete",
-        "feedback": "",       # 成功后清除反馈
-        "retry_count": 0,     # 成功后重置计数器
+        "feedback": "",                              # 成功后清除反馈
+        "retry_count": state.get("retry_count", 0),  # 🔴 保留当前重试计数，不重置（防死循环）
     }
 
 
@@ -816,8 +822,17 @@ def sdk_verify_node(state: RAGState) -> dict:
     query = state.get("fused_query") or state.get("query", "")
     raw_answer = state.get("raw_llm_answer") or state.get("final_answer", "")
     retry_count = state.get("retry_count", 0)
+    _MAX_RETRIES = 2
 
     logger.info(f"🔴 [Node 5] SDK_Verify: retry_count={retry_count}")
+
+    # ── 🔴 硬熔断: 重试次数已达上限 → 无条件放弃修复，透传当前回答 ──
+    if retry_count >= _MAX_RETRIES:
+        logger.warning(
+            f"  ↳ 🔴 SDK 重试硬熔断: retry_count={retry_count} >= {_MAX_RETRIES}，"
+            f"放弃修复，透传当前回答"
+        )
+        return {"feedback": "", "retry_count": retry_count}
 
     # ── 规则 1: 非 SDK 查询 → 跳过 ──
     if not _is_sdk_query(query):
@@ -1745,6 +1760,14 @@ def run_graph_stream(
     feedback = ""
 
     while True:
+        # ── 🔴 硬熔断: 重试次数已达上限 → 跳出循环，透传当前回答 ──
+        if retry_count > max_retries:
+            logger.warning(
+                f"🔴 [Stream] SDK 重试硬熔断: retry_count={retry_count} > {max_retries}，"
+                f"跳出循环，透传当前回答"
+            )
+            break
+
         # 构建消息（含自纠错反馈）
         try:
             messages = _build_messages(fused_query, context_docs, chat_history)

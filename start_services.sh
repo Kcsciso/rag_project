@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# NewsPage 自动化启动脚本
+# 比邻星 (ProximaRAG) 自动化启动脚本
 # =============================================================================
 #
 # 功能：
@@ -8,7 +8,7 @@
 #   2. 智能 GPU 选择：通过 nvidia-smi 探测所有 GPU 空闲显存，
 #      自动绑定剩余显存最大的 GPU（可通过 --gpu <id> 手动覆盖）
 #   3. 后台拉起本地 vLLM 推理服务（端口 8001）
-#   4. vLLM 就绪后自动启动 NewsPage FastAPI 后端（端口 8000）
+#   4. vLLM 就绪后自动启动 比邻星 (ProximaRAG) FastAPI 后端（端口 8000）
 #   5. 优雅退出：Ctrl+C 时自动清理 vLLM 后台进程
 #
 # 使用方式：
@@ -75,7 +75,7 @@ log_detail()  { echo -e "        ${DIM}$1${NC}"; }
 banner() {
     echo ""
     echo -e "${CYAN}╔══════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}${BOLD}     NewsPage 服务启动脚本                          ${NC}${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}${BOLD}     比邻星 (ProximaRAG) 服务启动脚本              ${NC}${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}${DIM}     湖南比邻星科技 — 文档智能问答系统               ${NC}${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════╝${NC}"
     echo ""
@@ -221,7 +221,7 @@ cleanup() {
         log_info "vLLM 已停止"
     fi
 
-    log_info "NewsPage 服务已全部关闭"
+    log_info "比邻星 (ProximaRAG) 服务已全部关闭"
     exit 0
 }
 
@@ -348,7 +348,7 @@ start_vllm() {
 }
 
 start_fastapi() {
-    log_step "第 2 步：启动 NewsPage FastAPI 后端"
+    log_step "第 2 步：启动 比邻星 (ProximaRAG) FastAPI 后端"
 
     if ! check_port $FASTAPI_PORT "FastAPI"; then
         # 🔴 v4 修复: 端口被占用时，先检测是否为可用的 FastAPI
@@ -374,7 +374,7 @@ start_fastapi() {
     export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
     export HF_HUB_OFFLINE=1
 
-    log_info "启动 NewsPage FastAPI 应用..."
+    log_info "启动 比邻星 (ProximaRAG) FastAPI 应用..."
     log_detail "端口:       ${FASTAPI_PORT}"
     log_detail "访问:       ${CYAN}http://localhost:${FASTAPI_PORT}${NC}"
 

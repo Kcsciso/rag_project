@@ -308,18 +308,26 @@ def _release_vllm_lock():
 # LLM 调用辅助函数（DRY 原则 — 双通道复用同一调用逻辑）
 # ============================================================
 
-def _call_llm(client: OpenAI, model: str, messages: List[Dict[str, str]]) -> str:
+def _call_llm(client: OpenAI, model: str, messages: List[Dict[str, str]],
+              max_tokens: int = 384, temperature: float = 0.2) -> str:
     """
     调用 LLM 完成非流式推理，返回完整回答文本。
 
     将 client.chat.completions.create() 封装为独立函数，
     便于 rag_chat() 中 Layer 1 / Layer 2 复用同一调用逻辑。
+
+    Args:
+        client: OpenAI 客户端实例
+        model: 模型名称
+        messages: 消息列表
+        max_tokens: 最大输出 token 数（默认 384，Planner 用 256）
+        temperature: 采样温度（默认 0.2）
     """
     response = client.chat.completions.create(
         model=model,
         messages=messages,
-        temperature=0.2,            # 🔴 0.2：足够确定性，防止 3B 模型输出感叹号刷屏
-        max_tokens=384,             # 🔴 384：工业问答足矣（~250 中文字），控制 input+output < 4096
+        temperature=temperature,            # 🔴 0.2：足够确定性，防止 3B 模型输出感叹号刷屏
+        max_tokens=max_tokens,              # 🔴 384：工业问答足矣（~250 中文字），256 for Planner
         extra_body={
             "repetition_penalty": 1.1,  # 🔴 适度惩罚重复，封杀 !!! 死循环
         },
@@ -1353,7 +1361,7 @@ def _direct_retrieval_response_stream(
 # Prompt 模板 — RAG 的核心"咒语"
 # ============================================================
 
-RAG_SYSTEM_PROMPT = """你是由湖南比邻星科技有限公司开发的官方开发与使用文档智能助手。
+RAG_SYSTEM_PROMPT = """你是由湖南比邻星科技有限公司开发的"比邻星 (ProximaRAG)"官方开发与使用文档智能助手。
 你的任务是基于提供的公司内部文档资料，准确、专业地回答用户关于公司产品、
 API 接口、开发指南和使用手册的问题。
 
@@ -2000,7 +2008,7 @@ _CHITCHAT_PATTERNS = [
     r'^(谢谢|感谢|多谢|谢了|thanks|thank)[\s!！。.]*$',
 ]
 
-_IDENTITY_RESPONSE = """你好！我是 **NewsPage** —— 由湖南比邻星科技研发的 **机器人与工业 SDK 智能文档助手**。
+_IDENTITY_RESPONSE = """你好！我是 **比邻星 (ProximaRAG)** —— 由湖南比邻星科技研发的 **机器人与工业 SDK 智能文档助手**。
 
 📚 **我能帮你做什么？**
 - 🔧 **JAKA 机械臂**：Zu APP 操作指南、控制柜电气参数、错误代码排查

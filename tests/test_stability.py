@@ -327,7 +327,7 @@ def test_stream_degradation(vs):
 # ============================================================
 
 def main():
-    print_section("NewsPage RAG 稳定性压力测试")
+    print_section("比邻星 (ProximaRAG) 稳定性压力测试")
     print(f"  时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  模型: {MODEL_NAME}")
     print(f"  Top-K: {RETRIEVAL_K} | 阈值: {SIMILARITY_THRESHOLD} | 历史轮数限制: {MAX_HISTORY_TURNS}")
