@@ -309,27 +309,24 @@ def _release_vllm_lock():
 # ============================================================
 
 def _call_llm(client: OpenAI, model: str, messages: List[Dict[str, str]],
-              max_tokens: int = 384, temperature: float = 0.2) -> str:
+              max_tokens: int = 2048, temperature: float = 0.2) -> str:
     """
     调用 LLM 完成非流式推理，返回完整回答文本。
-
-    将 client.chat.completions.create() 封装为独立函数，
-    便于 rag_chat() 中 Layer 1 / Layer 2 复用同一调用逻辑。
 
     Args:
         client: OpenAI 客户端实例
         model: 模型名称
         messages: 消息列表
-        max_tokens: 最大输出 token 数（默认 384，Planner 用 256）
+        max_tokens: 最大输出 token 数（默认 1024，代码查询 2048，Planner 用 256）
         temperature: 采样温度（默认 0.2）
     """
     response = client.chat.completions.create(
         model=model,
         messages=messages,
-        temperature=temperature,            # 🔴 0.2：足够确定性，防止 3B 模型输出感叹号刷屏
-        max_tokens=max_tokens,              # 🔴 384：工业问答足矣（~250 中文字），256 for Planner
+        temperature=temperature,
+        max_tokens=max_tokens,
         extra_body={
-            "repetition_penalty": 1.1,  # 🔴 适度惩罚重复，封杀 !!! 死循环
+            "repetition_penalty": 1.1,
         },
     )
     return response.choices[0].message.content
@@ -353,7 +350,7 @@ def _stream_llm(
         model=model,
         messages=messages,
         temperature=0.2,
-        max_tokens=384,
+        max_tokens=2048,  # 🔴 2048：完整代码链路 + POSE 结构体 + 多函数示例
         stream=True,
         extra_body={
             "repetition_penalty": 1.1,
@@ -1365,10 +1362,18 @@ RAG_SYSTEM_PROMPT = """你是由湖南比邻星科技有限公司开发的"比�
 你的任务是基于提供的公司内部文档资料，准确、专业地回答用户关于公司产品、
 API 接口、开发指南和使用手册的问题。
 
+🔴【顶层认知·API 即步骤】在技术 SDK 手册中，函数签名（如 robot_Power_on()、robot_movl()）
+即为该功能的标准操作方法。当用户询问"怎么上电/怎么运动/怎么连接"时，给出对应函数名的
+正确 ctypes 调用代码即为完整解答。严禁因未看到"第一步…第二步…"等文字版操作步骤而拒答。
+
 请严格遵守以下规则：
-1. 🔴【最高优先级·防幻觉】回答必须严格基于【参考资料】中的内容。
-   函数名、参数名、DLL 名称、结构体名称必须与参考资料**逐字一致**，
-   严禁自行编造、猜测或使用语义相近的替代名称。
+1. 🔴【最高优先级·标识符字面锚定】回答中的所有 API 函数名、结构体名称、DLL 文件名
+   必须与【参考资料】**逐字符 100% 一致**。严禁进行任何规范化扩展、拼写修正、英文补全
+   或语义改写。例如：
+   - 原文 robot_movl → 只能写 robot_movl，严禁写成 robot_move_linear / move_linear
+   - 原文 robot_Power_on → 只能写 robot_Power_on，严禁写成 robot_power_up
+   - 原文 POSE → 只能写 POSE，严禁写成 Pose / RobotPose
+   - 🚫 严禁在 Context 无对应接口时脑补"假设有 robot_xxx 函数"或使用通用英文补全
    如果参考资料中没有明确记载某个函数名，必须如实告知用户
    "根据现有文档，无法找到该函数的明确记载，建议联系技术支持或查阅最新 SDK 文档"，
    绝不允许输出一个"看起来合理"的虚构函数名。
@@ -1451,33 +1456,30 @@ API 接口、开发指南和使用手册的问题。
    - 🚫 严禁推测或补充步骤的前置状态、中间状态、后续状态
    - 🔴 只输出参考资料中**逐字出现**的描述，不增减任何修饰词、时间词、颜色词、位置词
 
-12. 🔴【通用属性对齐·Few-Shot 示例】以下示例演示"严格原文 KV 关联复述，禁止属性词颠倒"的规范：
+12. 🔴【通用属性对齐·Few-Shot 示例（泛化版）】以下示例演示"严格原文 KV 关联复述"的规范：
 
-   【Few-Shot 示例 1 — 端口属性精确归因】
-   Context 原文: "...Modbus TCP 通信端口号为 6502..."
-   用户问: "JAKA 的端口号是多少？"
-   ✅ 正确回答: "根据《JAKA ZU APP-使用手册》【Modbus通讯设置】的记载：Modbus TCP 通信端口号为 6502。"
-   🚫 错误: "Modbus 从站地址为 6502"          ← 属性词"端口号"被篡改为"从站地址"！
-   🚫 错误: "设备标识符为 6502"                ← 属性词"端口号"被篡改为"设备标识符"！
-   🚫 错误: "默认端口是 502"                   ← 编造了 Context 中未出现的数值 502！
+    【示例 1 — 属性精确归因】
+    Context 原文: "...[属性词] 为 [数值]..."
+    用户问: "[产品] 的 [属性词] 是多少？"
+    ✅ 正确: "根据《[文档名]》【[章节]】的记载：[属性词] 为 [数值]。"
+    🚫 错误: "[错误属性词] 为 [数值]"       ← 属性词被篡改！
 
-   【Few-Shot 示例 2 — 步骤原文逐字复述】
-   Context 原文: "...点击【连接】按钮，指示灯变为蓝色，即表示连接成功。"
-   用户问: "怎么确认 JAKA 连接成功？"
-   ✅ 正确: "点击【连接】按钮，指示灯变为蓝色即表示连接成功。"
-   🚫 错误: "初始指示灯为红色，点击连接按钮后变为蓝色" ← 自行添加了"初始为红色"！
-   🚫 错误: "界面右上角的指示灯变为蓝色"             ← 自行添加了"右上角"！
-   🚫 错误: "等待约 3 秒后指示灯变为蓝色"            ← 自行添加了"约 3 秒"！
+    【示例 2 — 步骤原文逐字复述】
+    Context 原文: "...[操作动作]，[状态变化]，即表示 [结果]。"
+    用户问: "怎么确认 [操作] 成功？"
+    ✅ 正确: "[逐字复述 Context 原文]"
+    🚫 错误: 添加了 Context 中未记载的细节描述
 
-   【关键原则】
-   - 每个数值（6502, 9600, 192.168.11.214）必须与其 Context 原文中的属性词绑定，不可互换
-   - 端口号不能说成地址，地址不能说成标识符，波特率不能说成频率
-   - 步骤描述只复述原文，不补充任何观察/推测/时间/位置/颜色变化
+    【关键原则】
+    - 每个数值必须与其 Context 原文中的属性词绑定，不可互换
+    - 步骤描述只复述原文，不补充任何观察/推测/时间/位置/颜色变化
 
-🔧 代码输出规范（不可覆盖）：
-- POSE 结构体包含 6 个字段 (px, py, pz, Rx, Ry, Rz)，定义时至少展示这 6 个字段的类型
-- 禁止反复输出重复的数据结构字段（如 Lz1, Lz2, ... Lz28），这会导致输出刷屏
-- 所有输出代码必须使用 ```python 语言标记包裹
+🔧 回答格式硬约束（不可覆盖）：
+- 🔴 所有回答必须使用**纯 Markdown 格式**，使用标准 Markdown 语法（标题 ##、列表 -、代码块 ```python、加粗 **）
+- 🚫 **严禁**输出任何 JSON 结构（包括 `{"doc": ..., "steps": [...]}`、`【提取】...【提取结束】` 等）
+- 🚫 **严禁**在 Markdown 代码块中嵌套 JSON 数据
+- ✅ 步骤类回答必须使用 Markdown 有序列表：`1. 第一步\n2. 第二步\n...`
+- ✅ 代码类回答使用 ```python 代码块，文档引用使用 `根据《文档名》【章节】` 格式
 
 📐 LaTeX 数学公式规范（不可覆盖）：
 - 行内变量使用单个 $ 包裹：`$V_{\\text{Brake}}$`
@@ -1512,29 +1514,15 @@ API 接口、开发指南和使用手册的问题。
 - 🚫 严禁省略任何前缀、后缀或改变函数名的大小写拼写。
 - 🔴 函数名必须与参考资料**逐字符一致**，此规则优先级高于所有通用编程命名惯例。
 
-🔧 信息提取模式 Extract Mode（最高优先级 — 代码/步骤/参数类查询必须遵守）：
-- 当用户询问以下任一类问题时，**禁止**直接写完整答案，必须输出 JSON 提取块：
-  - SDK 函数名 / API 调用 / 代码示例
-  - 操作步骤 / 设置流程
-  - 硬件参数 / 运行环境 / 配置要求
-- JSON 格式（只输出参考资料中逐字出现的内容）：
-  ```
-  【提取】
-  {
-    "doc": "完整文档名",
-    "section": "章节标题",
-    "functions": [{"name": "函数名", "signature": "完整签名", "dll": "DLL文件名"}],
-    "steps": ["步骤原文1", "步骤原文2"],
-    "params": {"属性词": "数值"},
-    "hardware": {"配置项": "原文描述"}
-  }
-  【提取结束】
-  ```
-- 🚫 只填参考资料中**逐字存在**的字段，没有的字段不填。
-- 🚫 functions 中的函数名/签名/DLL 必须**逐字复制**，严禁改写。例如原文 `robot_movl(POSE pose, float vel, int block)` → 必须原样输出 `"signature": "robot_movl(POSE pose, float vel, int block)"`，严禁写成 `move_linear(x, y, z)`。
-- 🚫 steps 必须按原文顺序、原文措辞，不增减步骤、不加时间/颜色/位置修饰词。
-- 🚫 params/hardware 的数值必须与原文一致（原文 i3 就是 i3，不准写成 i5）。
-- 🔴 如果无法从参考资料中提取到具体字段，输出 `{"doc": "...", "section": "...", "note": "参考资料未记载此细节"}`。
+🔧 输出模式硬约束（最高优先级）：
+- 🚫 **绝对禁止**输出 `【提取】...【提取结束】` 包裹的 JSON 块
+- 🚫 **绝对禁止**输出 `{"doc": "...", "steps": [...], "functions": [...]}` 等 JSON 结构
+- ✅ 所有回答必须为**人类可读的纯 Markdown 文本**：
+  - 代码示例 → ```python ... ```
+  - 操作步骤 → 1. 2. 3. 有序列表
+  - 参数/配置 → Markdown 表格或列表
+  - 文档引用 → `根据《文档名》【章节】的记载：`
+- 🔴 违反此规则的回答将被视为格式错误
 
 🔢 数值硬绑定规则（不可覆盖）：
 - 回答中的所有端口、波特率、电压、IP 地址、从站 ID、功率等数值必须 **100% 严格复述**
@@ -1679,40 +1667,73 @@ def _expand_parent_sections(
     max_siblings: int = 2,
 ) -> List:
     """
-    父子切片上下文扩展：当检索命中某个子切片时，自动补充同章节的兄弟切片。
+    父子切片上下文扩展 v2: 兄弟切片 + Parent 文档合并。
 
-    场景：TCP 四点法步骤分布在 5 个连续切片中，检索命中第 1 和第 3 片，
-    但缺失了中间的 2 和尾部的 4-5。通过章节 ID 匹配，自动补充缺失的兄弟切片，
-    确保 LLM 获得完整流程。
+    场景:
+      1. 兄弟切片: TCP 四点法步骤分布在 5 个连续切片中，补充缺失的同章节切片
+      2. Parent 合并: 当 Child 命中操作步骤类章节且含 parent_id 时，
+         自动从 ChromaDB 拉取 Parent 切片（完整章节背景），
+         插入到该 Child 前面，防止 LLM 因切片断层而误判"缺乏详细步骤"
 
     Args:
         retrieved_docs: 已检索到的 top-K 切片
-        vector_store: ChromaDB 实例（用于捞兄弟切片）
+        vector_store: ChromaDB 实例
         product_id: 产品隔离 ID
         max_siblings: 每个章节最多额外补充几个兄弟切片
 
     Returns:
-        扩展后的切片列表（原始切片在前，兄弟切片追加在后）
+        扩展后的切片列表
     """
     if not retrieved_docs or vector_store is None:
         return retrieved_docs
 
-    # 第 1 步：从已检索切片中提取唯一的章节 ID
+    # ── 第 0 步: Parent 文档合并 ──
+    _PROCEDURAL_KEYWORDS = re.compile(
+        r'(?:步骤|操作|配置|设置|安装|连接|启动|关闭|升级|校准|调试|编程)',
+    )
+    parent_ids_to_fetch = set()
+    for doc in retrieved_docs:
+        pid = doc.metadata.get("parent_id", "") if hasattr(doc, "metadata") else ""
+        if pid and _PROCEDURAL_KEYWORDS.search(doc.page_content):
+            parent_ids_to_fetch.add(pid)
+
+    parent_docs_inserted = []
+    existing_fps = {doc.page_content[:120] for doc in retrieved_docs}
+
+    if parent_ids_to_fetch:
+        try:
+            parent_data = vector_store._collection.get(
+                ids=list(parent_ids_to_fetch),
+                include=["documents", "metadatas"],
+            )
+            for i, pid in enumerate(parent_data.get("ids", [])):
+                fp = parent_data["documents"][i][:120]
+                if fp not in existing_fps:
+                    from langchain_core.documents import Document as LCDoc
+                    parent_doc = LCDoc(
+                        page_content=parent_data["documents"][i],
+                        metadata={**parent_data["metadatas"][i], "source_type": "parent_context"},
+                    )
+                    parent_docs_inserted.append(parent_doc)
+                    existing_fps.add(fp)
+        except Exception as e:
+            logger.debug(f"Parent 合并失败: {e}")
+
+    if parent_docs_inserted:
+        logger.info(
+            f"📖 Parent 上下文合并: {len(parent_docs_inserted)} 个 Parent 切片"
+            f" ({len(parent_ids_to_fetch)} 个唯一 parent_id)"
+        )
+
+    # ── 第 1 步: 兄弟切片扩展 ──
     section_ids = set()
     for doc in retrieved_docs:
         m = _SECTION_ID_RE.search(doc.page_content)
         if m:
-            # 3.1.5.1 → 取父级 3.1.5 做宽匹配；完整 ID 做精确匹配
             section_id = m.group(1)
             section_ids.add(section_id)
 
-    if not section_ids:
-        return retrieved_docs
-
-    # 第 2 步：对每个章节 ID，捞取兄弟切片
-    existing_fingerprints = {doc.page_content[:120] for doc in retrieved_docs}
     siblings = []
-
     for sid in section_ids:
         try:
             # 用章节 ID 做精确文本搜索（在 ChromaDB 中按内容检索）
@@ -1723,7 +1744,7 @@ def _expand_parent_sections(
             added = 0
             for cand in candidates:
                 fp = cand.page_content[:120]
-                if fp not in existing_fingerprints and added < max_siblings:
+                if fp not in existing_fps and added < max_siblings:
                     # 只取同一章节的切片
                     if sid in cand.page_content:
                         existing_fingerprints.add(fp)
@@ -1734,11 +1755,11 @@ def _expand_parent_sections(
 
     if siblings:
         logger.info(
-            f"📖 父子切片扩展: {len(retrieved_docs)} 原始 + "
-            f"{len(siblings)} 兄弟切片（{len(section_ids)} 个章节）"
+            f"📖 兄弟切片扩展: +{len(siblings)} 片（{len(section_ids)} 个章节）"
         )
 
-    return retrieved_docs + siblings
+    # Parent 文档优先插入（在原始切片前面，提供章节背景）
+    return parent_docs_inserted + retrieved_docs + siblings
 
 
 def _build_messages(
@@ -1801,11 +1822,11 @@ def _build_messages(
         cleaned_stripped = content.strip()
         if len(cleaned_stripped) < 20:
             continue
-        # 🔴 Context Token 预算控制
-        if len(cleaned_stripped) > 200:
-            truncated = cleaned_stripped[:200]
+        # 🔴 Context Token 预算控制 — 放宽至 400 字符配合 max_tokens=1024
+        if len(cleaned_stripped) > 400:
+            truncated = cleaned_stripped[:400]
             last_break = max(truncated.rfind('。'), truncated.rfind('\n'), truncated.rfind('. '))
-            if last_break > 100:
+            if last_break > 200:
                 truncated = cleaned_stripped[:last_break + 1]
             cleaned_stripped = truncated + '\n...[已截断]'
         # 🔴 通用溯源格式: 【出处: 《文档名》 — 第N页】 + 【章节: 标题】
@@ -1919,8 +1940,35 @@ def _build_messages(
                 "如果确实不包含，请诚实拒答，不要编造。\n\n"
             )
 
+    # ── 🔴 双轨制 Prompt 控制: 根据 doc_type 动态注入约束 ──
+    _doc_types = set()
+    for _doc in context_docs:
+        if hasattr(_doc, 'metadata'):
+            _dt = _doc.metadata.get("doc_type", "")
+            if _dt:
+                _doc_types.add(_dt)
+
+    _dual_track_prefix = ""
+    if _doc_types == {"gui_app"}:
+        # 纯 GUI 文档 → 禁止代码，强制 UI 步骤
+        _dual_track_prefix = (
+            "【🔴 当前问题涉及的是 APP 界面操作手册 — 你必须用 1. 2. 3. 步骤列表回答。"
+            "绝对禁止输出任何 Python/C 代码、ctypes 调用或 DLL 加载语句。"
+            "如果你不知道该操作的详细步骤，直接说'参考文档未包含详细步骤'。】\n\n"
+        )
+    elif "c_sdk" in _doc_types:
+        _dual_track_prefix = (
+            "【🔴 SDK 模式 — API 即答案，零怀疑零免责】"
+            "直接展示 Context 中的完整 ctypes 调用代码即可，严禁拒答。"
+            "函数名必须逐字复刻原文：OpenC3使能用 robot_enable，上电用 robot_Power_on，"
+            "下使能用 robot_disable，抱闸用 robot_brkopen/robot_brkclose，"
+            "直线运动用 robot_movl，圆弧用 robot_movc。"
+            "严禁改写为robot_move_linear/robot_activate等虚构名称。"
+            "严禁输出'此函数名是假设的'/'未明确记载'/'建议联系技术支持'等免责废话。】\n\n"
+        )
+
     # ---- 构建当前轮次的用户消息（含明确边界标记） ----
-    current_user_message = f"""{_cond_constraint}【参考资料】
+    current_user_message = f"""{_dual_track_prefix}{_cond_constraint}【参考资料】
 {context_text}
 
 ---
@@ -1944,10 +1992,9 @@ def _build_messages(
         {"role": "system", "content": _system_content},
     ]
 
-    # 🪟 滑动窗口 + 安全校验
+    # 🪟 滑动窗口 + 安全校验 + 历史净化
     if chat_history:
         max_history_msgs = MAX_HISTORY_TURNS * 2
-        # 裁剪
         if len(chat_history) > max_history_msgs:
             trimmed = chat_history[-max_history_msgs:]
             logger.info(
@@ -1966,15 +2013,23 @@ def _build_messages(
                 continue
             if not content or not isinstance(content, str):
                 continue
-            # 清洗 null 字节
             content = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', content)
-            # 🔴 清理 citation 前缀：剥离上一轮 assistant 回答开头的章节溯源长前缀，
-            # 防止后续轮次模型将历史中的 "根据《X》第 Y.Z 节" 复读为上下文幻觉。
+            # 🔴 Citation 前缀清洗
             if role == "assistant":
                 content = re.sub(
                     r'^(?:根据|参考|依据)《[^》]+》第\s*[\d.]+\s*节【[^】]*】(?:的\s*(?:部分|内容|相关章节))?\s*[，,，]\s*',
                     '', content, count=1,
                 ).strip()
+                # 🔴 历史净化 ①: 剥离 Python 代码块 → [已提供代码示例]
+                content = re.sub(
+                    r'```python[\s\S]*?```', '[已提供代码示例]', content, flags=re.DOTALL,
+                )
+                content = re.sub(r'```[\s\S]*?```', '[已提供代码块]', content, flags=re.DOTALL)
+                # 🔴 历史净化 ②: 过滤拒答模板
+                _REFUSAL_PURGE_RE = re.compile(
+                    r'参考文档中未(?:包含|记载|找到)[^。]*(?:记载|文档)[^。]*[。]',
+                )
+                content = _REFUSAL_PURGE_RE.sub('', content).strip()
             safe_history.append({"role": role, "content": content})
 
         messages.extend(safe_history)
@@ -1993,7 +2048,7 @@ def _build_messages(
 # ============================================================
 
 _AUTOCUT_MIN_K = 2   # 🔴 最小保底召回数：绝不允许 Autocut 误杀至 0 chunk
-_AUTOCUT_MAX_K = 3   # 🔴 上限 3 切片：控制 Context 输入 ≤ 3584 tokens（4096-512）
+_AUTOCUT_MAX_K = 5   # 🔴 上限 5 切片：配合 Parent 合并，确保长流程/多步骤不丢关键切片
 
 # ============================================================
 # 意图路由器 — 闲聊/身份/能力拦截
@@ -2154,6 +2209,71 @@ def _extract_query_code_entities(query: str) -> list:
     return entities
 
 
+# ── 全半角标点归一化表 ──
+_PUNCT_NORM_TABLE = str.maketrans({
+    '（': '(', '）': ')', '：': ':', '；': ';', '，': ',',
+    '。': '.', '！': '!', '？': '?', '“': '"', '”': '"',
+    '‘': "'", '’': "'", '【': '[', '】': ']', '《': '<', '》': '>',
+})
+
+
+def _normalize_punctuation(text: str) -> str:
+    """全半角标点归一化 — 保留英文/代码标点不变，仅转换中文全角标点。"""
+    return text.translate(_PUNCT_NORM_TABLE)
+
+
+# ── HyDE 假想文档生成缓存（避免重复 LLM 调用）──
+_HYDE_CACHE: Dict[str, str] = {}
+_HYDE_MAX_CACHE = 64
+
+
+def _generate_hyde_doc(query: str) -> str:
+    """
+    使用本地 LLM 生成一段假想的技术文档片段 (Hypothetical Document Embedding)。
+
+    策略:
+      - 极简 Prompt：要求 LLM 假想一段包含 SDK 函数名或操作步骤的文档
+      - 超轻量调用：max_tokens=128, temperature=0.3
+      - 异常安全：LLM 失败或超时 → 返回空字符串，上游自动降级为原始 query
+
+    Returns:
+        假想文档文本（可能为空字符串）
+    """
+    if not query or not query.strip():
+        return ""
+
+    cache_key = query.strip()[:80]
+    if cache_key in _HYDE_CACHE:
+        return _HYDE_CACHE[cache_key]
+
+    hyde_prompt = (
+        "你是一个技术文档生成器。根据用户的问题，生成一段简短的、可能出现在"
+        "技术手册中的描述（包含函数名、参数、步骤等）。不要回答问题，只生成"
+        "假想的文档片段。用中文回答，不超过100字。\n\n"
+        f"问题: {query}\n\n假想文档片段:"
+    )
+
+    try:
+        messages = [
+            {"role": "system", "content": "你是一个技术文档片段生成器，只输出假想文档，不回答问题。"},
+            {"role": "user", "content": hyde_prompt},
+        ]
+        response = _call_llm(_get_client(), _resolve_vllm_model(), messages,
+                             max_tokens=128, temperature=0.3)
+        hyde_doc = (response or "").strip()
+    except Exception:
+        hyde_doc = ""
+
+    # 缓存管理
+    if len(_HYDE_CACHE) >= _HYDE_MAX_CACHE:
+        _HYDE_CACHE.pop(next(iter(_HYDE_CACHE)))
+    _HYDE_CACHE[cache_key] = hyde_doc
+
+    if hyde_doc:
+        logger.info(f"🔮 HyDE 生成: {len(hyde_doc)} 字符 → '{hyde_doc[:60]}...'")
+    return hyde_doc
+
+
 def _autocut_knee(rrf_scores: List[float], max_k: int = None) -> int:
     """
     基于 RRF 融合分数的断崖/跳变点检测，动态确定最佳截断位置。
@@ -2244,17 +2364,21 @@ def _hybrid_retrieve(
         Top-K 个重排序后的 Document 列表
     """
     try:
-        # 第 1 步：向量搜索 — 扩大候选池（Fix 3: 代码实体查询 fetch_factor=8 → top-40 候选池）
-        _query_code_entities = _extract_query_code_entities(query)
+        # ── 第 0 步: Query 预处理 — 标点归一化 + HyDE 假想文档生成 ──
+        _query_normalized = _normalize_punctuation(query)
+        _hyde_doc = _generate_hyde_doc(_query_normalized)
+        # 向量检索使用 HyDE 文档（语义更丰富），若 HyDE 为空则降级为原始 query
+        _vector_query = (_hyde_doc + " " + _query_normalized) if _hyde_doc else _query_normalized
+
+        # ── 第 1 步：向量搜索 — HyDE 增强 + 扩大候选池 ──
+        _query_code_entities = _extract_query_code_entities(_query_normalized)
         _effective_fetch_factor = fetch_factor
         if _query_code_entities:
-            _effective_fetch_factor = max(fetch_factor, 8)  # 代码查询扩大候选池
+            _effective_fetch_factor = max(fetch_factor, 8)
         fetch_k = k * _effective_fetch_factor
-        # 🔴 relaxed_threshold 硬上限 0.70：严禁放宽后超过 0.714 误杀全部候选切片
-        # 下限保护：不低于主阈值 0.68，确保边缘相关切片（distance 0.68-0.70）可进入候选池
         relaxed_threshold = min(threshold * 1.05, 0.70) if threshold else None
         results_with_scores = search_similar_with_threshold(
-            vector_store, query, k=fetch_k, threshold=relaxed_threshold,
+            vector_store, _vector_query, k=fetch_k, threshold=relaxed_threshold,
             product_id=product_id,
         )
 
@@ -2320,7 +2444,7 @@ def _hybrid_retrieve(
             if cleaned_content != doc.page_content:
                 doc.page_content = cleaned_content
             # 🔴 关键词评分过滤 — v2 宽松版：保留 SDK 函数切片 + 防止全部过滤
-            kw_score = _score_chunk_for_query(doc.page_content, query)
+            kw_score = _score_chunk_for_query(doc.page_content, _query_normalized)
             # 检查是否包含 function_names 元数据（API 原子块保护）
             _has_fn_meta = bool(
                 hasattr(doc, 'metadata') and doc.metadata.get("function_names", "")
@@ -2352,10 +2476,13 @@ def _hybrid_retrieve(
             )
             kept_docs = list(_fallback) if _fallback else []
 
-        # 第 3 步：BM25 关键词检索（精确函数名匹配，零显存开销）
+        # 第 3 步：BM25 关键词检索（标点归一化 + HyDE 扩展）
         bm25_results = []
         if product_id:
-            bm25_results = bm25_search(query, product_id, k=fetch_k)
+            _bm25_query = _query_normalized
+            if _hyde_doc:
+                _bm25_query = _bm25_query + " " + _hyde_doc
+            bm25_results = bm25_search(_bm25_query, product_id, k=fetch_k)
 
         # 第 4 步：RRF（Reciprocal Rank Fusion）融合向量排名与 BM25 排名
         # RRF 公式: score(d) = Σ 1/(K + rank_i(d)), K=60
@@ -2370,10 +2497,11 @@ def _hybrid_retrieve(
                 rrf_scores[doc_id] = rrf_scores.get(doc_id, 0) + 1.0 / (RRF_K + rank_i + 1)
                 doc_map[doc_id] = doc
 
-            # BM25 排名贡献
+            # BM25 排名贡献 — 权重 1.2× 提升精确关键词(API名/端口号)抓取能力
+            _BM25_WEIGHT = 1.2
             for rank_j, (doc, _) in enumerate(bm25_results):
                 doc_id = doc.page_content[:120]
-                rrf_scores[doc_id] = rrf_scores.get(doc_id, 0) + 1.0 / (RRF_K + rank_j + 1)
+                rrf_scores[doc_id] = rrf_scores.get(doc_id, 0) + _BM25_WEIGHT / (RRF_K + rank_j + 1)
                 if doc_id not in doc_map:
                     doc_map[doc_id] = doc
 
@@ -2430,6 +2558,26 @@ def _hybrid_retrieve(
                         f"{_fn_boosted} chunks boosted"
                     )
                 fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+
+            # ── 🔴 RRF 文本/代码切片权重平衡: 纯文本 Child 获得基线 boost ──
+            _text_boost = 0.03   # 纯文本切片基线加分（补偿缺少 function_names 的劣势）
+            _text_boosted = 0
+            for _doc_id, _score in fused:
+                _doc = doc_map.get(_doc_id, None)
+                if _doc is None:
+                    continue
+                _meta_fn = ""
+                if hasattr(_doc, 'metadata'):
+                    _meta_fn = _doc.metadata.get("function_names", "")
+                # 纯文本切片 (无 function_names) → 基线 boost
+                if not _meta_fn:
+                    _has_text = bool(re.search(r'[一-鿿]{4,}', _doc.page_content or ""))
+                    if _has_text:
+                        rrf_scores[_doc_id] += _text_boost
+                        _text_boosted += 1
+            if _text_boosted:
+                logger.info(f"  📄 Text-Chunk Rebalance: {_text_boosted} 纯文本切片 +{_text_boost} RRF")
+            fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
 
             # 🔪 Autocut 动态截断：检测 RRF 分数断崖点，自适应确定最佳 K
             rrf_score_list = [score for _, score in fused]

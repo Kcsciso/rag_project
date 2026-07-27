@@ -132,7 +132,7 @@ EMBEDDING_BATCH_SIZE = 64   # GPU 批量推理大小（A100 建议 64-128）
 # 检索时返回的 Top-K 文档片段数
 # k=5: 每次检索返回最相关的 5 个文本块
 #      增加到 5 以提高召回覆盖率，降低关键函数漏检概率
-RETRIEVAL_K = 8
+RETRIEVAL_K = 10
 
 # 相似度阈值 — ChromaDB cosine 距离上限
 # 使用 similarity_search_with_score 进行距离过滤：

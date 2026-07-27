@@ -499,7 +499,7 @@ def print_service_section(vllm: Dict, fastapi: Dict, v4: Dict = None):
     # FastAPI
     api_status  = STATUS_OK if fastapi["online"] else STATUS_DOWN
     api_ready   = green("✅ 向量库就绪") if fastapi["ready"] else yellow("⚠️  向量库未初始化")
-    api_docs    = f"{fastapi['document_count']} 个文档片段 (v3)"
+    api_docs    = f"{fastapi['document_count']} 个文档片段"
     api_lat     = f"{fastapi.get('latency_ms', 0)}ms"
     api_err     = fastapi.get("error", "")
 

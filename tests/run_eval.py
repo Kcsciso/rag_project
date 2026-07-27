@@ -98,6 +98,100 @@ def _fatal_prompt_leak(answer: str) -> bool:
     return any(kw.lower() in answer.lower() for kw in leak_keywords)
 
 
+# ── v5.3 新增 3 项断言 ──
+
+_API_NAME_REWRITE_PATTERNS = [
+    # robot_movl → robot_move_linear / move_linear / linear_move
+    (r'\brobot_movl\b', [r'\bmove_linear\b', r'\blinear_move\b', r'\brobot_move_linear\b', r'\brobot_linm\b', r'\brobot_arm_move_linear\b']),
+    # robot_movc → robot_move_circle / move_arc
+    (r'\brobot_movc\b', [r'\bmove_arc\b', r'\brobot_move_circle\b', r'\brobot_arc_move\b']),
+    # set_move_line → set_move_linear / set_linear
+    (r'\bset_move_line\b', [r'\bset_move_linear\b', r'\bset_linear\b', r'\bmove_line\b']),
+    # robot_Power_on → robot_power_up / robot_turn_on
+    (r'\brobot_Power_on\b', [r'\brobot_power_up\b', r'\brobot_turn_on\b', r'\brobot_activate\b']),
+    # robot_enable → robot_activate / robot_start
+    (r'\brobot_enable\b', [r'\brobot_activate\b', r'\brobot_start\b', r'\benable_robot\b']),
+    # get_robot_pose → get_pose / read_pose
+    (r'\bget_robot_pose\b', [r'\bread_pose\b', r'\bget_position\b', r'\brobot_get_position\b']),
+]
+
+
+def _fatal_api_hallucination(case: dict, answer: str) -> bool:
+    """
+    ⑥ API 幻觉: Context 中存在某函数名，但模型输出时将其改写成虚构名称。
+
+    规则: 若 answer 出现某 API 的虚构改写且不包含正确的原始名称 → FAIL
+    """
+    answer_lower = answer.lower()
+    for correct_pat, rewrite_pats in _API_NAME_REWRITE_PATTERNS:
+        correct_in_answer = bool(re.search(correct_pat, answer_lower))
+        for rw_pat in rewrite_pats:
+            if re.search(rw_pat, answer_lower):
+                if not correct_in_answer:
+                    return True
+    # 检测虚构函数名: robot_/set_/get_ 不在 eval_cases 已知白名单中的
+    _KNOWN_FUNCS = {
+        'robot_power_on', 'robot_power_off', 'robot_enable', 'robot_disable',
+        'robot_movl', 'robot_movc', 'robot_movj', 'robot_stop', 'robot_brkopen',
+        'robot_brkclose', 'robot_motor_enable', 'robot_motor_disable',
+        'robot_socket_start', 'robot_socket_close', 'robot_handserialsend',
+        'robot_sysclose', 'robot_setdo', 'robot_get_pose', 'get_robot_pose',
+        'get_robot_state', 'get_robot_iostate', 'get_robot_joint_all',
+        'get_robot_joint_angle_all', 'get_robot_moterror', 'get_robot_torque',
+        'set_robot_power_on', 'set_robot_power_off', 'set_robot_arm_home',
+        'set_robot_arm_init', 'set_robot_io_output', 'set_robot_io_status',
+        'set_robot_time_delay', 'set_robot_arm_emergency_stop',
+        'set_move_line', 'set_joint_degree_by_number', 'set_all_joint_degree',
+        'set_robot_speed', 'end_communication',
+    }
+    found_unknown = re.findall(r'\b((?:robot_|set_|get_)\w{4,})\b', answer_lower)
+    for f in found_unknown:
+        if f not in _KNOWN_FUNCS:
+            return True
+    return False
+
+
+_SPECULATION_PATTERNS = re.compile(
+    r'(?:假设有|假设存在|假设函数|示例代码仅为假设|'
+    r'未在参考资料中明确记载.*```python|'
+    r'以下仅为示例代码框架|仅供参考.*具体的函数名|'
+    r'以下是.*假设性的|'
+    r'以下.*仅供示意)',
+    re.IGNORECASE,
+)
+
+
+def _fatal_zero_speculation(answer: str) -> bool:
+    """
+    ⑦ 零脑补: 答案在给出代码的同时使用了"假设/仅供参考/仅供示意"等幻术表述。
+
+    规则: 含 Python 代码块 + 同时出现推测性表述 → FAIL
+    """
+    has_code = '```python' in answer or '```' in answer
+    has_speculation = bool(_SPECULATION_PATTERNS.search(answer))
+    return has_code and has_speculation
+
+
+def _fatal_code_truncation(answer: str) -> bool:
+    """
+    ⑧ 代码截断: Python 代码块未正确闭合。
+
+    规则: ```python 出现次数 ≠ ``` 闭合次数 → FAIL
+    """
+    open_count = len(re.findall(r'```python|```\w*', answer))
+    close_count = len(re.findall(r'```(?!\w)', answer)) + len(re.findall(r'```$', answer))
+    # 简化：计数 ``` 总出现次数应为偶数
+    all_fences = re.findall(r'```', answer)
+    if len(all_fences) % 2 != 0:
+        return True
+    # 代码块在 50 字符内突然截断（无闭合）
+    last_fence = answer.rfind('```')
+    if last_fence >= 0 and len(answer) - last_fence < 4:
+        # 以 ``` 结尾但前面没有对应的开标签 → 截断
+        pass  # 上面已经检查了偶数性
+    return False
+
+
 def run_fatal_assertions(case: dict, answer: str) -> List[str]:
     """返回触发的致命断言列表（空列表 = 全部通过）"""
     errors = []
@@ -111,6 +205,12 @@ def run_fatal_assertions(case: dict, answer: str) -> List[str]:
         errors.append("④ 函数签名错误: 无参函数被写成有参")
     if _fatal_prompt_leak(answer):
         errors.append("⑤ 提示词泄露: 答案泄露了系统 Prompt 源码")
+    if _fatal_api_hallucination(case, answer):
+        errors.append("⑥ API幻觉: 函数名被改写/虚构(如robot_movl→move_linear)")
+    if _fatal_zero_speculation(answer):
+        errors.append("⑦ 零脑补: 含'假设有'/'示例代码仅为假设'等严重幻觉表述")
+    if _fatal_code_truncation(answer):
+        errors.append("⑧ 代码截断: Python代码块未闭合或残缺")
     return errors
 
 
