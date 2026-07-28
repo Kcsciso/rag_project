@@ -363,6 +363,18 @@ def load_pdfs_from_directory(
 # v4 切片策略: API 原子化 + 标题感知 + 父子双层索引
 # ============================================================
 
+# ── SDK 表头黑名单：绝不允许被识别为 Heading 切分点的表头关键词 ──
+# 这些词常见于 SDK 手册的表格/段落头部，若被误识别为 Heading 会把 API 块切碎
+_SDK_TABLE_HEADER_BLACKLIST = frozenset({
+    "函数名称", "函数名", "方法名", "方法名称",
+    "功能描述", "功能说明", "函数说明", "函数功能",
+    "参数说明", "参数列表", "参数", "输入参数", "输出参数",
+    "返回值", "返回值说明", "返回参数", "返回值类型",
+    "示例代码", "调用示例", "代码示例", "示例",
+    "注意事项", "备注", "说明", "注",
+    "头文件", "库文件", "依赖",
+})
+
 # ── 标题识别模式（兼容 Markdown 和非 Markdown 格式）──
 _V4_HEADING_PATTERNS = [
     # 数字编号: 3.1.5 / 3.1.5.1 标题
@@ -410,6 +422,21 @@ _API_BLOCK_PATTERNS = [
     # 匹配单行 "函数名称 robot_xxx" 格式（简化版），确保至少该行不被切碎
     re.compile(
         r'^函数名称\s+(\w+(?:\([^)]*\))?)',
+        re.MULTILINE,
+    ),
+    # ── 🔴 中文 SDK 手册: "数字序号 + 函数功能标题" 作为 API 原子块起点 ──
+    # 匹配 "3. 连接机械臂" / "4. 机械臂上电" 等序号标题，
+    # 将其后的函数名称+功能描述+参数说明+返回值+示例代码 完整封装在 1 个原子块中
+    re.compile(
+        r'(?:^|\n)(\d{1,2})[\.\)、）]\s*'
+        r'((?:连接|断开|上电|下电|使能|回零|复位|急停|抱闸|松闸|'
+        r'运动|移动|直线|圆弧|关节|设置|获取|读取|写入|初始化|配置|'
+        r'启动|停止|控制|加载|卸载|注册|注销|登录|登出|同步|异步|'
+        r'IO\s*操作|信号|输出|输入|状态|错误|异常)[^\n]{0,60})'
+        r'(?:[\s\S]{0,2000}?)'
+        r'(?=\n\d{1,2}[\.\)、）]\s*(?:连接|断开|上电|下电|使能|回零|复位|急停|抱闸|'
+        r'运动|移动|直线|圆弧|关节|设置|获取|读取|写入|初始化|配置|'
+        r'启动|停止|控制|加载|卸载|注册|注销)|\n\n\d{1,2}[\.\)、）]|\Z)',
         re.MULTILINE,
     ),
 ]
@@ -520,6 +547,23 @@ def _clean_pdf_text(text: str) -> str:
     # 4b: 处理剩余的 "( args )"（1 个捕获组）
     cleaned = re.sub(r'\(\s*([^)]*?)\s*\)', _clean_parens, cleaned)
 
+    # ── Step 4.3: 下划线空格断裂归一化（PDF OCR artifact）──
+    # "rob _ ip" → "rob_ip", "_ _" → "__", "collrob _ sdk" → "collrob_sdk"
+    cleaned = re.sub(r'(\w+)\s+_\s+(\w+)', r'\1_\2', cleaned)
+    cleaned = re.sub(r'_\s+_', '__', cleaned)
+    cleaned = re.sub(r'(\w)\s+_\s+', r'\1_', cleaned)
+    cleaned = re.sub(r'\s+_\s+(\w)', r'_\1', cleaned)
+
+    # ── Step 4.5: I/O 乱码归一化（PDF 字体映射问题：I→1, O→0）──
+    # 通用字符级替换，不依赖特定工业名词列表：
+    #   "配置1/0信息" → "配置I/O信息", "1/0 信号" → "I/O 信号"
+    #   "I/0"、"1/O" 等 PDF 字体错位变体 → "I/O"
+    cleaned = re.sub(r'\b1/[0O]\b|\bI/0\b|\b1/O\b', 'I/O', cleaned)
+    # 处理中文紧邻情况: "配置1/0信息" / "电控柜 1/0" / "IO 配置"
+    cleaned = re.sub(r'([一-鿿])\s*1/0\s*([一-鿿])', r'\1I/O\2', cleaned)
+    cleaned = re.sub(r'([一-鿿])\s+I0\b', r'\1 I/O', cleaned)
+    cleaned = re.sub(r'\bIO\s*([一-鿿])', r'I/O \1', cleaned)
+
     # ── Step 5: 收尾 — 仅压缩 ≥3 个连续空行，保护缩进与正文换行 ──
     cleaned = re.sub(r'\n{4,}', '\n\n\n', cleaned)  # 4+ → 3
     cleaned = re.sub(r'\n{3}', '\n\n', cleaned)       # 3 → 2
@@ -552,6 +596,12 @@ def _v4_extract_headings(text: str) -> List[Tuple[int, str, int]]:
             if not full or len(full) < 3 or len(full) > 85:
                 continue
 
+            # 🔴 SDK 表头黑名单过滤：禁止将 SDK 手册表格表头识别为 Heading
+            # 剥离数字编号前缀后检查（如 "3. 函数名称" → "函数名称"）
+            _stripped_title = re.sub(r'^[\d.]+\s*', '', full).strip()
+            if _stripped_title in _SDK_TABLE_HEADER_BLACKLIST:
+                continue
+
             # 推断层级
             groups = m.groups()
             if len(groups) >= 2 and groups[0] and groups[1]:
@@ -560,6 +610,10 @@ def _v4_extract_headings(text: str) -> List[Tuple[int, str, int]]:
                 dots = title_num.count('.')
                 if dots >= 1:
                     level = min(dots + 1, 4)  # 最多 4 级
+                    # 🔴 仅 1 个点号（如 "4.1" / "3.2"）→ 强制 H2，
+                    # 确保 "X.Y" 格式不被错误提升为更深层级
+                    if dots == 1:
+                        level = 2
                 elif title_num.startswith('#'):
                     level = min(len(title_num), 4)
                 elif '章' in title_num or '节' in title_num:
@@ -588,32 +642,48 @@ def _v4_extract_headings(text: str) -> List[Tuple[int, str, int]]:
 
 def _v4_build_breadcrumb(headings: List[Tuple[int, str, int]], chunk_pos: int, chunk_end: int) -> str:
     """
-    为给定位置范围构建层级面包屑。
+    为给定位置范围构建层级面包屑（固定 4 槽位数组）。
+
+    使用固定槽位 slots = ["", "", "", ""] 对应 H1~H4。
+    更新第 k 层标题时，强制清空 index > k 的所有旧槽位，
+    杜绝平级标题串联嵌套和跨章继承错误。
+
+    大章跳变检测：从标题中提取数字编号的整数部分（兼容 "3.1.5"、"第4章" 等格式），
+    跨章时强制重置所有槽位。
 
     例: [路径: JAKA Zu APP > 硬件与通讯 > Modbus 通讯设置]
-
-    确保即使数字编号格式（3.1.5）也能正确生成面包屑。
     """
-    # 找到该位置之前最近的各级标题
-    path_parts = []
-    current_level = 0
+    slots = ["", "", "", ""]  # [H1, H2, H3, H4]
+    last_root_number = 0
+
     for pos, title, level in headings:
         if pos > chunk_pos:
             break
-        if level > current_level:
-            path_parts.append(title)
-            current_level = level
-        elif level <= current_level and path_parts:
-            # 同级或上级标题 → 弹出并替换
-            while len(path_parts) >= max(level, 1):
-                path_parts.pop()
-            path_parts.append(title)
-            current_level = level
 
+        # 提取标题的数字编号整数部分（兼容 "3.1.5"、"第4章"、"4.1" 等格式）
+        root_match = re.search(r'(?:第|\b)(\d+)', title)
+        current_root = int(root_match.group(1)) if root_match else 0
+
+        # 🔴 顶级大章重置：整数部分跳变时（如 3.x → 4.x），强制清空所有槽位
+        if current_root > 0 and last_root_number > 0 and current_root != last_root_number:
+            slots = ["", "", "", ""]
+
+        last_root_number = current_root if current_root > 0 else last_root_number
+
+        # 槽位索引（level 1-based → 0-based）
+        slot_idx = max(0, min(level - 1, 3))
+
+        # 🔴 关键：写入当前槽位，并强制清空所有更深层槽位
+        slots[slot_idx] = title
+        for clear_idx in range(slot_idx + 1, 4):
+            slots[clear_idx] = ""
+
+    # 组装非空槽位
+    path_parts = [s for s in slots if s]
     if not path_parts:
         return ""
 
-    return " > ".join(p for p in path_parts if p)
+    return " > ".join(path_parts)
 
 
 def _v4_extract_api_blocks(text: str) -> List[Tuple[int, int, str]]:
@@ -906,11 +976,13 @@ def _build_child_prefix(
     func_names: List[str],
 ) -> str:
     """构建 Child Doc 正文前缀（面包屑 + 章节 + 函数名标注）。"""
+    # 🔴 v13: 标题清洗 — 剥离脏字符和前缀
+    _clean_title = _sanitize_section_title(section_title)
     parts = [f"[文档: {source}]"]
     if breadcrumb:
         parts.append(f"[路径: {breadcrumb}]")
-    if section_title:
-        parts.append(f"[章节: {section_title}]")
+    if _clean_title:
+        parts.append(f"[章节: {_clean_title}]")
     if func_names:
         parts.append(f"[Functions: {', '.join(f.lower() for f in func_names)}]")
     return "\n".join(parts) + "\n"
@@ -1089,6 +1161,171 @@ def _v4_build_parent_child_docs(
     return parent_docs, all_children
 
 
+# ── 🔴 v13: SDK 轨状态机 API 块解析器 ──
+
+# 新 API 块边界触发条件（通用匹配，不限于技术动作词）
+_SDK_BLOCK_BOUNDARY_RE = re.compile(
+    r'(?:'
+    # ① 数字小节标题: "3.连接机械臂" / "4. 机械臂上电" / "15.设置"
+    r'^\d{1,2}[\.\、\s]\s*[一-鿿A-Za-z0-9_]+'
+    r'|'
+    # ② 显式函数名表头: "函数名称\nRobot_socket_start" — 允许跨行
+    r'^函数名称'                                            # ② "函数名称" 独立行 — 强硬边界
+    r'|'
+    # ③ 代码定义行: C/Python 函数签名
+    r'^(?:void|int|double|bool|def)\s+(\w+)\('
+    r'|'
+    # ④ Markdown 标题: "# 机械臂末端运动指令"
+    r'^#{1,4}\s+'
+    r')',
+    re.MULTILINE,
+)
+
+
+def _sanitize_section_title(title: str) -> str:
+    """
+    标题元数据清洗器 — 剥离 PDF 提取引入的脏字符。
+
+    处理:
+      1. 剥离 \\n、\\r、# 字符
+      2. 剥离 "函数名称\\n"、"API:" 等前缀
+      3. 合并多余空白
+      4. 若清洗后为空，返回空字符串（由调用方 Fallback）
+    """
+    if not title:
+        return ""
+    # Step 1: 换行 → 空格，去掉 # 和多余空白
+    cleaned = re.sub(r'[\n\r]+', ' ', title).strip()
+    cleaned = re.sub(r'^#+\s*', '', cleaned)
+    # Step 2: 剥离已知前缀
+    cleaned = re.sub(r'^(?:函数名称|函数名|方法名|API)[\s\n:：]*', '', cleaned, flags=re.IGNORECASE)
+    # Step 3: 压缩连续空白
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
+
+
+def _is_skeleton_chunk(content: str) -> bool:
+    """
+    检测并过滤骨架/目录占位块 — 在建库阶段直接丢弃。
+
+    判定规则（全部满足 → True → 丢弃）:
+      1. 文本长度 < 150 字符
+      2. 不含实际代码特征（def、argtypes、restype、ctypes.CDLL、```python）
+      3. 不含实质参数/功能描述（参数说明、返回值、功能描述）
+      4. 含占位符文本（示例代码、代码示例、纯数字标题序列）
+    """
+    if not content or len(content.strip()) >= 150:
+        return False
+    content = content.strip()
+
+    # 有实际代码 → 保留
+    _has_code = bool(re.search(
+        r'(?:def\s+\w+\s*\(|\.restype|\.argtypes|\bctypes\.|```python|=.*ctypes\.CDLL)',
+        content,
+    ))
+    if _has_code:
+        return False
+
+    # 有实质参数/功能描述 → 保留
+    _has_substance = bool(re.search(
+        r'(?:参数说明|返回值|功能描述|函数说明|功能说明|注意事项)',
+        content,
+    ))
+    if _has_substance:
+        return False
+
+    # 纯占位符文本
+    _skeleton_markers = ['示例代码', '代码示例', '调用示例', '见示例', '详见示例']
+    if any(m in content for m in _skeleton_markers):
+        return True
+
+    # 纯数字标题序列（目录骨架）
+    lines = [l.strip() for l in content.split('\n') if l.strip()]
+    if len(lines) <= 2 and all(re.match(r'^\d{1,2}[\.\、\s]', l) for l in lines):
+        return True
+
+    return False
+
+
+def _v4_parse_sdk_state_machine(text: str) -> List[Tuple[int, int, str]]:
+    """
+    SDK 轨状态机解析器：扫描文本行，识别 API 边界并封装完整函数块。
+
+    算法:
+      1. 从 pos=0 开始扫描全文（确保前言不丢失）
+      2. 用 _SDK_BLOCK_BOUNDARY_RE 识别每个新 API 块的起点位置
+      3. 两次边界之间的全部内容（函数名 + 功能描述 + 参数 + 返回值 + 代码块）
+         100% 封装为一个原子块边界
+      4. 绝不跨 API 串味
+
+    对比原 _v4_extract_headings 方法：
+      - 状态机不依赖层级推断，直接以 API 语义边界切分
+      - 可处理 "# 标题" 与 "数字." 混合排版
+      - 确保代码示例与描述封闭在同一个 Chunk 中
+
+    Returns:
+        [(start_pos, end_pos, title), ...]  按位置排序
+    """
+    if not text:
+        return []
+
+    # Step 1: 找到所有 API 边界起点的位置
+    boundaries = [0]  # 确保从 pos 0 开始，前言（import ctypes 等）不丢失
+    titles = [""]
+    for m in _SDK_BLOCK_BOUNDARY_RE.finditer(text):
+        pos = m.start()
+        if pos == 0:
+            # pos=0 的边界替换默认的前言起点
+            boundaries[0] = 0
+            titles[0] = m.group(0).strip()
+        else:
+            boundaries.append(pos)
+            titles.append(m.group(0).strip())
+
+    boundaries.append(len(text))  # 末尾哨兵
+    titles.append("")              # 最后一个块无标题
+
+    # ── 🔴 v15: 边界邻近合并 — 消除 "标题孤块" 导致的 Multi-API 粘连 ──
+    # 场景: "3.连接机械臂" 和 "函数名称\nRobot_socket_start" 间隔 < 50 字符
+    # → 两个边界太近，合并为一个（保留更具体的函数名标题）
+    _MIN_BLOCK_GAP = 30  # 🔴 v15: 30 字符 — 足够区分标题孤块与真 API 边界
+    merged_boundaries = [boundaries[0]]
+    merged_titles = [titles[0]]
+    for i in range(1, len(boundaries)):
+        gap = boundaries[i] - merged_boundaries[-1]
+        if gap < _MIN_BLOCK_GAP and i < len(boundaries) - 1:  # 不合并末尾哨兵
+            # 合并：保留更长的标题（通常函数名比数字标题更具体）
+            if len(titles[i]) > len(merged_titles[-1]):
+                merged_titles[-1] = titles[i]
+            # 边界点不变（跳过当前边界，扩展到下一个）
+        else:
+            merged_boundaries.append(boundaries[i])
+            merged_titles.append(titles[i])
+
+    # Step 2: 构建相邻边界间的块 + 智能标题提取
+    blocks = []
+    for i in range(len(merged_boundaries) - 1):
+        start = merged_boundaries[i]
+        end = merged_boundaries[i + 1]
+        if start >= end:
+            continue
+        # 🔴 v15: 从块文本中提取有意义的标题（正则匹配可能只捕获 "函数名称"）
+        raw_title = merged_titles[i]
+        block_text = text[start:end]
+        # 提取策略: 取第一个非空的 数字标题 / 函数名行 / Markdown 标题
+        _title_match = re.search(
+            r'(?:^\d{1,2}[\.\、\s]\s*[^\n]+|^函数名称\s*\n?\s*(\w+)|^#{1,4}\s+[^\n]+)',
+            block_text, re.MULTILINE,
+        )
+        if _title_match:
+            title = _title_match.group(0).strip()
+        else:
+            title = raw_title
+        blocks.append((start, end, title))
+
+    return blocks
+
+
 def _v4_build_child_docs_v2(
     full_text: str,
     source: str,
@@ -1113,19 +1350,61 @@ def _v4_build_child_docs_v2(
     """
     children = []
 
+    doc_type = _resolve_doc_type(product_id)  # 🔴 v5: 双轨制切片策略
+
+    # ── 🔴 v11: SDK 轨状态机快速路径 — 替代标题树切分 ──
+    if doc_type == "c_sdk":
+        section_text = full_text[section_start:section_end]
+        sdk_blocks = _v4_parse_sdk_state_machine(section_text)
+        if sdk_blocks:
+            for block_start_rel, block_end_rel, block_title in sdk_blocks:
+                block_abs_start = section_start + block_start_rel
+                block_abs_end = section_start + block_end_rel
+                block_text = full_text[block_abs_start:block_abs_end].strip()
+                if len(block_text) < 15:
+                    continue
+                # 构建面包屑：使用状态机识别的块标题
+                breadcrumb = _v4_build_breadcrumb(headings, block_abs_start, block_abs_end)
+                sub_children = _split_text_into_children(
+                    block_text, source, product_id, parent_id,
+                    child_chunk_size, breadcrumb, block_title or breadcrumb, 3,
+                    sdk_header=sdk_header, doc_type=doc_type,
+                )
+                children.extend(sub_children)
+        else:
+            # 状态机无匹配 → 回退到段落切分
+            text = full_text[section_start:section_end].strip()
+            if text:
+                breadcrumb = _v4_build_breadcrumb(headings, section_start, section_end)
+                children = _split_text_into_children(
+                    text, source, product_id, parent_id,
+                    child_chunk_size, breadcrumb, "",
+                    sdk_header=sdk_header, doc_type=doc_type,
+                )
+        return children
+
     sub_headings = [
         (pos, title, lv) for pos, title, lv in headings
         if section_start <= pos < section_end and lv > 2
     ]
 
     if not sub_headings:
+        # 🔴 H2 导言区：无 H3 子标题 → text 是 Parent 标题后的导言段落
+        # 必须继承 Parent 标题作为 section_title，杜绝空值 "无头盲块"
         text = full_text[section_start:section_end].strip()
         if text:
             breadcrumb = _v4_build_breadcrumb(headings, section_start, section_end)
+            # 🔴 从 headings 中回溯当前 Parent 的 H2 标题
+            _parent_title = ""
+            for pos, title, lv in headings:
+                if pos <= section_start and lv == 2:
+                    _parent_title = title
+                elif pos > section_start:
+                    break
             children = _split_text_into_children(
                 text, source, product_id, parent_id,
-                child_chunk_size, breadcrumb, "",
-                sdk_header=sdk_header,
+                child_chunk_size, breadcrumb, _parent_title or breadcrumb,
+                sdk_header=sdk_header, doc_type=doc_type,
             )
         return children
 
@@ -1154,7 +1433,7 @@ def _v4_build_child_docs_v2(
         sub_children = _split_text_into_children(
             text, source, product_id, parent_id,
             child_chunk_size, breadcrumb, current_title, current_level,
-            sdk_header=sdk_header,
+            sdk_header=sdk_header, doc_type=doc_type,
         )
         children.extend(sub_children)
 
@@ -1171,6 +1450,7 @@ def _split_text_into_children(
     section_title: str = "",
     section_level: int = 3,
     sdk_header: str = "",
+    doc_type: str = "general",  # 🔴 v5: 双轨制切片策略
 ) -> List[Document]:
     """
     将文本段落按「先提取受保护块，再按段落切分」的 Tokenize 模式切分为 Child Docs。
@@ -1179,6 +1459,10 @@ def _split_text_into_children(
       - ```代码块``` 先整体提取，无论多大绝不拦腰切断，防止 Markdown AST 崩溃
       - |表格行| 作为受保护整体保留
       - 普通文本按 \\n\\n 段落边界累积合并，超出 chunk_size 时 flush
+
+    🔴 v5 双轨制:
+      - gui_app: 废除字符硬切，按 Heading-to-Heading 完整保留 UI 步骤
+      - c_sdk / general: 保留段落累积逻辑，放宽代码块保护
     """
     children = []
     child_idx = 0
@@ -1188,27 +1472,57 @@ def _split_text_into_children(
         content = content.strip()
         if len(content) < 10:
             return
+        # 🔴 v13: 离线骨架块过滤 — 建库阶段直接丢弃占位/目录块
+        if _is_skeleton_chunk(content):
+            return
         func_names = _v4_extract_function_names(content)
         is_api = len(func_names) > 0
         prefix = _build_child_prefix(source, breadcrumb, section_title, func_names)
-        # 🔴 SDK 全局代码头自动挂载: c_sdk 文档的每个 API Child 注入 CDLL+结构体
-        header_block = ""
-        if sdk_header and is_api:
-            header_block = f"\n【前置依赖 — 可直接运行】\n{sdk_header}\n"
+        # 🔴 v13: section_title 存入 metadata 前先清洗
+        _clean_sec = _sanitize_section_title(section_title)
         children.append(Document(
-            page_content=f"{prefix}{header_block}{content}",
+            page_content=f"{prefix}{content}",
             metadata={
                 "source": source, "product_id": product_id,
                 "doc_type": _resolve_doc_type(product_id),
                 "chunk_type": "child", "parent_id": parent_id,
-                "section_title": section_title,
+                "section_title": _clean_sec,
                 "section_level": section_level,
                 "function_names": ",".join(func_names) if func_names else "",
                 "api_atomic": is_api,
                 "is_api": is_api,
+                # 🔴 v5: sdk_header 存入 metadata，线上按需单次挂载
+                "sdk_header": sdk_header if (sdk_header and is_api) else "",
             },
         ))
         child_idx += 1
+
+    # ── 🔴 v5: GUI 轨 — 废除字符硬切，按 Heading-to-Heading 完整保留 ──
+    if doc_type == "gui_app":
+        content = text.strip()
+        if len(content) >= 10:
+            _emit_child(content)
+        return children
+
+    # ── 🔴 v12: SDK 轨 — 状态机已定义 API 边界，整块保留不拆散 ──
+    if doc_type == "c_sdk":
+        # 受保护块 (```code```) 单独 emit，其余段落整体保留
+        segments = []
+        last_end = 0
+        for m in _PROTECTED_BLOCK_RE.finditer(text):
+            normal = text[last_end:m.start()].strip()
+            if normal:
+                segments.append({"type": "normal", "text": normal})
+            segments.append({"type": "protected", "text": m.group(0)})
+            last_end = m.end()
+        remaining = text[last_end:].strip()
+        if remaining:
+            segments.append({"type": "normal", "text": remaining})
+        # 合并所有段为一个整体 emit（代码块自然吸附在描述后方）
+        merged = "\n\n".join(seg["text"] for seg in segments)
+        if len(merged.strip()) >= 10:
+            _emit_child(merged)
+        return children
 
     # ── 1. 将文本解析为 [受保护段] 与 [普通段] ──
     segments = []

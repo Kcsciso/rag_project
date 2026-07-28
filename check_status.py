@@ -62,7 +62,7 @@ STATUS_DOWN = red("● 离线")
 # ============================================================
 
 VLLM_BASE_URL      = "http://localhost:8001"
-FASTAPI_BASE_URL   = "http://localhost:7860"
+FASTAPI_BASE_URL   = "http://localhost:8000"
 
 TIMEOUT_CONNECT = 3.0   # HTTP 连接超时（秒）
 TIMEOUT_READ    = 5.0   # HTTP 读取超时（秒）

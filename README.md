@@ -19,15 +19,14 @@
 - **Query 预处理**（`_preprocess_query`）：多层迭代剥离口语化噪音（25+ 模式）。
 - **产品级物理隔离**（ADR-6）：入库自动打标 → 检索 `where={"product_id":"OpenR6"}` → 未指定时主动反问。
 
-### 🧠 智能上下文扩展与防幻觉（ADR-9/ADR-10/ADR-11/ADR-12/ADR-14/ADR-15/ADR-16）
-- **LangGraph v3 Plan-Execute-Synthesize 架构**（ADR-14）：SubGoalPlanner 任务分解 + CrossProductRetrieval 全库检索 + Synthesize 多路融合 + CodeEntityAnchor 代码实体锚定。
-- **v4 切片机制升级**（ADR-15）：API 原子切分 + PDF 连字清洗 (`_clean_pdf_text`) + 原始大小写保留 + 标题感知 + Parent-Child 双层索引（70P + 605C，101 个 API 原子块）。
-- **多模态 OCR + 面包屑注入**（ADR-16）：RapidOCR 图片文本抽取 → `[路径: H1 > H2]` + `[章节: X.Y.Z]` 章节上下文注入。
-- **检索幻觉修复**（v4.1）：function_names 元数据模糊匹配 + 放宽关键词过滤 + kept_docs 安全网 + `_force_no_code` 防幻觉硬拦截 + 产品自动推断隔离。
-- **Extract-Render 两层分离架构**（ADR-12）：**信息提取模式** — 模型只从 Context 提取结构化 JSON 实体，代码/步骤/引用由 Python 确定性渲染器生成。
-- **SDK 重试硬熔断防护**：3 处熔断点（`sdk_verify_node` 入口 + `llm_generation_node` 计数保留 + stream 循环顶部），最大 3 次 LLM 调用，杜绝死循环。
-- **SemanticDedup 语义去重** + **Entity Anchor 实体锚定重排**。
-- **Prompt 注入防御** + **安全注入拦截** (中文+英文双防护)。
+### 🧠 智能上下文扩展与防幻觉（ADR-9 ~ ADR-17）
+- **双轨制文档隔离与路由**（ADR-17）：JAKA(gui_app) / OpenC3&OpenR6(c_sdk) 双轨分治 — GUI 轨绝对禁止代码，SDK 轨 API 即答案 + 字面强锚定。
+- **SDK Header Dependency Injection**：自动提取 CDLL 加载 + POSE/Joint 结构体 → 挂载至每个 API Child 切片顶部。
+- **HyDE 假想文档生成**：7B 轻量调用生成假想技术文档片段增强向量检索语义密度。
+- **LangGraph v3 Plan-Execute-Synthesize**（ADR-14）+ **v4 标题树切分**（ADR-15）：47P + 574C，102 API 原子块。
+- **多模态 OCR + 面包屑注入**（ADR-16）+ **PDF 连字清洗** + **原始大小写保留**。
+- **8 项硬断言**：JSON泄露 / 重复检查 / 界面套话 / 函数签名 / 提示词泄露 / API幻觉 / 零脑补 / 代码截断。
+- **SDK 重试硬熔断** + **SemanticDedup** + **安全注入防御** (中英文双防护)。
 - **ABSTAIN 硬弃答网关**: Context 中实体缺失时直接返回诚实拒答，零 LLM 调用（26ms）。
 - **Contextual Prefixing**: 每个切片注入 `[文档: X | 章节: Y]` 前缀，从物理切片源头隔离参数概念。
 - **父子切片上下文扩展**（Parent-Child Chunking）：检索命中子切片时，自动按章节 ID 捞取同章节兄弟切片，补充完整流程上下文，彻底解决 TCP 四点法、关机步骤等长流程因截断导致总结不完整的问题。
@@ -209,8 +208,8 @@ export VLLM_GPU_ID=0                                      # 手动指定 GPU
 | `tests/run_eval.py` | 30 用例 (GT + SDK 函数 + 安全注入 + 多轮指代 + 错别字容错 + 多文档对比) | `python tests/run_eval.py --verbose` |
 | `test_stability.py` | 多轮对话 + 并发保护 + 7 种异常降级 | `python test_stability.py` |
 
-📊 **最新评测** (2026-07-27, 7B-AWQ): `tests/TEST_REPORT.md`
-Overall **33.3%** (10/30) · Context Recall **46.3%** · Product Isolation **90.0%** · Format Cleanliness **96.7%**
+📊 **最新评测** (v15 切片冲刺, 7B-AWQ): `tests/TEST_REPORT.md`
+Overall **33.3%** (10/30) · Health Score **91.8** 🏆 · 硬断言 **8** · API 幻觉 **2** (↓60%) · GT-2 稳定通过 ✅
 
 ---
 

@@ -1,5 +1,95 @@
 # 比邻星 (ProximaRAG) — 开发日志
 
+> **日期**: 2026-07-28 | **版本**: v14 → v15 | **类型**: 切片冲刺+门控修复
+
+### v15 成果
+- **健康度**: 74.5→**91.8** (+17.3) · Multi-API Sticky 7.3%→3.3% · Corrupted Title 10.8%→1.6%
+- **评测**: 10/30 PASS (33.3%) · 硬断言 9→8 · API 幻觉 5→2
+- **关键修复**: SDK 边界邻近合并+智能标题提取 / `^函数名称` 独立硬边界 / metadata 优先的反跨产品门控
+
+> **日期**: 2026-07-28 | **版本**: v13 → v14 | **类型**: 在线防御 (历史净化+反泄露+overflow)
+
+### v14 新增
+- `sanitize_chat_history()` — 历史沉渣净化中间件
+- `_anti_bleed_prefix` — C-SDK 反跨产品泄露门控
+- 评测: 10/30 PASS (33.3%)
+
+> **日期**: 2026-07-28 | **版本**: v12 → v13 | **类型**: 切片质量重构
+
+### v13 4 项修改
+
+| # | 修改 | 效果 |
+|---|------|------|
+| 1 | `_SDK_BLOCK_BOUNDARY_RE` 重构 — 通用数字标题+函数名表头+代码定义行，4 类全覆盖 | 边界识别不再漏匹配 |
+| 2 | `_sanitize_section_title()` — 剥离换行/# /函数名称前缀 | 脏标题清零 |
+| 3 | `_is_skeleton_chunk()` — 离线丢弃 < 150 字符且无代码/参数的占位块 | 骨架块 0/368 ✅ |
+| 4 | `_clean_pdf_text()` Step 4.3 — `rob _ ip`→`rob_ip` 下划线断裂归一化 | OCR artifact 0/368 ✅ |
+| 5 | `_build_child_prefix` + `_emit_child` — 集成清洗器与骨架过滤 | 全链路生效 |
+
+**切片健康度**: 28→74.5 (+166%)  
+**评测**: 8/30→11/30 (36.7%, +10pp) · 硬断言 10→6 (-40%)  
+**vLLM 400**: 0 次 (v12 裁 Context 策略持续有效)
+
+> **变更范围**: `src/pdf_loader.py`, `audit_chunks.py`, `CLAUDE.md`, `README.md`
+
+---
+
+> **日期**: 2026-07-28  
+> **版本**: v10 → v11  
+> **变更类型**: 方法论级修复 (SDK 状态机解析器 + vLLM 400 拦截 + 历史尾部净化 + Autocut 下限)
+
+### v11 4 项修改
+
+| # | 文件 | 修改 | 效果 |
+|---|------|------|------|
+| 1 | `pdf_loader.py` | 新增 `_v4_parse_sdk_state_machine()` — SDK 轨状态机 API 块解析器，集成到 `_v4_build_child_docs_v2()` | OpenC3: 33→45 (+36%), OpenR6: 49→65 (+33%), API 块: 76→90 |
+| 2 | `rag_chain.py` | `_TAIL_REFUSAL_RE` — 历史对话尾部污染净化，剥离 assistant 末尾拒答套话 | E11(JAKA关机) 回归通过 |
+| 3 | `rag_chain.py` | `BadRequestError` 拦截 — `_call_llm()` + `_stream_llm()` 捕获 400 错误：context overflow → `max_tokens//2` 重试；参数不兼容 → 去掉 `extra_body` 重试 | 6 次成功拦截，0 次静默降级到云端 🏆 |
+| 4 | `rag_chain.py` | `_AUTOCUT_MIN_K`: 2→3 — 硬下限保底，多步骤 SDK 流程不丢关键切片 | Autocut 保证 ≥3 Chunk |
+
+**评测**: 8/30 PASS (26.7%) · vLLM 400 拦截 6 次 · GT-3 首次正确输出 `robot_movl`
+
+> **变更范围**: `src/pdf_loader.py`, `src/rag_chain.py`, `CLAUDE.md`, `README.md`
+
+---
+
+> **日期**: 2026-07-28  
+> **版本**: v9 → v10  
+> **变更类型**: LLM 微调 (max_tokens 2048→2560 + SDK 代码精简指令 + Markdown 代码块自动闭合 Guardrail)
+
+### v9 切片架构重构 (第 1+2 批)
+
+**第 1 批 — `src/pdf_loader.py`** (8 项):
+1. `_clean_pdf_text()`: 新增 Step 4.5 I/O 乱码通用归一化 (`1/0`→`I/O`, `1/O`→`I/O`, `I0`→`I/O`)
+2. 新增 `_SDK_TABLE_HEADER_BLACKLIST` (frozenset 22 项) + `_v4_extract_headings()` 黑名单过滤
+3. `_v4_extract_headings()`: 层级推断修正 — `dots==1` 强制 level=2 (H2)
+4. `_v4_build_breadcrumb()`: **完全重写** — 固定 4 槽位数组 + `re.search(r'(?:第|\b)(\d+)', title)` 大章跳变重置
+5. `_v4_build_child_docs_v2()`: H2 导言区 `section_title` 强制继承 Parent 标题
+6. `_API_BLOCK_PATTERNS`: 新增 "数字序号+函数功能标题" 原子块模式
+7. `_emit_child()`: **sdk_header 解耦** — 从 `page_content` 物理拼接 → `metadata["sdk_header"]`
+8. `_split_text_into_children()`: 新增 `doc_type` 参数 + GUI 轨 Heading-to-Heading 完整保留
+
+**第 2 批 — `src/rag_chain.py`** (4 项):
+1. `_build_messages()`: SDK Header 动态单次注入 (`_doc_types` 提前 + Context 顶部仅挂载 1 次)
+2. `_build_messages()`: 父子结构化组装 (Child `【精确定位小节】` 优先 + Parent `【章节背景】` 附后)
+3. 新增 `_decompose_compound_query()` + `_hybrid_retrieve_single()`: 复合查询拆解 (仅顺序连接词 `然后/接着/之后/下一步/随后/再`，绝不拆 `和/与/以及/同时`)
+4. `_build_messages()`: 总 Context Cap `_MAX_CONTEXT_CHARS=2500`，整块剔除不截断内部正文
+
+**向量库变化**: 574C→368C (↓36%)，API 原子块覆盖率 18%→21%
+
+### v10 LLM 微调 (第 3 批)
+
+1. `max_tokens`: 2048→2560 (`_call_llm()` + `_stream_llm()`)，为 ctypes 完整调用链提供 +25% 输出空间
+2. `c_sdk` 轨 System Prompt: 新增 "严禁重复书写 class POSE / class Joint 类定义代码"
+3. 新增 `_ensure_code_blocks_closed()` + `_stream_guardrail()`: LLM 输出自动补全未闭合的 ```
+4. `_MAX_CONTEXT_CHARS`: 2500→2000，为 max_tokens=2560 腾出 8192 上下文空间
+
+**评测**: 8/30 PASS (26.7%)，硬断言 10→9，E04 新通过，vLLM 400 错误可控范围
+
+> **变更范围**: `src/pdf_loader.py` (重写), `src/rag_chain.py` (重构), `tests/TEST_REPORT.md`, `CLAUDE.md`, `README.md`
+
+---
+
 > **日期**: 2026-07-20  
 > **开发者**: Kcsciso  
 > **项目概述**: 基于 RAG（检索增强生成）架构的智能文档对话系统，支持加载本地 PDF、生成向量知识库、WebUI 交互及 ngrok 网络穿透。
@@ -2473,3 +2563,85 @@ v4 上线后暴露 3 类严重问题：
 | `dev_log.md` | 文档 | 本次条目 |
 | `README.md` | 文档 | 功能描述同步 |
 | `CLAUDE.md` | 文档 | 红线与测试规则更新 |
+
+---
+
+## 2026-07-27 — 双轨制架构 + SDK Header Injection + 评估体系重构
+
+### 背景
+系统最致命的架构缺陷：JAKA ZU APP 手册（纯GUI）与 OpenC3/OpenR6 SDK 文档（C动态库）混为一体，导致回答 JAKA 时伪造 ctypes 代码，回答 OpenC3 时因找不到文字步骤而误判拒答。
+
+### 22.1 双轨制文档隔离与路由 (Dual-Track Architecture)
+
+**离线建库** (`pdf_loader.py`):
+- `_resolve_doc_type(product_id)`: JAKA → `"gui_app"`, OpenC3/OpenR6 → `"c_sdk"`
+- `doc_type` 注入到每个 Parent 和 Child Document 的 metadata
+- `_extract_sdk_header(full_text)`: 从 SDK 文档提取全局代码头（CDLL 加载 + POSE/Joint 结构体），自动挂载至每个 API Child 切片
+- JAKA OCR 文字以 `【界面截图文字信息】` 格式注入
+
+**线上生成** (`rag_chain.py` `_build_messages`):
+- 根据 Context 中 `doc_type` 动态渲染双轨 Prompt：
+  - `gui_app` 轨：强制 UI 步骤列表，绝对禁止代码
+  - `c_sdk` 轨：API 即答案，字面强锚定，零怀疑零免责
+- 历史净化：strip 代码块为 `[已提供代码示例]`，过滤拒答模板
+
+### 22.2 SDK Header Dependency Injection
+
+`_extract_sdk_header()` 自动提取：
+- CDLL 加载行：`robot = ctypes.CDLL("collrob_sdk.dll")`
+- POSE / Joint 结构体定义
+- 每个 API Child 切片顶部注入 `【前置依赖 — 可直接运行】` 代码头
+
+效果：任意 API 切片被检索时均包含可直接运行的完整代码上下文。
+
+### 22.3 评估体系重构 (run_eval.py v6)
+
+新增 3 项硬质量断言：
+- ⑥ API 幻觉检测：函数名被改写/虚构检测 (robot_movl → move_linear)
+- ⑦ 零脑补检查："假设有"/"仅供参考"/"示例代码仅为假设"等幻术表述
+- ⑧ 代码截断检查：Python 代码块未闭合或残缺
+
+### 22.4 System Prompt 彻底去毒化
+
+- Few-Shot 示例泛化：移除硬编码 6502/端口号/JAKA 等具体业务词
+- Extract Mode JSON 块替换为 Markdown 硬约束
+- "API 即步骤" 顶层认知定义
+- 标识符字面锚定指令
+
+### 22.5 检索参数全调优
+
+| 参数 | 旧值 | 新值 |
+|------|------|------|
+| RETRIEVAL_K | 8 | **10** |
+| _AUTOCUT_MAX_K | 3 | **5** |
+| BM25 RRF 权重 | 1.0 | **1.2×** |
+| max_tokens | 384 | **2048** |
+| Context 截断 | 200 chars | **400 chars** |
+| api_atomic | 0 | **102** |
+
+### 22.6 HyDE 假想文档生成
+
+`_generate_hyde_doc(query)`: 7B 轻量调用 (max_tokens=128, temperature=0.3) 生成假想技术文档片段，增强向量检索语义密度。LRU 缓存 + 异常降级。
+
+### 测试结果 (2026-07-27, 7B-AWQ, 30 用例)
+
+| 指标 | 初始 | 最终 | 提升 |
+|------|------|------|------|
+| Context Recall | 46% | **52%** | +6pp |
+| Product Isolation | 87% | **93%** | +6pp |
+| Format Cleanliness | 97% | **100%** | +3pp |
+| 防幻觉·APP | 2/3 | **3/3** | +1 |
+| SDK函数·GT | 0/1 | **1/1** | +1 |
+| 硬断言触发 | 13 | **7** | -46% |
+| GT-2 上电步骤 | ❌ | **✅** | 历史突破 |
+
+### 变更文件汇总
+
+| 文件 | 变更 |
+|------|------|
+| `src/pdf_loader.py` | `_resolve_doc_type()` + `_extract_sdk_header()` + doc_type 注入 + SDK header 自动挂载 |
+| `src/rag_chain.py` | 双轨 Prompt + 历史代码剥离 + 拒答模板过滤 + max_tokens 2048 + `_generate_hyde_doc()` + `_normalize_punctuation()` |
+| `src/config.py` | RETRIEVAL_K 8→10 |
+| `tests/run_eval.py` | ⑥⑦⑧ 3 项新硬断言 |
+| `tests/TEST_REPORT.md` | 6 轮迭代评测报告归档 |
+| `tests/audit_ingestion.py` | 新增 v4 白盒审计脚本 |

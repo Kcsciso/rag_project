@@ -328,6 +328,11 @@ def query_fusion_node(state: RAGState) -> dict:
     chat_history = state.get("chat_history")
     product_id = state.get("product_id")
 
+    # 🔴 v14: 历史沉渣净化 — 传入融合节点前剥离拒答/免责套话
+    if chat_history:
+        from .rag_chain import sanitize_chat_history as _sanitize_hist
+        chat_history = _sanitize_hist(chat_history)
+
     logger.info(f"🟢 [Node 1] QueryFusion: raw='{query[:60]}'")
 
     # 第 1 步：澄清补全（检测上一轮是否为澄清反问 + 用户仅输入产品名）
@@ -338,11 +343,19 @@ def query_fusion_node(state: RAGState) -> dict:
             query = fused
             logger.info(f"  ↳ 澄清补全: product_id='{product_id}', fused_query='{query[:80]}'")
 
-    # 第 2 步：短词融合（< 8 字符 → 从历史拼接语义）
-    fused_query = _fuse_short_query(query, chat_history, product_id)
-    if fused_query != query:
-        query = fused_query
-        logger.info(f"  ↳ 短词融合: '{query[:80]}'")
+    # 第 2 步：v16 指代词门控融合 — 仅当含明确指代词时才融合历史
+    # 独立短语（如 "电控柜 IO"、"延时命令"）保留原 Query，不强行粘连历史
+    _PRONOUN_TRIGGERS = re.compile(
+        r'(?:它|这个|那个|该功能|怎么用|参数呢|上面|前面|刚才|继续)',
+    )
+    _is_pronoun_query = bool(_PRONOUN_TRIGGERS.search(query))
+    if _is_pronoun_query and chat_history:
+        fused_query = _fuse_short_query(query, chat_history, product_id)
+        if fused_query != query:
+            query = fused_query
+            logger.info(f"  ↳ 指代词融合: '{query[:80]}'")
+    elif len(query.strip()) < _SHORT_QUERY_MAX_LEN and not _is_pronoun_query:
+        logger.info(f"  ↳ 短词但无指代词，保留原 Query: '{query[:60]}'")
 
     # 第 3 步：口语噪音剥离
     cleaned = _preprocess_query(query)
@@ -370,6 +383,76 @@ def _detect_all_products(query: str) -> List[str]:
                     products.append(rule["product_id"])
                 break
     return products
+
+
+# ── 🔴 v17: Search-First 预检索软路由 ──
+def _search_first_soft_route(query: str) -> Optional[str]:
+    """
+    后台跨产品全库预检索：若某产品得分断层领先，自动锁定 product_id。
+
+    算法:
+      1. 调用 search_similar_with_threshold 做全库检索 (k=5, threshold=None)
+      2. 按 metadata["product_id"] 分组，取各组最高相似度得分
+      3. 若最高分产品 > 0.5 且比第二高产品领先 ≥ 0.15 → 返回该产品的 product_id
+      4. 否则返回 None
+    """
+    try:
+        from .vector_store import search_similar_with_threshold as _vsearch
+        docs = _vsearch(query, k=5, threshold=None, product_id=None)
+        if not docs:
+            return None
+        # 按产品分组取最高得分
+        product_best: Dict[str, float] = {}
+        for doc in docs:
+            pid = doc.metadata.get("product_id", "") if hasattr(doc, "metadata") else ""
+            if not pid or pid == "General":
+                continue
+            # ChromaDB 相似度: 距离越小越相似，需有 score
+            score = getattr(doc, '_score', None) or doc.metadata.get('_score', 0.5)
+            if pid not in product_best or score > product_best[pid]:
+                product_best[pid] = score
+        if len(product_best) < 1:
+            return None
+        # 找最高分产品
+        sorted_products = sorted(product_best.items(), key=lambda x: x[1], reverse=True)
+        top_pid, top_score = sorted_products[0]
+        second_score = sorted_products[1][1] if len(sorted_products) > 1 else 0.0
+        # 断层领先判定
+        if top_score > 0.5 and (top_score - second_score) >= 0.15:
+            logger.info(
+                f"🔍 Search-First: 锁定 '{top_pid}' (score={top_score:.3f}, "
+                f"lead={top_score - second_score:.3f})"
+            )
+            return top_pid
+    except Exception as e:
+        logger.debug(f"Search-First 预检索异常: {e}")
+    return None
+
+
+# ── 🔴 v17: 确定性产品反问生成器 ──
+def build_product_clarification_response() -> dict:
+    """
+    纯 Python 确定性反问 — 彻底废除 LLM 生成的占位符澄清模板。
+
+    直接调用 get_registered_products() 读取 ChromaDB 中已入库产品列表，
+    组装为确定性的反问文案。
+    """
+    try:
+        from .vector_store import get_registered_products as _get_products
+        products = _get_products() or []
+    except Exception:
+        products = []
+    # 🔴 过滤无效值，若为空则硬编码物理产品列表兜底 — 绝不用占位符
+    valid_prods = [p for p in products if p and "具体产品型号" not in str(p)]
+    if not valid_prods:
+        valid_prods = ["JAKA", "OpenC3", "OpenR6"]
+    products_str = "、".join(valid_prods)
+    msg = (
+        f"请问您询问的是哪一款产品呢？（当前已支持：{products_str}）\n"
+        "不同产品的 SDK 接口与操作逻辑有所不同，请告知具体型号以便为您准确解答。"
+    )
+    return {"answer": msg, "sources": [], "model": "product-clarification",
+            "needs_clarification": True}
 
 
 def product_routing_node(state: RAGState) -> dict:
@@ -413,20 +496,30 @@ def product_routing_node(state: RAGState) -> dict:
         elif len(all_products) == 1:
             product_id = all_products[0]
 
-    # ── 意图 3: 产品未识别 → 反问澄清 或 跨产品搜索 ──
+    # ── 意图 3: 产品未识别 → Search-First 预检索 → 反问澄清 ──
     if not product_id:
         from .rag_chain import _resolve_product_from_query as _resolve
         product_id = _resolve(query)
         if not product_id:
-            # 🔴 若 query 包含业务意图且原始长度足够（≥12 字符），路由到跨产品搜索。
-            # 用原始 query（pre-noise-stripping）判断长度，避免噪音剥离后的短词误入 clarify。
             _orig_query = state.get("query", "") or query
+            # 🔴 v17: Search-First 软路由 — 后台跨产品预检索，断层领先则自动锁定
+            _auto_locked_pid = None
+            if _has_business_intent(query) and len(_orig_query.strip()) >= 4:
+                try:
+                    _auto_locked_pid = _search_first_soft_route(query)
+                except Exception:
+                    pass
+            if _auto_locked_pid:
+                logger.info(f"  ↳ Search-First 自动锁定: product_id='{_auto_locked_pid}'")
+                return {"route_status": "generate", "product_id": _auto_locked_pid}
+            # 有业务意图 + 足够长度 → 跨产品搜索（不反问）
             if _has_business_intent(query) and len(_orig_query.strip()) >= 12:
-                logger.info("  ↳ route_status='generate' (no product but has business intent, orig_len≥12 → cross-product)")
+                logger.info("  ↳ route_status='generate' (cross-product, no dominant product)")
                 return {"route_status": "generate", "product_id": None,
                         "sources": [], "model": "cross-product-router"}
+            # 短词 + 无显式产品 → 澄清反问
             registered = get_registered_products()
-            resp = _build_clarification_response(registered)
+            resp = build_product_clarification_response()
             logger.info("  ↳ route_status='clarify'")
             return {"route_status": "clarify", "final_answer": resp["answer"],
                     "sources": [], "model": "product-clarification", "product_id": None}
@@ -1013,6 +1106,34 @@ def render_node(state: RAGState) -> dict:
 # Node 6: ExtractAlignNode — 通用属性对齐校验（v2）
 # ============================================================
 
+# ── 🔴 v16: 免责套话后处理剥离 ──
+_HEDGING_TAIL_RE = re.compile(
+    r'(?:'
+    r'参考文档(?:中)?未(?:包含|记载|找到|涵盖|提供)(?:详细)?[^。]{0,30}[。]?'
+    r'|上述代码(?:假设|仅为示例|假设存在)[^。]*[。]?'
+    r'|具体操作步骤未在文档中[^。]*[。]?'
+    r'|建议(?:您)?(?:联系技术支持|查阅最新文档|参照)[^。]*[。]?'
+    r'|请注意[，,]\s*以上[^。]*[。]?'
+    r'|由于参考资料[^。]*[。]?'
+    r')[\s\n]*$'
+)
+
+
+def _strip_hedging_tail(text: str) -> str:
+    """
+    v16: 后处理剥离 — 擦除回答末尾自相矛盾的免责/假设套话。
+
+    场景: LLM 已正确给出 API 代码，但末尾又追加了
+    "参考文档未包含详细步骤" 或 "上述代码假设存在"，形成前后矛盾。
+    """
+    if not text:
+        return text
+    stripped = _HEDGING_TAIL_RE.sub('', text).strip()
+    if stripped != text:
+        logger.info("  ✂️  HedgingTail: 剥离末尾免责套话")
+    return stripped
+
+
 def extract_align_node(state: RAGState) -> dict:
     """
     通用属性对齐校验节点 — 后处理阶段的最后防线。
@@ -1135,6 +1256,9 @@ def extract_align_node(state: RAGState) -> dict:
                 f"(trigram_overlap > 0.55 @ pos {_cut_at})"
             )
             corrected = "\n".join(_deduped)
+
+    # 🔴 v16: 剥离末尾自相矛盾的免责套话
+    corrected = _strip_hedging_tail(corrected)
 
     return {
         "final_answer": corrected,

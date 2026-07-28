@@ -59,12 +59,13 @@ RAG 对话管线 — 检索增强生成的核心编排层
 """
 
 import logging
+import re
 import threading
 import time
 from typing import List, Dict, Optional, Generator
 
 import httpx
-from openai import OpenAI, APITimeoutError, APIConnectionError
+from openai import OpenAI, APITimeoutError, APIConnectionError, BadRequestError
 
 from .config import (
     BASE_URL, API_KEY, MODEL_NAME, RETRIEVAL_K, SIMILARITY_THRESHOLD,
@@ -110,7 +111,49 @@ _VLLM_LOCK_TIMEOUT = 120.0  # 🔴 匹配 read=120s：等待前一个推理完�
 # ============================================================
 
 # 最多保留最近 N 轮对话历史（1 轮 = 1 user + 1 assistant = 2 条消息）
-MAX_HISTORY_TURNS = 3  # 3 轮 = 6 条消息，加上 system + 当前 user ≈ 8 条，安全适配 4096 上下文
+MAX_HISTORY_TURNS = 2  # 🔴 v16: 2 轮 = 4 条消息，从源头消除 vLLM 400 Context Overflow
+
+# 🔴 v14: 历史沉渣净化正则 — 剥离 Assistant 回复中的拒答/免责/跨产品泄露句式
+_HISTORY_SANITIZE_RE = re.compile(
+    r'(?:'
+    r'参考文档(?:中)?未(?:包含|记载|找到|涵盖)[^。]*(?:。|$)'
+    r'|并未涵盖[^。]*(?:。|$)'
+    r'|知识库中未检索到[^。]*(?:。|$)'
+    r'|未找到关于[^。]*(?:。|$)'
+    r'|建议联系技术支持[^。]*(?:。|$)'
+    r'|建议(?:您)?查阅最新[^。]*(?:。|$)'
+    r'|如需(?:更多|进一步|深入)[^。]*(?:。|$)'
+    r')',
+    re.IGNORECASE,
+)
+
+
+def sanitize_chat_history(messages: list) -> list:
+    """
+    v14: 历史沉渣净化中间件 — 阻断 7B 模型在多轮对话中的句式复读惯性。
+
+    对历史中 role=="assistant" 的消息，剥离系统级拒答/免责套话，
+    保留用户原始 Prompt 和 Assistant 提取出的有效正文。
+
+    调用点: _build_messages() / query_fusion_node() — 在传入 LLM 前执行。
+    """
+    if not messages:
+        return messages
+    cleaned = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            cleaned.append(msg)
+            continue
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role == "assistant" and isinstance(content, str):
+            # 剥离拒答/免责沉渣，保留有效正文
+            sanitized = _HISTORY_SANITIZE_RE.sub('', content).strip()
+            # 若剥离后几乎为空 → 保留原消息（避免丢上下文）
+            if len(sanitized) >= 10:
+                content = sanitized
+        cleaned.append({"role": role, "content": content})
+    return cleaned
 
 # ============================================================
 # 用户友好错误提示
@@ -309,7 +352,7 @@ def _release_vllm_lock():
 # ============================================================
 
 def _call_llm(client: OpenAI, model: str, messages: List[Dict[str, str]],
-              max_tokens: int = 2048, temperature: float = 0.2) -> str:
+              max_tokens: int = 1024, temperature: float = 0.2) -> str:
     """
     调用 LLM 完成非流式推理，返回完整回答文本。
 
@@ -317,19 +360,54 @@ def _call_llm(client: OpenAI, model: str, messages: List[Dict[str, str]],
         client: OpenAI 客户端实例
         model: 模型名称
         messages: 消息列表
-        max_tokens: 最大输出 token 数（默认 1024，代码查询 2048，Planner 用 256）
+        max_tokens: 最大输出 token 数（v16: 1024，代码+步骤已完全充裕）
         temperature: 采样温度（默认 0.2）
     """
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        extra_body={
-            "repetition_penalty": 1.1,
-        },
-    )
-    return response.choices[0].message.content
+    _current_tokens = max_tokens
+    for _attempt in range(3):  # 最多 3 次：原始 + 裁 Context + 再裁 Context
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=_current_tokens,
+                extra_body={"repetition_penalty": 1.1} if _attempt == 0 else None,
+            )
+            raw = response.choices[0].message.content
+            return _ensure_code_blocks_closed(raw) if raw else raw
+        except BadRequestError as e:
+            _err_msg = str(e)
+            if "maximum context length" in _err_msg.lower():
+                # 🔴 v12: 保 max_tokens，裁输入 Context（不裁输出！）
+                # 从最后一条 user message 的【参考资料】段中剔除末尾 1 个 Chunk
+                last_msg = messages[-1]
+                if last_msg.get("role") == "user":
+                    content = last_msg["content"]
+                    # Split by chunk separator "\n\n---\n\n"
+                    sections = content.split("\n\n---\n\n")
+                    # sections: [prefix+chunk1, chunk2, ..., chunkN, question_section]
+                    if len(sections) >= 3:
+                        # 保留前半 Chunk + question_section（末尾）
+                        keep_chunks = max(1, (len(sections) - 1) // 2)
+                        trimmed = "\n\n---\n\n".join(
+                            sections[:keep_chunks] + [sections[-1]]
+                        )
+                        messages[-1]["content"] = trimmed
+                        logger.warning(
+                            f"⚠️  Context overflow → 裁 Context: "
+                            f"{len(sections)-1} chunks → {keep_chunks} chunks "
+                            f"(max_tokens={_current_tokens} 不变)"
+                        )
+                        continue  # retry with trimmed context
+                # Can't trim further → raise
+                raise
+            elif "repetition_penalty" in _err_msg.lower():
+                logger.warning("⚠️  repetition_penalty 不被支持，去掉 extra_body 重试")
+                continue
+            else:
+                raise
+    # Exhausted retries
+    raise RuntimeError("vLLM 400: unable to fit context after trimming")
 
 
 def _stream_llm(
@@ -346,21 +424,49 @@ def _stream_llm(
       - max_tokens=512: 硬限制单次最大输出长度
       - repetition_penalty=1.15: 惩罚连续重复 token，阻断 Lz27→Lz28 循环
     """
-    stream = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=0.2,
-        max_tokens=2048,  # 🔴 2048：完整代码链路 + POSE 结构体 + 多函数示例
-        stream=True,
-        extra_body={
-            "repetition_penalty": 1.1,
-        },
-    )
+    _max_tokens = 1024  # 🔴 v16: 1024 — 代码+步骤已完全充裕，从源头消解 400
+    _temperature = 0.2
 
-    for chunk in stream:
-        delta = chunk.choices[0].delta
-        if delta and delta.content:
-            yield delta.content
+    for _attempt in range(3):  # 🔴 v12: 最多 3 次（原始 + 裁 Context + 再裁 Context）
+        try:
+            stream = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=_temperature,
+                max_tokens=_max_tokens,
+                stream=True,
+                extra_body={"repetition_penalty": 1.1} if _attempt == 0 else None,
+            )
+            for chunk in stream:
+                delta = chunk.choices[0].delta
+                if delta and delta.content:
+                    yield delta.content
+            return  # 成功
+        except BadRequestError as e:
+            _err_msg = str(e)
+            if "maximum context length" in _err_msg.lower():
+                # 🔴 v12: 保 max_tokens，裁输入 Context
+                last_msg = messages[-1] if messages else None
+                if last_msg and last_msg.get("role") == "user":
+                    content = last_msg["content"]
+                    sections = content.split("\n\n---\n\n")
+                    if len(sections) >= 3:
+                        keep_chunks = max(1, (len(sections) - 1) // 2)
+                        messages[-1]["content"] = "\n\n---\n\n".join(
+                            sections[:keep_chunks] + [sections[-1]]
+                        )
+                        logger.warning(
+                            f"⚠️  Stream overflow → 裁 Context: "
+                            f"{len(sections)-1} → {keep_chunks} chunks "
+                            f"(max_tokens={_max_tokens} 不变)"
+                        )
+                        continue
+                raise
+            elif "repetition_penalty" in _err_msg.lower():
+                logger.warning("⚠️  Stream repetition_penalty 不支持，去掉 extra_body 重试")
+                continue
+            else:
+                raise
 
 
 # ============================================================
@@ -381,8 +487,6 @@ def _stream_llm(
 #   - 不做内容理解与总结，仅提供经提取的结构化原文片段
 #   - 多轮对话上下文不会影响检索结果（仅基于当前 query 检索）
 # ============================================================
-
-import re
 
 from langchain_core.documents import Document
 
@@ -552,10 +656,12 @@ def _build_clarification_response(registered_products: list = None) -> Dict[str,
         {"answer": ..., "sources": [], "model": "product-clarification",
          "needs_clarification": True}
     """
+    if not registered_products:
+        registered_products = get_registered_products()
     if registered_products:
-        product_list = " 或 ".join(registered_products)
+        product_list = "、".join(registered_products)
     else:
-        product_list = "OpenR6 或 OpenC3"
+        product_list = "具体产品型号"
 
     clarification_msg = PRODUCT_CLARIFICATION_PROMPT.format(
         product_list=product_list
@@ -579,10 +685,12 @@ def _build_clarification_response_stream(
 
     将澄清文本逐字符 yield 以兼容 SSE 流式接口。
     """
+    if not registered_products:
+        registered_products = get_registered_products()
     if registered_products:
-        product_list = " 或 ".join(registered_products)
+        product_list = "、".join(registered_products)
     else:
-        product_list = "OpenR6 或 OpenC3"
+        product_list = "具体产品型号"
 
     clarification_msg = PRODUCT_CLARIFICATION_PROMPT.format(
         product_list=product_list
@@ -1374,9 +1482,9 @@ API 接口、开发指南和使用手册的问题。
    - 原文 robot_Power_on → 只能写 robot_Power_on，严禁写成 robot_power_up
    - 原文 POSE → 只能写 POSE，严禁写成 Pose / RobotPose
    - 🚫 严禁在 Context 无对应接口时脑补"假设有 robot_xxx 函数"或使用通用英文补全
-   如果参考资料中没有明确记载某个函数名，必须如实告知用户
-   "根据现有文档，无法找到该函数的明确记载，建议联系技术支持或查阅最新 SDK 文档"，
-   绝不允许输出一个"看起来合理"的虚构函数名。
+   - 🔴 若 Context 中已包含 API 函数签名或操作步骤，请直接准确回答，
+     严禁在回答末尾声明"上述代码假设存在"或"参考文档未包含详细步骤"。
+   - 仅当 Context 确实为空时，才告知用户"根据现有文档未找到明确记载"。
 
 2. 🔴【SDK 调用规范·ctypes 强制约束】所有 SDK 代码示例必须严格遵循 ctypes 调用约定：
    - OpenR6 系列产品：`ctypes.CDLL("py_dll.dll")`
@@ -1795,8 +1903,22 @@ def _build_messages(
     # 允许的聊天角色
     ALLOWED_ROLES = {"user", "assistant"}
 
-    # ---- 拼接参考资料（清洗 null 字节 + 噪声截断 + 溯源注入） ----
-    context_parts = []
+    # ── 🔴 v5: 提前提取 doc_types（供后续 SDK Header 注入 + 双轨制控制使用）──
+    _doc_types = set()
+    for _doc in context_docs:
+        if hasattr(_doc, 'metadata'):
+            _dt = _doc.metadata.get("doc_type", "")
+            if _dt:
+                _doc_types.add(_dt)
+
+    # ---- 拼接参考资料（父子结构化组装 + 整块保留不截断） ----
+    # 🔴 v5: 单个 Chunk 100% 完整保留正文，绝不内部截断。
+    # Token 预算控制统一由末尾总 Context Cap 按整块剔除。
+    _MAX_CONTEXT_CHARS = 2000  # 🔴 v10: 2000 字符 — 为 max_tokens=2560 腾出 8192 上下文空间
+
+    child_parts = []   # 【精确定位小节】
+    parent_parts = []  # 【章节背景】
+
     for i, doc in enumerate(context_docs, start=1):
         source = doc.metadata.get("source", "未知来源")
         content = doc.page_content.strip()
@@ -1822,20 +1944,61 @@ def _build_messages(
         cleaned_stripped = content.strip()
         if len(cleaned_stripped) < 20:
             continue
-        # 🔴 Context Token 预算控制 — 放宽至 400 字符配合 max_tokens=1024
-        if len(cleaned_stripped) > 400:
-            truncated = cleaned_stripped[:400]
-            last_break = max(truncated.rfind('。'), truncated.rfind('\n'), truncated.rfind('. '))
-            if last_break > 200:
-                truncated = cleaned_stripped[:last_break + 1]
-            cleaned_stripped = truncated + '\n...[已截断]'
+
         # 🔴 通用溯源格式: 【出处: 《文档名》 — 第N页】 + 【章节: 标题】
         _header = f"【出处: 《{source}》{_page_str}】"
         if _section_str:
             _header += f"\n【章节: {_section_str}】"
-        context_parts.append(f"{_header}\n{cleaned_stripped}")
 
-    context_text = "\n\n---\n\n".join(context_parts)
+        # ── 🔴 v5: 父子结构化组装 —— Child 优先，Parent 附后 ──
+        _is_parent = doc.metadata.get("source_type", "") == "parent_context"
+        if _is_parent:
+            # Parent 切片 → 【章节背景】，放在末尾（背景信息）
+            parent_parts.append(f"【章节背景】\n{_header}\n{cleaned_stripped}")
+        else:
+            # Child 切片 → 【精确定位小节】，放在前面（核心正文）
+            child_parts.append(f"【精确定位小节】\n{_header}\n{cleaned_stripped}")
+
+    # ── 🔴 v5: Total Context Cap — 按整块 Chunk 从末尾剔除，绝不切割内部正文 ──
+    all_chunks = child_parts + parent_parts  # Child 优先，Parent 附后
+    total_chars = sum(len(c) for c in all_chunks)
+    if total_chars > _MAX_CONTEXT_CHARS:
+        # 从末尾（Parent 切片优先）逐块剔除，直到总长 ≤ 上限
+        kept = []
+        running = 0
+        for chunk_text in all_chunks:
+            if running + len(chunk_text) <= _MAX_CONTEXT_CHARS:
+                kept.append(chunk_text)
+                running += len(chunk_text)
+            else:
+                break  # 后续整块丢弃
+        dropped = len(all_chunks) - len(kept)
+        if dropped > 0:
+            logger.info(
+                f"📏 Context Cap: {total_chars} → {running} 字符 "
+                f"(剔除末尾 {dropped} 个整块 Chunk, 上限 {_MAX_CONTEXT_CHARS})"
+            )
+        all_chunks = kept
+
+    context_text = "\n\n---\n\n".join(all_chunks)
+
+    # ── 🔴 v5: SDK Header 动态单次注入 — 从 metadata 提取，仅在 Context 顶部挂载 1 次 ──
+    _sdk_header_injected = ""
+    if "c_sdk" in _doc_types:
+        for _doc in context_docs:
+            if hasattr(_doc, 'metadata'):
+                _sh = _doc.metadata.get("sdk_header", "")
+                if _sh:
+                    _sdk_header_injected = _sh
+                    break  # 只需第一个非空 sdk_header
+        if _sdk_header_injected:
+            context_text = (
+                "【前置依赖 — SDK 全局代码头（可直接运行）】\n"
+                + _sdk_header_injected
+                + "\n---\n\n"
+                + context_text
+            )
+            logger.info(f"📦 SDK Header 单次注入: {len(_sdk_header_injected)} 字符")
 
     # ---- 🔴 柔性 Grounding 提示：查询含数字关键词但 Context 中无具体数值时追加提示 ----
     _NUMERIC_QUERY_RE = re.compile(
@@ -1940,35 +2103,122 @@ def _build_messages(
                 "如果确实不包含，请诚实拒答，不要编造。\n\n"
             )
 
-    # ── 🔴 双轨制 Prompt 控制: 根据 doc_type 动态注入约束 ──
-    _doc_types = set()
-    for _doc in context_docs:
-        if hasattr(_doc, 'metadata'):
-            _dt = _doc.metadata.get("doc_type", "")
-            if _dt:
-                _doc_types.add(_dt)
+    # ── 🔴 v15: C-SDK 反跨产品泄露门控（metadata 优先 + 双重确认）──
+    _anti_bleed_prefix = ""
+    if "c_sdk" in _doc_types:
+        # Step 1: 目标产品识别（取 Context 中 c_sdk doc 的产品）
+        _target_pid = None
+        for _doc in context_docs:
+            if hasattr(_doc, 'metadata'):
+                _dt = _doc.metadata.get("doc_type", "")
+                _pid = _doc.metadata.get("product_id", "")
+                if _dt == "c_sdk" and _pid:
+                    _target_pid = _pid
+                    break
 
+        # Step 2: 多源联合判定 — metadata function_names 为权威信号
+        _target_has_meta_funcs = False
+        _non_target_has_meta_funcs = False
+        _non_target_products = set()
+
+        for _doc in context_docs:
+            _pid = ""
+            if hasattr(_doc, 'metadata'):
+                _pid = _doc.metadata.get("product_id", "")
+                _fns = _doc.metadata.get("function_names", "")
+                _is_api = _doc.metadata.get("is_api", False)
+                # 🔴 v15: metadata 有 function_names 或 is_api=True → 直接判定有 API
+                if _pid == _target_pid and (_fns or _is_api):
+                    _target_has_meta_funcs = True
+                elif _pid and _pid != _target_pid and _pid != "General" and (_fns or _is_api):
+                    _non_target_has_meta_funcs = True
+                    _non_target_products.add(_pid)
+
+        # Step 3: 🔴 仅当双重确认均无 API 时才触发 — metadata 优先
+        if _target_pid and not _target_has_meta_funcs:
+            # 第二重确认：正文扫描（更宽泛的匹配）
+            _target_text_has_funcs = False
+            _body_re = re.compile(
+                r'\b((?:robot_|set_|get_|Robot_|arm_|jaka_|collrob_)[a-zA-Z_]\w{3,})\s*\(|'
+                r'(?:函数名称|函数名)\s+(\w+)',
+                re.IGNORECASE,
+            )
+            for _doc in context_docs:
+                _pid = ""
+                if hasattr(_doc, 'metadata'):
+                    _pid = _doc.metadata.get("product_id", "")
+                if _pid != _target_pid:
+                    continue
+                _ct = _doc.page_content if hasattr(_doc, 'page_content') else str(_doc)
+                if _body_re.search(_ct):
+                    _target_text_has_funcs = True
+                    break
+
+            # 🔴 v15: 双重确认机制 — metadata + 正文均无 API 时才注入
+            if not _target_text_has_funcs and _non_target_has_meta_funcs:
+                _leaked_products = ", ".join(sorted(_non_target_products))
+                _anti_bleed_prefix = (
+                    f"【🚫 跨产品 API 隔离 — 最高优先级】\n"
+                    f"当前问题涉及的产品是 {_target_pid}，但检索到的 SDK 函数签名全部来自 "
+                    f"{_leaked_products}。\n"
+                    f"当前产品知识库未收录 {_target_pid} 的相关 API 代码。\n"
+                    f"你必须明确告知用户：\"{_target_pid} 手册未涵盖此功能\"，\n"
+                    f"严禁提供 {_leaked_products} 的 API 函数作为替代！\n\n"
+                )
+                logger.info(
+                    f"🛡️  反跨产品泄露 (双重确认): target={_target_pid}, "
+                    f"leaked={sorted(_non_target_products)}"
+                )
+            elif not _target_text_has_funcs:
+                # 当前产品无任何 API 签名，但也没有其他产品泄露 → 弱约束
+                logger.debug(
+                    f"🛡️  c_sdk 无目标产品 API: target={_target_pid}, "
+                    f"但无跨产品泄露风险 → 跳过强隔离"
+                )
+
+    # ── 🔴 v17: 双轨制 Prompt 控制 — Python 动态提取章节信息 ──
     _dual_track_prefix = ""
     if _doc_types == {"gui_app"}:
-        # 纯 GUI 文档 → 禁止代码，强制 UI 步骤
-        _dual_track_prefix = (
-            "【🔴 当前问题涉及的是 APP 界面操作手册 — 你必须用 1. 2. 3. 步骤列表回答。"
-            "绝对禁止输出任何 Python/C 代码、ctypes 调用或 DLL 加载语句。"
-            "如果你不知道该操作的详细步骤，直接说'参考文档未包含详细步骤'。】\n\n"
-        )
+        # 🔴 JAKA 轨: 从 context_docs[0] 提取真实 source + section，100% 确定性注入
+        _doc_name = "参考文档"
+        _doc_section = ""
+        if context_docs:
+            _first = context_docs[0]
+            if hasattr(_first, 'metadata'):
+                _doc_name = _first.metadata.get("source", _doc_name)
+                _doc_section = _first.metadata.get("section_title", "")
+        # 若无 section，回退到 page_content 中的 [章节: ...] 标记
+        if not _doc_section and context_docs:
+            _ct = context_docs[0].page_content if hasattr(context_docs[0], 'page_content') else ""
+            _sec_m = re.search(r'\[章节:\s*(.+?)\]', _ct)
+            if _sec_m:
+                _doc_section = _sec_m.group(1).strip()
+
+        if _doc_section:
+            _dual_track_prefix = (
+                "【首句强制红线】你的回答第一句必须完全按照以下内容开头，字面严禁改变：\n"
+                f"根据《{_doc_name}》【章节: {_doc_section}】的记载：\n\n"
+                "用 1. 2. 3. 步骤列表回答，绝对禁止输出任何代码。\n"
+                "🚫 严禁声明'参考文档未包含详细步骤'或'具体步骤未记载'。\n\n"
+            )
+        else:
+            _dual_track_prefix = (
+                "【🔴 APP 操作手册模式】用 1. 2. 3. 步骤列表回答，严禁输出任何代码。\n"
+                "🚫 严禁声明'参考文档未包含详细步骤'或'具体步骤未记载'。\n\n"
+            )
     elif "c_sdk" in _doc_types:
+        # 🔴 C-SDK 轨: 不强制章节前缀，直接展示代码
         _dual_track_prefix = (
-            "【🔴 SDK 模式 — API 即答案，零怀疑零免责】"
-            "直接展示 Context 中的完整 ctypes 调用代码即可，严禁拒答。"
-            "函数名必须逐字复刻原文：OpenC3使能用 robot_enable，上电用 robot_Power_on，"
-            "下使能用 robot_disable，抱闸用 robot_brkopen/robot_brkclose，"
-            "直线运动用 robot_movl，圆弧用 robot_movc。"
-            "严禁改写为robot_move_linear/robot_activate等虚构名称。"
-            "严禁输出'此函数名是假设的'/'未明确记载'/'建议联系技术支持'等免责废话。】\n\n"
+            "【🔴 SDK 模式 — API 即答案】"
+            "直接展示完整的 ctypes 调用代码。"
+            "函数名必须逐字复刻原文（如 robot_movl 绝不可写成 robot.movl 或 movl）。"
+            "🚫 严禁声明'上述代码假设存在'或'参考文档未包含详细步骤'。"
+            "\n【代码生成规范】：全局代码头（含 class POSE/Joint 及 CDLL 加载）已在"
+            "前置环境加载。严禁重复书写 class POSE/class Joint 的类定义，直接从 API 调用写起。】\n\n"
         )
 
     # ---- 构建当前轮次的用户消息（含明确边界标记） ----
-    current_user_message = f"""{_dual_track_prefix}{_cond_constraint}【参考资料】
+    current_user_message = f"""{_anti_bleed_prefix}{_dual_track_prefix}{_cond_constraint}【参考资料】
 {context_text}
 
 ---
@@ -1994,6 +2244,8 @@ def _build_messages(
 
     # 🪟 滑动窗口 + 安全校验 + 历史净化
     if chat_history:
+        # 🔴 v14: 历史沉渣净化 — 传入 LLM 前剥离拒答/免责套话
+        chat_history = sanitize_chat_history(chat_history)
         max_history_msgs = MAX_HISTORY_TURNS * 2
         if len(chat_history) > max_history_msgs:
             trimmed = chat_history[-max_history_msgs:]
@@ -2030,6 +2282,16 @@ def _build_messages(
                     r'参考文档中未(?:包含|记载|找到)[^。]*(?:记载|文档)[^。]*[。]',
                 )
                 content = _REFUSAL_PURGE_RE.sub('', content).strip()
+                # 🔴 v11: 历史尾部污染净化 — 剥离 assistant 回复末尾的拒答/免责套话
+                # 防止下一轮模型在尾部盲目复读上一轮的拒答词
+                _TAIL_REFUSAL_RE = re.compile(
+                    r'(?:'
+                    r'参考文档(?:中)?未(?:包含|记载|找到)[^。]*(?:。|$)'
+                    r'|建议联系技术支持[^。]*(?:。|$)'
+                    r'|如需(?:更多|进一步|深入)[^。]*(?:。|$)'
+                    r')[\s\n]*$'
+                )
+                content = _TAIL_REFUSAL_RE.sub('', content).strip()
             safe_history.append({"role": role, "content": content})
 
         messages.extend(safe_history)
@@ -2047,7 +2309,7 @@ def _build_messages(
 # Autocut 动态自适应截断 — 基于 RRF 分数断崖检测
 # ============================================================
 
-_AUTOCUT_MIN_K = 2   # 🔴 最小保底召回数：绝不允许 Autocut 误杀至 0 chunk
+_AUTOCUT_MIN_K = 3   # 🔴 v11: 硬下限 3 — 绝不低于 3 个 Chunk，多步骤 SDK 流程不丢关键切片
 _AUTOCUT_MAX_K = 5   # 🔴 上限 5 切片：配合 Parent 合并，确保长流程/多步骤不丢关键切片
 
 # ============================================================
@@ -2108,6 +2370,43 @@ def _hard_refusal_response() -> Dict[str, any]:
 def _hard_refusal_stream() -> Generator[str, None, None]:
     for i in range(0, len(_HARD_REFUSAL), 15):
         yield _HARD_REFUSAL[i:i + 15]
+
+
+# ── 🔴 v10: Markdown 代码块自动闭合 Guardrail ──
+def _ensure_code_blocks_closed(text: str) -> str:
+    """
+    若 Markdown 代码块未闭合（奇数个 ```），自动在尾部补全反引号。
+
+    防止代码截断触发硬断言⑧。
+    """
+    if not text:
+        return text
+    backtick_count = text.count("```")
+    if backtick_count % 2 != 0:
+        text = text.rstrip() + "\n```"
+    return text
+
+
+def _stream_guardrail(gen: Generator[str, None, None]) -> Generator[str, None, None]:
+    """
+    对流式 LLM 输出做代码块自动闭合后处理。
+
+    缓冲全部 token 后应用 _ensure_code_blocks_closed，再按 ~15 字符/块
+    重新 yield，保持前端打字机效果。
+    """
+    buffer = []
+    for chunk in gen:
+        buffer.append(chunk)
+    full_text = "".join(buffer)
+    fixed = _ensure_code_blocks_closed(full_text)
+    # 如果 fix 没有改变文本，直接重新 yield 原始 chunks（零开销）
+    if fixed == full_text:
+        yield from buffer
+        return
+    # fix 追加了 ``` → 按块重新 yield
+    chunk_size = 15
+    for i in range(0, len(fixed), chunk_size):
+        yield fixed[i:i + chunk_size]
 
 
 def _is_chitchat(query: str) -> bool:
@@ -2242,6 +2541,21 @@ def _generate_hyde_doc(query: str) -> str:
     if not query or not query.strip():
         return ""
 
+    # 🔴 v16: HyDE 防毒化 Guardrail — 满足条件直接跳过，用原始 Query 检索
+    _q = query.strip()
+    # 条件 1: 纯数字/极短查询 (< 6 字符) → 无语义可扩写
+    if len(_q) < 6:
+        logger.debug(f"🛡️  HyDE skip: query too short ({len(_q)} chars)")
+        return ""
+    # 条件 2: 含非技术符号/表情 → 避免脑补毒化
+    if re.search(r'[^\w\s一-鿿\.\,\;\:\!\?\-\+\=\(\)\[\]\{\}\'\"\/\@\#\$\%\^\&\*]', _q):
+        logger.debug(f"🛡️  HyDE skip: non-technical symbols in query")
+        return ""
+    # 条件 3: 已包含精确 API 签名 → 检索已足够精准，HyDE 反而引入噪声
+    if re.search(r'\b(?:robot_|set_|get_|Robot_)\w+\s*\(', _q):
+        logger.debug(f"🛡️  HyDE skip: exact API signature present")
+        return ""
+
     cache_key = query.strip()[:80]
     if cache_key in _HYDE_CACHE:
         return _HYDE_CACHE[cache_key]
@@ -2324,6 +2638,58 @@ def _autocut_knee(rrf_scores: List[float], max_k: int = None) -> int:
     return cut
 
 
+# ── 复合查询拆解：仅针对明确前后动作顺序的连接词 ──
+# 🔴 严禁拆分 "和"、"与"、"以及"、"同时"（会切碎 "硬件和通讯"、"JAKA和OpenC3" 等名词短语）
+_COMPOUND_ACTION_CONNECTORS = re.compile(
+    r'(?:然后|接着|之后|下一步|随后|再)(?:做|进行|执行|操作)?'
+)
+
+# 最小子查询长度：短于此值的片段直接丢弃（如纯连接词残余 "然后"）
+_MIN_SUB_QUERY_LEN = 4
+
+
+def _decompose_compound_query(query: str) -> List[str]:
+    """
+    检测并拆解复合操作提问为子查询列表。
+
+    仅针对明确有前后动作顺序的连接词进行拆分：
+      然后、接着、之后、下一步、随后、再
+    绝不对 "和"、"与"、"以及"、"同时" 拆分（防止切碎名词短语）。
+
+    纯启发式（不调 LLM），零延迟。
+
+    Args:
+        query: 清洗后的用户查询
+
+    Returns:
+        子查询列表。若无复合意图 → 返回 [query]（单元素列表）
+    """
+    if not query or len(query.strip()) < 10:
+        return [query] if query else []
+
+    # 按连接词切分
+    parts = _COMPOUND_ACTION_CONNECTORS.split(query)
+
+    # 清洗 + 过滤空/过短片段
+    sub_queries = []
+    for part in parts:
+        cleaned = part.strip()
+        # 去除前导标点/空格
+        cleaned = re.sub(r'^[，,、\s]+', '', cleaned)
+        cleaned = re.sub(r'[？?！!。.，,、\s]+$', '', cleaned)
+        if len(cleaned) >= _MIN_SUB_QUERY_LEN:
+            sub_queries.append(cleaned)
+
+    if len(sub_queries) <= 1:
+        return [query]
+
+    logger.info(
+        f"🔀 复合查询拆解: {len(sub_queries)} 个子查询 → "
+        f"{[q[:40] for q in sub_queries]}"
+    )
+    return sub_queries
+
+
 def _hybrid_retrieve(
     vector_store,
     query: str,
@@ -2364,10 +2730,57 @@ def _hybrid_retrieve(
         Top-K 个重排序后的 Document 列表
     """
     try:
+        # ── 🔴 v5: 复合查询拆解 — 多步骤操作拆分为子查询分别检索 ──
+        _sub_queries = _decompose_compound_query(query)
+        _is_compound = len(_sub_queries) > 1
+
+        if _is_compound:
+            # 多路检索：每个子查询独立检索 → 按 page_content 指纹去重合并
+            _all_docs = []
+            _seen_fingerprints = set()
+            for _sq in _sub_queries:
+                _sq_docs = _hybrid_retrieve_single(
+                    vector_store, _sq, k=k, threshold=threshold,
+                    fetch_factor=fetch_factor, product_id=product_id,
+                )
+                for _doc in _sq_docs:
+                    _fp = _doc.page_content[:120]
+                    if _fp not in _seen_fingerprints:
+                        _seen_fingerprints.add(_fp)
+                        _all_docs.append(_doc)
+            logger.info(
+                f"🔀 复合检索: {len(_sub_queries)} 子查询 → "
+                f"{len(_all_docs)} 个去重切片"
+            )
+            return _all_docs[:max(k, int(k * 1.5))]
+        else:
+            return _hybrid_retrieve_single(
+                vector_store, query, k=k, threshold=threshold,
+                fetch_factor=fetch_factor, product_id=product_id,
+            )
+
+    except Exception as e:
+        logger.error(f"❌ 混合检索失败: {type(e).__name__}: {e}")
+        return []
+
+
+def _hybrid_retrieve_single(
+    vector_store,
+    query: str,
+    k: int = RETRIEVAL_K,
+    threshold: float = SIMILARITY_THRESHOLD,
+    fetch_factor: int = 5,
+    product_id: Optional[str] = None,
+) -> List:
+    """
+    单查询混合检索（原 _hybrid_retrieve 的核心逻辑）。
+
+    由 _hybrid_retrieve() 调用：复合查询拆解后对每个子查询独立运行此函数。
+    """
+    try:
         # ── 第 0 步: Query 预处理 — 标点归一化 + HyDE 假想文档生成 ──
         _query_normalized = _normalize_punctuation(query)
         _hyde_doc = _generate_hyde_doc(_query_normalized)
-        # 向量检索使用 HyDE 文档（语义更丰富），若 HyDE 为空则降级为原始 query
         _vector_query = (_hyde_doc + " " + _query_normalized) if _hyde_doc else _query_normalized
 
         # ── 第 1 步：向量搜索 — HyDE 增强 + 扩大候选池 ──
@@ -2383,8 +2796,6 @@ def _hybrid_retrieve(
         )
 
         if not results_with_scores:
-            # 🔴 保底召回：阈值过滤全部拦截（如"上电函数" vs 文档"上电指令"的语义鸿沟），
-            # 强制取原始向量 Top-3 切片作为上下文，交由 LLM 阅读理解推断。
             logger.warning(
                 f"⚠️  阈值过滤后 0 切片通过 (relaxed_threshold={relaxed_threshold})，"
                 f"触发保底召回 — 取原始向量 Top-3"
@@ -2394,7 +2805,6 @@ def _hybrid_retrieve(
                 product_id=product_id,
             )
             if raw_fallback:
-                # 获取保底切片的实际相似度得分用于日志
                 raw_with_scores = vector_store.similarity_search_with_score(
                     query, k=3,
                     filter={"product_id": product_id} if product_id else None,
@@ -2409,23 +2819,17 @@ def _hybrid_retrieve(
             return []
 
         # 第 2 步：噪声切片过滤（保留向量原始排名，不重排序）
-        # 🔴 关键修复：关键词评分仅用于过滤噪声切片（score < 0.05 → 丢弃），
-        # 绝不再对向量排名进行任何重排序。BM25 已通过 RRF 提供关键词信号，
-        # 重复使用关键词评分重排只会破坏向量语义相似度的正确排序。
         kept_docs = []
         filtered_count = 0
         noise_filtered = 0
         image_noise_filtered = 0
         for doc in results_with_scores:
-            # 🔴 过滤噪声切片（庞大结构体定义）
             if _is_noise_chunk(doc.page_content):
                 noise_filtered += 1
                 continue
-            # 🔴 智能图片切片过滤：含 OCR 内容 → 保留；纯页码引用 → 丢弃
             text_content = doc.page_content
             img_tags = re.findall(r'\[Image:\s*[^\]]*\]', text_content)
             if img_tags:
-                # 提取 OCR 内容文本
                 ocr_texts = []
                 for tag in img_tags:
                     m = re.search(r'\|?\s*OCR内容:\s*(.+?)(?:\]|$)', tag)
@@ -2433,23 +2837,17 @@ def _hybrid_retrieve(
                         ocr_texts.append(m.group(1).strip())
                 ocr_len = sum(len(t) for t in ocr_texts)
                 img_chars = sum(len(t) for t in img_tags)
-                # 有效内容 = 总字符 - 图片标签 + OCR 文本
                 effective_chars = len(text_content.strip()) - img_chars + ocr_len
-                # 仅当有效内容 < 20 字符时才过滤（纯页码引用、无意义标签）
                 if effective_chars < 20:
                     image_noise_filtered += 1
                     continue
-            # 截断噪声内容（长结构体但非纯噪声）
             cleaned_content = _truncate_noise_content(doc.page_content)
             if cleaned_content != doc.page_content:
                 doc.page_content = cleaned_content
-            # 🔴 关键词评分过滤 — v2 宽松版：保留 SDK 函数切片 + 防止全部过滤
             kw_score = _score_chunk_for_query(doc.page_content, _query_normalized)
-            # 检查是否包含 function_names 元数据（API 原子块保护）
             _has_fn_meta = bool(
                 hasattr(doc, 'metadata') and doc.metadata.get("function_names", "")
             )
-            # 放宽条件：kw_score >= 0.03 或 含函数名元数据 或 含代码实体 → 保留
             if kw_score < 0.03 and not _has_fn_meta:
                 _txt = doc.page_content.lower()
                 _has_code = any(
@@ -2468,7 +2866,6 @@ def _hybrid_retrieve(
         if filtered_count > 0:
             logger.info(f"🧹 低关键词分过滤: {filtered_count} 个")
 
-        # 🔴 安全网：全部被过滤 → 恢复向量 Top-3（防止 LLM 空上下文幻觉）
         if not kept_docs:
             logger.warning("⚠️  过滤后 kept_docs 为空！恢复向量 Top-3 保底")
             _fallback = search_similar_with_threshold(
@@ -2485,19 +2882,16 @@ def _hybrid_retrieve(
             bm25_results = bm25_search(_bm25_query, product_id, k=fetch_k)
 
         # 第 4 步：RRF（Reciprocal Rank Fusion）融合向量排名与 BM25 排名
-        # RRF 公式: score(d) = Σ 1/(K + rank_i(d)), K=60
         if bm25_results:
             RRF_K = 60
-            rrf_scores: Dict[str, float] = {}  # doc_id → RRF score
-            doc_map: Dict[str, any] = {}         # doc_id → Document
+            rrf_scores: Dict[str, float] = {}
+            doc_map: Dict[str, any] = {}
 
-            # 向量排名贡献（kept_docs 已保持原始向量相似度顺序）
             for rank_i, doc in enumerate(kept_docs):
-                doc_id = doc.page_content[:120]  # 用内容前120字符做指纹
+                doc_id = doc.page_content[:120]
                 rrf_scores[doc_id] = rrf_scores.get(doc_id, 0) + 1.0 / (RRF_K + rank_i + 1)
                 doc_map[doc_id] = doc
 
-            # BM25 排名贡献 — 权重 1.2× 提升精确关键词(API名/端口号)抓取能力
             _BM25_WEIGHT = 1.2
             for rank_j, (doc, _) in enumerate(bm25_results):
                 doc_id = doc.page_content[:120]
@@ -2505,11 +2899,8 @@ def _hybrid_retrieve(
                 if doc_id not in doc_map:
                     doc_map[doc_id] = doc
 
-            # 按 RRF 得分降序排列
             fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
 
-            # ── 🔴 v3.0 Entity Anchor 实体强锚定重排 ──
-            # 提取 query 中的具体数字和专有名词，对物理包含这些实体的切片置顶
             _query_anchors = set()
             for _m in re.finditer(r'\b(\d{2,})\b', query):
                 _query_anchors.add(_m.group(1))
@@ -2537,10 +2928,8 @@ def _hybrid_retrieve(
                     logger.info(f"  ⚓ Entity Anchor: {len(_query_anchors)} 锚点 → {_boosted_count} chunks boost")
                 fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
 
-            # ── Fix 1: function_names 元数据 boost ──
-            # 利用 v4 child chunk 的 function_names 结构化字段做精确函数名加权
             if _query_code_entities:
-                _fn_boost = 0.08  # 函数名匹配加权 > 普通锚点
+                _fn_boost = 0.08
                 _fn_boosted = 0
                 for _doc_id, _score in fused:
                     _doc = doc_map.get(_doc_id, None)
@@ -2559,8 +2948,7 @@ def _hybrid_retrieve(
                     )
                 fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
 
-            # ── 🔴 RRF 文本/代码切片权重平衡: 纯文本 Child 获得基线 boost ──
-            _text_boost = 0.03   # 纯文本切片基线加分（补偿缺少 function_names 的劣势）
+            _text_boost = 0.03
             _text_boosted = 0
             for _doc_id, _score in fused:
                 _doc = doc_map.get(_doc_id, None)
@@ -2569,7 +2957,6 @@ def _hybrid_retrieve(
                 _meta_fn = ""
                 if hasattr(_doc, 'metadata'):
                     _meta_fn = _doc.metadata.get("function_names", "")
-                # 纯文本切片 (无 function_names) → 基线 boost
                 if not _meta_fn:
                     _has_text = bool(re.search(r'[一-鿿]{4,}', _doc.page_content or ""))
                     if _has_text:
@@ -2579,7 +2966,6 @@ def _hybrid_retrieve(
                 logger.info(f"  📄 Text-Chunk Rebalance: {_text_boosted} 纯文本切片 +{_text_boost} RRF")
             fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
 
-            # 🔪 Autocut 动态截断：检测 RRF 分数断崖点，自适应确定最佳 K
             rrf_score_list = [score for _, score in fused]
             autocut_k = _autocut_knee(rrf_score_list, max_k=k)
             top_docs = [doc_map[doc_id] for doc_id, _ in fused[:autocut_k]]
@@ -2589,11 +2975,8 @@ def _hybrid_retrieve(
                 f"→ RRF 融合 → Autocut K={autocut_k} → 输出 Top-{len(top_docs)}"
             )
         else:
-            # 无 BM25 结果时回退到纯向量 Top-K（保持原始向量顺序）
             top_docs = kept_docs[:k]
 
-        # 🔴 保底召回：如果评分后仍无有效切片（全部被噪声过滤器拦截），
-        # 回退到原始向量搜索结果的前 k 个。
         if not top_docs and results_with_scores:
             logger.warning(
                 f"⚠️  关键词评分后 0 切片通过（全部被噪声过滤器拦截），"
@@ -2608,7 +2991,7 @@ def _hybrid_retrieve(
         return top_docs
 
     except Exception as e:
-        logger.error(f"❌ 混合检索失败: {type(e).__name__}: {e}")
+        logger.error(f"❌ 单查询混合检索失败: {type(e).__name__}: {e}")
         return []
 
 
@@ -2866,7 +3249,7 @@ def rag_chat(
                         doc.metadata.get("source", "未知")
                         for doc in context_docs
                     ))
-                    return {"answer": answer, "sources": sources, "model": _resolve_vllm_model()}
+                    return {"answer": _ensure_code_blocks_closed(answer), "sources": sources, "model": _resolve_vllm_model()}
             else:
                 # 锁获取超时 → 视为 Layer 1 不可用
                 logger.warning("⚠️  第 1 层（本地 vLLM）跳过：并发锁获取超时")
@@ -2895,7 +3278,7 @@ def rag_chat(
                     doc.metadata.get("source", "未知")
                     for doc in context_docs
                 ))
-                return {"answer": answer, "sources": sources, "model": DEEPSEEK_MODEL}
+                return {"answer": _ensure_code_blocks_closed(answer), "sources": sources, "model": DEEPSEEK_MODEL}
 
         except _FALLBACK_EXCEPTIONS as e:
             logger.warning(f"⚠️  第 2 层（DeepSeek API）不可用（网络/超时）: {e}")
@@ -3141,7 +3524,7 @@ def rag_chat_stream(
         lock_acquired = _acquire_vllm_lock()
         try:
             if lock_acquired:
-                yield from _track_yield(_stream_llm(_get_client(), _resolve_vllm_model(), messages))
+                yield from _track_yield(_stream_guardrail(_stream_llm(_get_client(), _resolve_vllm_model(), messages)))
                 if _stream_yielded_anything[0]:
                     logger.info(f"✅ 第 1 层（本地 vLLM 流式）调用成功")
                     return  # ← 成功，生成器结束
@@ -3164,7 +3547,7 @@ def rag_chat_stream(
     if _FALLBACK_ENABLED:
         logger.info("🔄 正在切换到第 2 层（DeepSeek API 流式）...")
         try:
-            yield from _track_yield(_stream_llm(_get_deepseek_client(), DEEPSEEK_MODEL, messages))
+            yield from _track_yield(_stream_guardrail(_stream_llm(_get_deepseek_client(), DEEPSEEK_MODEL, messages)))
             if _stream_yielded_anything[0]:
                 logger.info("✅ 第 2 层（DeepSeek API 流式）降级成功")
                 return  # ← 成功，生成器结束

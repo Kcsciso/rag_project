@@ -742,6 +742,6 @@ if __name__ == "__main__":
     uvicorn.run(
         "app:app",
         host=HOST,
-        port=PORT,
+        port=8000,
         reload=True,  # 开发模式：代码变更时自动重启
     )
