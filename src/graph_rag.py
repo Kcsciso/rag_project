@@ -513,10 +513,10 @@ def product_routing_node(state: RAGState) -> dict:
                 logger.info(f"  ↳ Search-First 自动锁定: product_id='{_auto_locked_pid}'")
                 return {"route_status": "generate", "product_id": _auto_locked_pid}
             # 有业务意图 + 足够长度 → 跨产品搜索（不反问）
-            if _has_business_intent(query) and len(_orig_query.strip()) >= 12:
-                logger.info("  ↳ route_status='generate' (cross-product, no dominant product)")
-                return {"route_status": "generate", "product_id": None,
-                        "sources": [], "model": "cross-product-router"}
+            # if _has_business_intent(query) and len(_orig_query.strip()) >= 12:
+            #     logger.info("  ↳ route_status='generate' (cross-product, no dominant product)")
+            #     return {"route_status": "generate", "product_id": None,
+            #             "sources": [], "model": "cross-product-router"}
             # 短词 + 无显式产品 → 澄清反问
             registered = get_registered_products()
             resp = build_product_clarification_response()

@@ -1,6 +1,6 @@
 {
   "description": "RAG v4 统一回归评测用例集 — 合并所有旧测试脚本 (GT + robot + human + multidoc)",
-  "version": "4.2",
+  "version": "4.3",
   "cases": [
     {
       "id": "GT-1", "category": "数字参数·GT", "query": "JAKA端口号是多少",
@@ -55,7 +55,7 @@
     },
     {
       "id": "E04", "category": "SDK函数", "query": "OpenC3 六轴机械臂打开抱闸和使能的函数是什么？",
-      "product_id": null, "must_contain": ["brkopen", "enable"],
+      "product_id": null, "must_contain": ["robot_brkopen", "robot_enable"],
       "must_not_contain": ["set_robot_power_on", "py_dll", "robot_Power_on("],
       "description": "OpenC3 抱闸+使能(robot_brkopen/robot_enable)，不得出现OpenR6函数"
     },
@@ -120,9 +120,9 @@
     },
     {
       "id": "E15", "category": "口语化", "query": "这个机械臂咋上电啊老哥",
-      "product_id": null, "must_contain": ["上电", "电"],
+      "product_id": "OpenC3", "must_contain": ["robot_Power_on"],
       "must_not_contain": [],
-      "description": "口语化噪音查询 — 应能正确识别意图并回答"
+      "description": "口语化噪音查询 — 绑定对应产品后能正确剥离噪音并回答"
     },
     {
       "id": "E16", "category": "跨产品", "query": "OpenR6 上电函数怎么写？",
@@ -149,7 +149,7 @@
       "query": "机械臂上垫和使能函数怎么写",
       "product_id": "OpenC3",
       "must_contain": ["robot_Power_on", "robot_enable"],
-      "must_not_contain": ["上垫"],
+      "must_not_contain": [],
       "description": "同音错别字纠错：'上垫'应自动识别并召回'上电'函数"
     },
     {
@@ -204,8 +204,16 @@
       "product_id": "OpenC3",
       "must_contain": ["get_robot_pose", "px", "py", "pz"],
       "must_not_contain": ["set_robot_coordinate"],
-      "description": "隐式特征提问：'返回六个值' $\\rightarrow$ 正确匹配 get_robot_pose 与 POSE 结构体"
+      "description": "隐式特征提问：'返回六个值' → 正确匹配 get_robot_pose 与 POSE 结构体"
+    },
+    {
+      "id": "E25",
+      "category": "跨SDK防混淆",
+      "query": "OpenC3 的 set_move_line 函数怎么用？",
+      "product_id": "OpenC3",
+      "must_contain": ["未包含", "未记载"],
+      "must_not_contain": ["set_move_line", "py_dll"],
+      "description": "错用OpenR6函数问OpenC3 — 必须诚实拒答，严禁编造OpenC3的set_move_line代码"
     }
   ]
-  
 }

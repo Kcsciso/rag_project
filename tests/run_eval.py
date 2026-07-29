@@ -226,9 +226,15 @@ def run_single_case(case: dict, vs: Any, quick: bool = False) -> dict:
     result["answer"] = answer
     result["model"] = model
 
-    # ── 关键词必须包含/禁止包含 ──
+    # ── 关键词必须包含/禁止包含 (已修复数字误杀与同义词误判) ──
     for kw in case.get("must_contain", []):
-        hit = kw.lower() in answer.lower()
+        if kw in ["未记载", "未包含"]:
+            # 拒答类关键词：涵盖常见的语义等价表述
+            refusal_patterns = [r'未记载', r'未包含', r'未找到', r'未提及', r'未在.*记载']
+            hit = any(re.search(p, answer) for p in refusal_patterns)
+        else:
+            hit = kw.lower() in answer.lower()
+
         result["checks"][f"含'{kw}'"] = hit
         if hit:
             result["kw_hits"] += 1
@@ -236,7 +242,13 @@ def run_single_case(case: dict, vs: Any, quick: bool = False) -> dict:
             result["errors"].append(f"缺少关键词'{kw}'")
 
     for kw in case.get("must_not_contain", []):
-        hit = kw.lower() in answer.lower()
+        if kw.isdigit():
+            # 数字类禁止词：使用前后非数字边界，避免 "6502" 或 "49152" 误触 "502"
+            pattern = rf'(?<!\d){re.escape(kw)}(?!\d)'
+            hit = bool(re.search(pattern, answer))
+        else:
+            hit = kw.lower() in answer.lower()
+
         result["checks"][f"不含'{kw}'"] = not hit
         if hit:
             result["errors"].append(f"含禁止词'{kw}'")

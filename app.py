@@ -544,7 +544,7 @@ async def list_products():
 
 
 # ============================================================
-# 调试端点 — Retrieval Debugger (v4.2)
+# 调试端点 — Retrieval Debugger (v4.2 健壮修复版)
 # ============================================================
 
 @app.get("/api/debug/inspect_chunks")
@@ -555,39 +555,38 @@ async def inspect_chunks(
 ):
     """
     切片检查器 — GET /api/debug/inspect_chunks
-
-    参数:
-      - product_id: 按产品过滤（可选）
-      - keyword: 按 page_content 子串匹配（可选）
-      - limit: 最大返回数（默认 10）
-
-    返回每个匹配 Child 切片的:
-      - chunk_id, product_id, section, raw_text(前 300 字),
-        function_names(list), api_atomic(bool), source
+    动态获取磁盘上最新的 Collection，彻底解决重建数据库后内存旧句柄失效报错的问题。
     """
-    # 复用应用级 vector_store 的底层 ChromaDB client
-    _coll = None
-    if vector_store is not None:
-        _coll = vector_store._collection  # 当前加载的 collection (rag_v4_child)
-    if _coll is None:
-        return JSONResponse({"error": "vector store not loaded"}, status_code=503)
+    import chromadb
+    from src.config import CHROMA_PERSIST_DIR
+
+    # 🔴 动态连接磁盘 PersistentClient，确保每次获取的都是最新的 Collection
     try:
-        coll = _coll
-    except Exception as e:
-        return JSONResponse({"error": f"collection access failed: {e}"}, status_code=404)
+        client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+        coll = client.get_collection("rag_v4_child")
+    except Exception:
+        # 回退逻辑：尝试旧集合名称
+        try:
+            client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+            coll = client.get_collection("rag_documents")
+        except Exception as e:
+            return JSONResponse({"error": f"Collection 访问失败: {e}"}, status_code=404)
 
     where_filter = {}
     if product_id:
         where_filter["product_id"] = product_id
 
-    all_data = coll.get(
-        where=where_filter if where_filter else None,
-        include=["documents", "metadatas"],
-    )
+    try:
+        all_data = coll.get(
+            where=where_filter if where_filter else None,
+            include=["documents", "metadatas"],
+        )
+    except Exception as e:
+        return JSONResponse({"error": f"查询切片失败: {e}"}, status_code=500)
 
     chunks = []
-    for i, (doc_id, doc_text, meta) in enumerate(
-        zip(all_data["ids"], all_data["documents"], all_data["metadatas"])
+    for doc_id, doc_text, meta in zip(
+        all_data["ids"], all_data["documents"], all_data["metadatas"]
     ):
         if keyword and keyword.lower() not in doc_text.lower():
             continue

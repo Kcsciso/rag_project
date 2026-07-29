@@ -720,13 +720,22 @@ def search_similar_with_threshold(
                 f"{doc.metadata.get('source', '?')[:50]}"
             )
 
+    # 🔴 关键修复：当阈值过陡挤掉所有切片时，若候选池中有精准匹配 API 名字的切片，触发特例拉升保底
+    if not filtered_docs and results_with_scores:
+        all_docs = [doc for doc, _ in results_with_scores]
+        boosted = _boost_api_chunks(query, all_docs)
+        if boosted and boosted[0] != all_docs[0]:
+            logger.info("🚀 阈值超限但命中 API 实体，触发特例强拉升保底！")
+            return boosted[:k]
+
     if filtered_count > 0:
         logger.info(
             f"🔍 相似度阈值过滤: {len(filtered_docs)}/{len(results_with_scores)} "
             f"个切片通过 (threshold={threshold})"
         )
 
-    return filtered_docs
+    # 🔴 返回前统一执行 API 强拉升
+    return _boost_api_chunks(query, filtered_docs)
 
 
 def get_vector_store_info(vector_store: Chroma) -> dict:
@@ -796,6 +805,45 @@ def _extract_query_code_entities(query: str) -> List[str]:
                 seen.add(e)
                 entities.append(e)
     return entities
+
+def _boost_api_chunks(query: str, docs: List[Document]) -> List[Document]:
+    """
+    若 Query 中包含 SDK 函数名/代码实体，强行提升 metadata['function_names']
+    或正文中命中该 API 的切片至头部（Hard Boost），解决 Dense Vector 对纯代码名召回靠后或被过滤的问题。
+    """
+    if not docs or not query:
+        return docs
+
+    entities = _extract_query_code_entities(query)
+    if not entities:
+        return docs
+
+    boosted = []
+    normal = []
+
+    for doc in docs:
+        fn_meta = doc.metadata.get("function_names", "")
+        # 1. 优先检查元数据中记录的函数名
+        is_hit = _match_function_names(fn_meta, entities)
+
+        # 2. 若元数据未写全，后置扫描正文中的 [Functions: ...] 标头或代码实体
+        if not is_hit:
+            content_lower = doc.page_content.lower()
+            for ent in entities:
+                if len(ent) >= 3 and ent.lower() in content_lower:
+                    is_hit = True
+                    break
+
+        if is_hit:
+            boosted.append(doc)
+        else:
+            normal.append(doc)
+
+    if boosted:
+        logger.info(f"🚀 API 强拉升生效: 优先排序 {len(boosted)} 个命中 API 实体 {entities} 的切片")
+        return boosted + normal
+
+    return docs
 
 def _embed_batched(
     texts: List[str],
@@ -1043,7 +1091,7 @@ def search_dual_index(
             metadata={**child_doc.metadata, "source_type": "child_detail"},
         ))
 
-    return merged
+    return _boost_api_chunks(query, merged)
 
 
 # ============================================================

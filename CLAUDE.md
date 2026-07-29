@@ -39,13 +39,15 @@ Conda `rag_agent` (Python 3.10)。**严禁 `pip install --upgrade`**：
 | 17 | v5 | 双轨制 (gui_app/c_sdk) + 8 项硬断言 | `_resolve_doc_type()`, `_extract_sdk_header()` |
 | v9-11 | v9-11 | 切片架构重构: I/O归一化/面包屑4槽/状态机/sdk_header解耦/GUI完整保留/复合拆解/400拦截/历史净化 | `_v4_build_breadcrumb()`, `_v4_parse_sdk_state_machine()`, `sanitize_chat_history()` |
 | v12-13 | v12-13 | 裁Context保输出/骨架过滤/标题清洗/下划线归一化 | `_is_skeleton_chunk()`, `_sanitize_section_title()`, `_clean_pdf_text()` Step 4.3 |
-| v14-15 | v14-15 | 历史沉渣净化+反跨产品门控+边界合并+Health Score 91.8 | `_anti_bleed_prefix`, `_MIN_BLOCK_GAP=30` |
+| v16-17 | v16-17 | QueryFusion指代词门控/HyDE防毒化/Search-First软路由/确定性反问/首句章节Python注入/套话擦除 | `_search_first_soft_route()`, `build_product_clarification_response()`, `_strip_hedging_tail()` |
+| v18 | v18 | 🔴 代码注释污染治理: Heading上下文拦截/伪标题黑名单/状态机净化/Golden TOC预留 | `_v4_extract_headings()` 代码注释拦截, `_sanitize_section_title()` 伪标题黑名单, `_v4_extract_sdk_toc()` |
+| **当前** | **v18** | max_tokens=1024, MAX_HISTORY_TURNS=2, SDK Context Cap=4000, Autocut SDK min_k=6 | — |
 
 ### 当前关键配置
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
-| max_tokens | 2200 | v13: 保代码完整，裁Context不减输出 |
+| max_tokens | 1024 | v17: 代码+步骤完全充裕，从源头消解 vLLM 400 |
 | _AUTOCUT_MIN_K | 3 | v11: 硬下限3，多步骤SDK不丢切片 |
 | _MAX_CONTEXT_CHARS | 2000 | v11: 总Context字符硬上限 |
 | CHILD_CHUNK_SIZE | 400 | H3/H4 函数级子层 |
@@ -99,16 +101,60 @@ python app.py   # → http://localhost:8000 (比邻星 ProximaRAG) · API: /docs
 
 | 函数 | 位置 | 用途 |
 |------|------|------|
-| `_v4_parse_sdk_state_machine()` | pdf_loader.py | SDK 轨 4 类边界状态机 |
-| `_sanitize_section_title()` | pdf_loader.py | 标题清洗器 |
+| `_v4_parse_sdk_state_machine()` | pdf_loader.py | SDK 轨状态机 API 块解析器（`数字标题` + `函数名称/函数说明` 两类边界） |
+| `_v4_extract_headings()` | pdf_loader.py | 标题提取 + 🔴 代码注释拦截（8 特征词上下文校验） |
+| `_sanitize_section_title()` | pdf_loader.py | 标题清洗器 + 🔴 伪标题黑名单（10 项 frozenset） |
+| `_v4_extract_sdk_toc()` | pdf_loader.py | 🔴 Golden TOC 目录树预解析（预留回退基础设施） |
 | `_is_skeleton_chunk()` | pdf_loader.py | 离线骨架过滤 |
-| `_clean_pdf_text()` | pdf_loader.py | 7 步通用文本清洗 |
+| `_clean_pdf_text()` | pdf_loader.py | 7 步通用文本清洗 + 🔴 Step 6 SDK 代码换行修复 |
 | `_hybrid_retrieve()` | rag_chain.py | BM25+向量 RRF 混合检索 |
 | `_decompose_compound_query()` | rag_chain.py | 复合查询拆解 (顺序连接词) |
-| `_build_messages()` | rag_chain.py | Prompt 组装 + 双轨控制 + 反泄露门控 |
+| `_build_messages()` | rag_chain.py | Prompt 组装 + 双轨控制 + 反泄露门控 + 🔴 SDK Context Cap 4000 |
 | `sanitize_chat_history()` | rag_chain.py | 历史沉渣净化中间件 |
-| `_ensure_code_blocks_closed()` | rag_chain.py | 代码块自动闭合 Guardrail |
+| `_fix_and_close_sdk_code()` | rag_chain.py | 🔴 代码块自动闭合 + CDLL 补全（替代已删除的 `_ensure_code_blocks_closed`） |
 | `_call_llm()` / `_stream_llm()` | rag_chain.py | LLM 调用 + 400 拦截 + Context 裁切 |
+
+### 🔴 PDF 切片规则 (v18)
+
+#### SDK 状态机边界触发条件 (`_SDK_BLOCK_BOUNDARY_RE`)
+
+```
+仅两路可验证边界:
+  ① ^\d{1,2}[\.\、\s]\s*\S+       → "28. 机械臂电源上电" / "4. 机械臂上电"
+  ② ^(?:函数名称|函数说明)\s*      → OpenC3/OpenR6 两种 API 表头格式
+```
+
+**严格禁止**匹配的模式：`^#{1,4}\s+`（Python 注释 `# 时间等待3秒` 与 Markdown 标题无法区分，已从边界正则中永久移除）。
+
+#### Heading 代码注释拦截 (`_v4_extract_headings`)
+
+所有 `#` 开头的候选标题需通过 **±120 字符上下文校验**：
+```python
+_CODE_KEYWORDS = ['restype', 'argtypes', 'CDLL', 'ctypes', 'robot.', 'c_int', 'c_float', 'import ']
+```
+任一关键词出现在上下文窗口 → 该 `#` 行被判定为代码注释 → 拒绝提权为 Heading。
+
+#### 伪标题黑名单 (`_PSEUDO_SECTION_BLACKLIST`)
+
+```python
+frozenset({"时间等待", "命令发送", "示例代码", "代码示例", "调用示例",
+           "参数说明", "返回值", "功能描述", "函数说明", "注意事项", "备注"})
+```
+标题清洗后长度 < 15 字符 且 包含黑名单关键词 → 返回 `""` → 调用方自动继承父级 H2 标题。
+
+#### Golden Section 继承机制
+
+当 `_sanitize_section_title()` 返回空字符串时：
+- `_v4_build_child_docs_v2` c_sdk 路径：回退到 `breadcrumb` 路径信息
+- `_emit_child` 非 SDK 路径：回退到 `_parent_title`（父级 H2 标题）
+- **预留**: `_v4_extract_sdk_toc()` 已实现 Golden TOC 映射引擎，待接入空值回退链路
+
+#### Micro-Chunk Auto-Merge 阈值
+
+```python
+_MIN_BLOCK_GAP = 20     # 边界邻近合并窗口（字符）
+# 合并后文本 ≥ 60 字符 或 包含代码特征词 → 提交为独立 API 块
+```
 
 ---
 
@@ -125,8 +171,9 @@ LLM_INFERENCE_TIMEOUT = httpx.Timeout(connect=5.0, read=60.0, write=15.0, pool=5
 
 # 检索
 CHUNK_SIZE=300 / CHUNK_OVERLAP=50 / RETRIEVAL_K=10 / SIMILARITY_THRESHOLD=0.68
-_AUTOCUT_MIN_K=3 / _AUTOCUT_MAX_K=5
+_AUTOCUT_MIN_K=3 / _AUTOCUT_MAX_K=5  # SDK 检索时 MIN_K 动态提升至 6
 CHUNK_MODE = "v4_dual"  # Parent(1000) + Child(400)
+_MAX_CONTEXT_CHARS = 2000  # SDK 检索时动态提升至 4000
 
 # 嵌入
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-zh-v1.5"  # 512维, HF→ONNX 回退

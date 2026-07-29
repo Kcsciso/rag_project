@@ -22,7 +22,9 @@
 ### 🧠 智能上下文扩展与防幻觉（ADR-9 ~ ADR-17）
 - **双轨制文档隔离与路由**（ADR-17）：JAKA(gui_app) / OpenC3&OpenR6(c_sdk) 双轨分治 — GUI 轨绝对禁止代码，SDK 轨 API 即答案 + 字面强锚定。
 - **SDK Header Dependency Injection**：自动提取 CDLL 加载 + POSE/Joint 结构体 → 挂载至每个 API Child 切片顶部。
-- **HyDE 假想文档生成**：7B 轻量调用生成假想技术文档片段增强向量检索语义密度。
+- **C-SDK 切片元数据净化**（v18）：代码注释拦截（8 特征词上下文校验）+ 伪标题黑名单（10 项）+ 父级 H2 标题自动继承 + Golden TOC 目录树预留回退。杜绝 `section_title` 被 Python 注释（`# 时间等待3秒`）污染。
+- **1 API = 1 Chunk 原子切分**（v18）：状态机仅匹配 `数字标题` + `函数名称/函数说明` 两类可验证边界，Micro-Chunk Auto-Merge 碎片缝合。API 切片绝不跨函数粘连。
+- **HyDE 假想文档生成**：7B 轻量调用生成假想技术文档片段增强向量检索语义密度。SDK 轨道产品级硬禁用（OpenC3/OpenR6 直接跳过）。
 - **LangGraph v3 Plan-Execute-Synthesize**（ADR-14）+ **v4 标题树切分**（ADR-15）：47P + 574C，102 API 原子块。
 - **多模态 OCR + 面包屑注入**（ADR-16）+ **PDF 连字清洗** + **原始大小写保留**。
 - **8 项硬断言**：JSON泄露 / 重复检查 / 界面套话 / 函数签名 / 提示词泄露 / API幻觉 / 零脑补 / 代码截断。
@@ -208,8 +210,8 @@ export VLLM_GPU_ID=0                                      # 手动指定 GPU
 | `tests/run_eval.py` | 30 用例 (GT + SDK 函数 + 安全注入 + 多轮指代 + 错别字容错 + 多文档对比) | `python tests/run_eval.py --verbose` |
 | `test_stability.py` | 多轮对话 + 并发保护 + 7 种异常降级 | `python test_stability.py` |
 
-📊 **最新评测** (v15 切片冲刺, 7B-AWQ): `tests/TEST_REPORT.md`
-Overall **33.3%** (10/30) · Health Score **91.8** 🏆 · 硬断言 **8** · API 幻觉 **2** (↓60%) · GT-2 稳定通过 ✅
+📊 **最新评测** (v17 管道重构, 7B-AWQ): `tests/TEST_REPORT.md`
+Health Score **91.8** 🏆 · Search-First 软路由 · 首句 Python 确定性锚定 · 反问零占位符
 
 ---
 

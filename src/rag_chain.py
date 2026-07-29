@@ -374,7 +374,7 @@ def _call_llm(client: OpenAI, model: str, messages: List[Dict[str, str]],
                 extra_body={"repetition_penalty": 1.1} if _attempt == 0 else None,
             )
             raw = response.choices[0].message.content
-            return _ensure_code_blocks_closed(raw) if raw else raw
+            return _fix_and_close_sdk_code(raw) if raw else raw
         except BadRequestError as e:
             _err_msg = str(e)
             if "maximum context length" in _err_msg.lower():
@@ -716,9 +716,10 @@ _BUSINESS_INTENT_KEYWORDS = [
     "连接", "断开", "初始化", "配置", "设置", "获取", "读取", "写入",
     # 问题词
     "怎么", "如何", "什么", "为什么", "哪里", "哪个",
-    # 技术词
+    # 技术词与通用名词（🔴 新加: 变量、系统、状态、错误、报错、坐标系、路点等）
     "函数", "接口", "参数", "代码", "示例", "SDK", "sdk", "API", "api",
-    "文档", "说明", "用法", "调用",
+    "文档", "说明", "用法", "调用", "变量", "系统", "状态", "错误", "报错",
+    "报警", "寄存器", "地址", "IO", "io", "路点", "固件", "版本", "坐标系", "示教",
     # 中文标点（表示完整句子）
     "？", "?", "吗", "呢", "吧",
     # 通用技术动作
@@ -836,35 +837,69 @@ def _resolve_clarification_followup(
             f"🔄 澄清补全: 当前 query='{query}' 识别为产品名，但上一轮非澄清反问，"
             f"交由通用短词融合处理"
         )
-        # 🔴 轻度补全：直接取最近一条 user 消息拼接（不要求业务意图）
+        # 🔴 Step1 穿透回溯：清洗产品名后判空，空则继续向更早历史穿透
         for msg in reversed(chat_history):
-            if msg.get("role") == "user" and msg.get("content", "").strip() != query.strip():
-                prev = msg.get("content", "").strip()
-                if len(prev) >= 4:
-                    cleaned = _preprocess_query(prev)
-                    combined = f"{product_id} {cleaned}"
-                    logger.info(
-                        f"🔄 澄清补全（轻度）: 产品名='{product_id}' + "
-                        f"最近历史='{prev[:50]}' → '{combined[:80]}'"
-                    )
-                    return combined, product_id
-                break
-        return query, product_id  # 返回 product_id 但不拼接（让下游处理）
+            if msg.get("role") != "user":
+                continue
+            prev = msg.get("content", "").strip()
+            if prev == query.strip() or len(prev) < 4:
+                continue
+            # 清洗产品名
+            _penetration = _preprocess_query(prev)
+            for _rule in PRODUCT_ROUTER_RULES:
+                _old_pid = _rule["product_id"]
+                _penetration = re.sub(
+                    r'\b' + re.escape(_old_pid) + r'\b',
+                    '', _penetration, flags=re.IGNORECASE,
+                )
+            _penetration = re.sub(r'\s+', ' ', _penetration).strip()
+            # 清洗后为空 → 该消息仅为产品声明 → 继续回溯
+            if not _penetration or len(_penetration) < 3:
+                logger.debug(
+                    f"🔄 澄清补全（轻度）: 跳过纯产品声明 '{prev[:40]}' → 继续回溯"
+                )
+                continue
+            combined = f"{product_id} {_penetration}"
+            logger.info(
+                f"🔄 澄清补全（轻度/穿透）: 产品名='{product_id}' + "
+                f"历史意图='{_penetration[:50]}' → '{combined[:80]}'"
+            )
+            return combined, product_id
+        return query, product_id  # 全部穿透后仍无有效意图（让下游处理）
 
     # 第 3 步：向前扫描历史，精准定位带有真实业务意图的用户消息
-    # 🔴 关键修复：不能盲目取紧邻的上一条 user 消息——
-    # 它可能是错别字（"O pen C3"）、空白输入或纯噪声，拼接后产生垃圾查询。
-    # 必须逐条回扫，找到第一条包含业务关键词的有效消息。
     previous_user_query = None
     previous_user_idx = -1
     for idx, msg in enumerate(reversed(chat_history)):
         if msg.get("role") != "user":
             continue
         candidate = msg.get("content", "").strip()
-        if _has_business_intent(candidate):
+        # 🔴 Step1 穿透: 先清洗产品名，防止纯产品声明（如 "OpenC3"）阻断回溯
+        _penetration = _preprocess_query(candidate)
+        for _rule in PRODUCT_ROUTER_RULES:
+            _old_pid = _rule["product_id"]
+            _penetration = re.sub(
+                r'\b' + re.escape(_old_pid) + r'\b',
+                '', _penetration, flags=re.IGNORECASE,
+            )
+        _penetration = re.sub(r'\s+', ' ', _penetration).strip()
+        # 清洗后为空 → 该消息仅为产品声明 → 继续回溯
+        if not _penetration or len(_penetration) < 3:
+            logger.debug(
+                f"🔄 澄清补全: 跳过纯产品声明 '{candidate[:40]}' → 继续回溯"
+            )
+            continue
+
+        # 🔴【无损防守补强】确定是澄清反问场景时，紧邻反问前的上一条 User 消息就是目标问题；
+        # 配合扩充后的 _has_business_intent 形成双重保险，绝不越界穿透到更早的历史。
+        is_clarified_target = (
+            last_assistant_msg 
+            and _CLARIFICATION_MARKER in last_assistant_msg 
+            and len(_penetration) >= 2
+        )
+
+        if _has_business_intent(_penetration) or _has_business_intent(candidate) or is_clarified_target:
             previous_user_query = candidate
-            # 🔴 修复：chat_history.index() 返回的是第一次出现的位置，
-            # 不一定是当前消息。改用 enumerate 追踪真实位置。
             original_idx = len(chat_history) - 1 - idx
             previous_user_idx = original_idx
             logger.info(
@@ -906,10 +941,14 @@ def _resolve_clarification_followup(
         return previous_user_query, product_id
 
     # 第 4 步：清洗原始提问的口语噪音 + 拼接产品名
-    # 🔴 关键：previous_user_query 可能含大量噪音词（"请问"、"怎么写"、"函数"），
-    # 必须经 _preprocess_query() 剥离后再拼接，否则复合 query 的向量语义被稀释，
-    # 导致 relaxed_threshold 误杀全部候选切片。
     cleaned_prev = _preprocess_query(previous_user_query)
+    for _rule in PRODUCT_ROUTER_RULES:
+        _old_pid = _rule["product_id"]
+        cleaned_prev = re.sub(
+            r'\b' + re.escape(_old_pid) + r'\b',
+            '', cleaned_prev, flags=re.IGNORECASE,
+        )
+    cleaned_prev = re.sub(r'\s+', ' ', cleaned_prev).strip()
     combined = f"{product_id} {cleaned_prev}"
     logger.info(
         f"🔄 多轮对话澄清补全: 产品名='{product_id}' + "
@@ -1914,7 +1953,10 @@ def _build_messages(
     # ---- 拼接参考资料（父子结构化组装 + 整块保留不截断） ----
     # 🔴 v5: 单个 Chunk 100% 完整保留正文，绝不内部截断。
     # Token 预算控制统一由末尾总 Context Cap 按整块剔除。
-    _MAX_CONTEXT_CHARS = 2000  # 🔴 v10: 2000 字符 — 为 max_tokens=2560 腾出 8192 上下文空间
+    # 🔴 Step1: SDK 轨道动态放大 Context 上限 2000→4000
+    #   确保 Autocut Top-6 切片 (≈2400 chars) 不被物理截断
+    _is_sdk_context = ("c_sdk" in _doc_types) or _is_sdk_code_query(query)
+    _MAX_CONTEXT_CHARS = 4000 if _is_sdk_context else 2000
 
     child_parts = []   # 【精确定位小节】
     parent_parts = []  # 【章节背景】
@@ -2054,9 +2096,8 @@ def _build_messages(
     if _contains_injection_pattern(query):
         logger.warning(f"⚠️  检测到可能的 Prompt 注入模式: {query[:120]}...")
 
-    # ── Fix 2: 强化防幻觉 — 仅 SDK 代码查询 + 无上下文时才硬拦截 ──
+    # ── Fix 2: 强化防幻觉 — 不再硬封口，LLM 自然阅读 Context 回答 ──
     _cond_constraint = ""
-    _force_no_code = False
     _is_explicit_code = _has_explicit_code_demand(query)
     if _is_sdk_code_query(query):
         _has_func_in_context = False
@@ -2079,24 +2120,7 @@ def _build_messages(
             if _meta_fn:
                 _ctx_func_names.update(f.strip().lower() for f in _meta_fn.split(",") if f.strip())
 
-        # Bug Fix 2: 仅当用户明确要写代码 且 上下文完全无函数/步骤/数字时 才硬拦截
-        if _is_explicit_code and not _has_func_in_context and not _has_procedure_in_context and not _ctx_func_names:
-            _force_no_code = True
-            _cond_constraint = (
-                '【🚫 强制约束 — 最高优先级】\n'
-                '检索结果中未找到该 SDK 的任何函数签名或操作步骤。\n'
-                '你必须严格遵守以下规则：\n'
-                '1. 只允许回复: "参考文档中未包含此功能的记载,建议联系技术支持或查阅最新文档。"\n'
-                '2. 严禁输出任何 Python/ctypes/C 代码(包括代码块)\n'
-                '3. 严禁编造任何函数名(如 robot_xxx, set_xxx)\n'
-                '4. 严禁提供任何替代方案或"你可以尝试"的建议\n'
-                '5. 回复长度不得超过 50 字\n\n'
-            )
-            logger.info(
-                f"🚫 SDK 查询无函数/步骤上下文 → 硬拦截代码生成 "
-                f"(query_entities={_extract_query_code_entities(query)})"
-            )
-        elif not _has_func_in_context and _ctx_func_names:
+        if not _has_func_in_context and _ctx_func_names:
             # 仅 metadata 有函数名但文本中未出现 → 弱约束（可能是子串匹配）
             _cond_constraint = (
                 "【⚠️ 注意】参考资料文本中未明确包含该 SDK 的函数签名。"
@@ -2207,14 +2231,11 @@ def _build_messages(
                 "🚫 严禁声明'参考文档未包含详细步骤'或'具体步骤未记载'。\n\n"
             )
     elif "c_sdk" in _doc_types:
-        # 🔴 C-SDK 轨: 不强制章节前缀，直接展示代码
         _dual_track_prefix = (
-            "【🔴 SDK 模式 — API 即答案】"
-            "直接展示完整的 ctypes 调用代码。"
-            "函数名必须逐字复刻原文（如 robot_movl 绝不可写成 robot.movl 或 movl）。"
-            "🚫 严禁声明'上述代码假设存在'或'参考文档未包含详细步骤'。"
-            "\n【代码生成规范】：全局代码头（含 class POSE/Joint 及 CDLL 加载）已在"
-            "前置环境加载。严禁重复书写 class POSE/class Joint 的类定义，直接从 API 调用写起。】\n\n"
+            "【🔴 SDK 极简模式】\n"
+            "请直接给出完整的 ctypes 调用 Python 代码块。\n"
+            "1. 严格使用【参考资料】中为当前产品记载的准确函数名与参数，不得拼写错误、改写或混用其他产品函数。\n"
+            "2. 第一行直接输出 ```python 代码块，禁止输出任何前言套话或'假设存在'、'未包含'等免责声明。\n\n"
         )
 
     # ---- 构建当前轮次的用户消息（含明确边界标记） ----
@@ -2229,15 +2250,6 @@ def _build_messages(
 
     # ---- 组装完整消息列表 ----
     _system_content = RAG_SYSTEM_PROMPT
-    if _force_no_code:
-        _system_content = (
-            "【🚫 本次对话的最高指令 — 覆盖所有其他规则】\n"
-            "当前检索结果中不包含任何真实的 SDK 函数名。你的唯一任务是回复："
-            '"参考文档中未包含此功能的记载，建议联系技术支持或查阅最新文档。"\n'
-            "绝对禁止：输出任何代码块、编造函数名、提供替代方案。\n"
-            "回复长度不得超过 50 字。\n\n"
-            + _system_content
-        )
     messages = [
         {"role": "system", "content": _system_content},
     ]
@@ -2372,33 +2384,18 @@ def _hard_refusal_stream() -> Generator[str, None, None]:
         yield _HARD_REFUSAL[i:i + 15]
 
 
-# ── 🔴 v10: Markdown 代码块自动闭合 Guardrail ──
-def _ensure_code_blocks_closed(text: str) -> str:
-    """
-    若 Markdown 代码块未闭合（奇数个 ```），自动在尾部补全反引号。
-
-    防止代码截断触发硬断言⑧。
-    """
-    if not text:
-        return text
-    backtick_count = text.count("```")
-    if backtick_count % 2 != 0:
-        text = text.rstrip() + "\n```"
-    return text
-
-
 def _stream_guardrail(gen: Generator[str, None, None]) -> Generator[str, None, None]:
     """
     对流式 LLM 输出做代码块自动闭合后处理。
 
-    缓冲全部 token 后应用 _ensure_code_blocks_closed，再按 ~15 字符/块
+    缓冲全部 token 后应用 _fix_and_close_sdk_code，再按 ~15 字符/块
     重新 yield，保持前端打字机效果。
     """
     buffer = []
     for chunk in gen:
         buffer.append(chunk)
     full_text = "".join(buffer)
-    fixed = _ensure_code_blocks_closed(full_text)
+    fixed = _fix_and_close_sdk_code(full_text)
     # 如果 fix 没有改变文本，直接重新 yield 原始 chunks（零开销）
     if fixed == full_text:
         yield from buffer
@@ -2526,7 +2523,7 @@ _HYDE_CACHE: Dict[str, str] = {}
 _HYDE_MAX_CACHE = 64
 
 
-def _generate_hyde_doc(query: str) -> str:
+def _generate_hyde_doc(query: str, product_id: Optional[str] = None) -> str:
     """
     使用本地 LLM 生成一段假想的技术文档片段 (Hypothetical Document Embedding)。
 
@@ -2539,6 +2536,16 @@ def _generate_hyde_doc(query: str) -> str:
         假想文档文本（可能为空字符串）
     """
     if not query or not query.strip():
+        return ""
+
+    # 🔴 Step1: SDK 产品级 HyDE 硬禁用
+    #   OpenC3/OpenR6 的 HyDE 假想文档会生成硬件描述（"电源按钮"、"控制柜"等），
+    #   毒化向量检索，将真正的 SDK API 切片挤出 Autocut 截断线
+    if (product_id and product_id in {"OpenC3", "OpenR6"}) or _is_sdk_code_query(query):
+        logger.info(
+            f"🛡️  SDK 查询(product_id={product_id}) → 强行禁用 HyDE，"
+            f"回归纯净向量/BM25 检索"
+        )
         return ""
 
     # 🔴 v16: HyDE 防毒化 Guardrail — 满足条件直接跳过，用原始 Query 检索
@@ -2588,7 +2595,7 @@ def _generate_hyde_doc(query: str) -> str:
     return hyde_doc
 
 
-def _autocut_knee(rrf_scores: List[float], max_k: int = None) -> int:
+def _autocut_knee(rrf_scores: List[float], max_k: int = None, min_k: int = None) -> int:
     """
     基于 RRF 融合分数的断崖/跳变点检测，动态确定最佳截断位置。
 
@@ -2596,22 +2603,25 @@ def _autocut_knee(rrf_scores: List[float], max_k: int = None) -> int:
       1. 计算相邻分数的差值: diffs[i] = scores[i] - scores[i+1]
       2. 寻找最大差值位置（Knee Point）— 这是分数下降最剧烈的地方
       3. 在 knee point 处截断（保留 knee point 及之前的所有切片）
-      4. 钳制在 [_AUTOCUT_MIN_K, max_k] 范围内
+      4. 钳制在 [min_k, max_k] 范围内
 
     Args:
         rrf_scores: 按 RRF 得分降序排列的分数列表
         max_k: 动态上限（默认取 _AUTOCUT_MAX_K），由调用方传入 k 值控制
+        min_k: 动态下限（默认取 _AUTOCUT_MIN_K），SDK 检索场景传入 6
 
     Returns:
         动态确定的截断位置（保留前 N 个切片的数量）
     """
     if max_k is None:
         max_k = _AUTOCUT_MAX_K
+    if min_k is None:
+        min_k = _AUTOCUT_MIN_K
     # 🔴 v2.2: 上限动态跟随传入的 k 值
-    effective_max = max(_AUTOCUT_MIN_K + 1, max_k)
+    effective_max = max(min_k + 1, max_k)
 
     n = len(rrf_scores)
-    if n <= _AUTOCUT_MIN_K:
+    if n <= min_k:
         return n
 
     # 计算相邻差值 — 扫描范围跟随 effective_max
@@ -2629,11 +2639,11 @@ def _autocut_knee(rrf_scores: List[float], max_k: int = None) -> int:
     best_diff, knee_pos = diffs[0]
 
     # 钳制 — 上限使用动态 effective_max
-    cut = max(_AUTOCUT_MIN_K, min(knee_pos + 1, effective_max, n))
+    cut = max(min_k, min(knee_pos + 1, effective_max, n))
 
     logger.info(
         f"🔪 Autocut: {n} 个候选 → max_diff={best_diff:.4f} @ pos={knee_pos} "
-        f"→ cut={cut} (clamped [{_AUTOCUT_MIN_K}, {effective_max}], k={max_k})"
+        f"→ cut={cut} (clamped [{min_k}, {effective_max}], k={max_k})"
     )
     return cut
 
@@ -2780,7 +2790,7 @@ def _hybrid_retrieve_single(
     try:
         # ── 第 0 步: Query 预处理 — 标点归一化 + HyDE 假想文档生成 ──
         _query_normalized = _normalize_punctuation(query)
-        _hyde_doc = _generate_hyde_doc(_query_normalized)
+        _hyde_doc = _generate_hyde_doc(_query_normalized, product_id=product_id)
         _vector_query = (_hyde_doc + " " + _query_normalized) if _hyde_doc else _query_normalized
 
         # ── 第 1 步：向量搜索 — HyDE 增强 + 扩大候选池 ──
@@ -2967,7 +2977,15 @@ def _hybrid_retrieve_single(
             fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
 
             rrf_score_list = [score for _, score in fused]
-            autocut_k = _autocut_knee(rrf_score_list, max_k=k)
+            # 🔴 Step1: SDK 检索放宽 Autocut 下限 3→6
+            #   确保 set_robot_power_on / robot_Power_on 等 API 切片不因排名靠后被截断
+            _CSDK_PRODUCTS = {"OpenC3", "OpenR6"}
+            _is_sdk_retrieval = (
+                (product_id and product_id in _CSDK_PRODUCTS) or
+                _is_sdk_code_query(query)
+            )
+            _min_k = 6 if _is_sdk_retrieval else _AUTOCUT_MIN_K
+            autocut_k = _autocut_knee(rrf_score_list, max_k=k, min_k=_min_k)
             top_docs = [doc_map[doc_id] for doc_id, _ in fused[:autocut_k]]
 
             logger.info(
@@ -3249,7 +3267,7 @@ def rag_chat(
                         doc.metadata.get("source", "未知")
                         for doc in context_docs
                     ))
-                    return {"answer": _ensure_code_blocks_closed(answer), "sources": sources, "model": _resolve_vllm_model()}
+                    return {"answer": _fix_and_close_sdk_code(answer), "sources": sources, "model": _resolve_vllm_model()}
             else:
                 # 锁获取超时 → 视为 Layer 1 不可用
                 logger.warning("⚠️  第 1 层（本地 vLLM）跳过：并发锁获取超时")
@@ -3278,7 +3296,7 @@ def rag_chat(
                     doc.metadata.get("source", "未知")
                     for doc in context_docs
                 ))
-                return {"answer": _ensure_code_blocks_closed(answer), "sources": sources, "model": DEEPSEEK_MODEL}
+                return {"answer": _fix_and_close_sdk_code(answer), "sources": sources, "model": DEEPSEEK_MODEL}
 
         except _FALLBACK_EXCEPTIONS as e:
             logger.warning(f"⚠️  第 2 层（DeepSeek API）不可用（网络/超时）: {e}")
@@ -3296,6 +3314,7 @@ def rag_chat(
         result = _direct_retrieval_response(context_docs, query)
         answer_text = result.get("answer", "")
         if answer_text and answer_text.strip():
+            result["answer"] = _fix_and_close_sdk_code(answer_text)
             return result
         else:
             logger.warning("⚠️  第 3 层返回空内容，进入终极兜底")
@@ -3459,7 +3478,7 @@ def rag_chat_stream(
     except Exception as e:
         logger.error(f"❌ Prompt 构建失败: {type(e).__name__}: {e}，直接进入 Layer 3 流式")
         try:
-            yield from _track_yield(_direct_retrieval_response_stream(context_docs, query))
+            yield from _track_yield(_stream_guardrail(_direct_retrieval_response_stream(context_docs, query)))
             if _stream_yielded_anything[0]:
                 return
         except Exception:
@@ -3567,7 +3586,7 @@ def rag_chat_stream(
     logger.info("🔄 正在切换到第 3 层（纯向量检索直出模式-流式）...")
     try:
         # 传入全部 context_docs，由 _extract_structured_content 内部评分排序后截取 Top-K
-        yield from _track_yield(_direct_retrieval_response_stream(context_docs, query))
+        yield from _track_yield(_stream_guardrail(_direct_retrieval_response_stream(context_docs, query)))
         if _stream_yielded_anything[0]:
             logger.info("✅ 第 3 层（纯检索直出模式-流式）成功")
             return  # ← 成功，生成器结束
@@ -3616,6 +3635,32 @@ def shutdown_clients():
             logger.warning(f"关闭降级 LLM 客户端时出错: {e}")
         finally:
             _deepseek_client = None
+
+def _fix_and_close_sdk_code(answer: str, doc_type: str = "") -> str:
+    """
+    纯 Python 1ms 确定性代码修复与 Markdown 闭合（零 LLM 开销）。
+    解决 7B 模型随机漏写 CDLL 以及输出 Token 耗尽导致代码块未闭合的问题。
+    """
+    if not answer:
+        return answer
+
+    # 1. 物理检查并自动闭合 Markdown 反引号代码块
+    fences = re.findall(r'```', answer)
+    if len(fences) % 2 != 0:
+        answer = answer.rstrip() + "\n```\n"
+
+    # 2. 自动补全 ctypes.CDLL 加载语句（仅限生成了 Python 代码块但漏写了 CDLL 的场景）
+    if "```python" in answer and "CDLL(" not in answer:
+        # 根据回答上下文判定使用哪个动态库
+        if "openr6" in answer.lower() or "py_dll" in answer.lower():
+            dll_name = "py_dll.dll"
+        else:
+            dll_name = "collrob_sdk.dll"
+            
+        fix_header = f"import ctypes\ndll = ctypes.CDLL(\"{dll_name}\")\n"
+        answer = answer.replace("```python\n", f"```python\n{fix_header}")
+
+    return answer
 
 
 # ============================================================

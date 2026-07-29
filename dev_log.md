@@ -1,5 +1,21 @@
 # 比邻星 (ProximaRAG) — 开发日志
 
+> **日期**: 2026-07-28 | **版本**: v16 → v17 | **类型**: Graph 管道架构级重构
+
+### v17 变更 (graph_rag.py + rag_chain.py)
+- **Search-First 软路由**: `_search_first_soft_route()` — 全库预检索，断层领先自动锁定产品
+- **确定性反问**: `build_product_clarification_response()` — 零占位符，硬编码兜底产品列表
+- **首句 Python 锚定**: `_build_messages()` — f-string 提取真实 source+section 字面注入
+- **C-SDK 解绑章节**: 不强制章节前缀，直接展示代码
+- **套话擦除增强**: `_strip_hedging_tail()` 新增 "具体操作步骤未在文档中..." 等模式
+- **Token 预算**: max_tokens 2200→1024, MAX_HISTORY_TURNS 3→2
+
+### v16 变更 (graph_rag.py + rag_chain.py)
+- **QueryFusion 指代词门控**: `_PRONOUN_TRIGGERS` — 非指代词短语保留原 Query
+- **HyDE 防毒化**: 3 条 skip 条件 (len<6/非技术符号/精确 API 签名)
+- **动态澄清模板**: 不再硬编码 "OpenR6 或 OpenC3"
+- **Prompt 降温**: System Prompt 去免责化指令
+
 > **日期**: 2026-07-28 | **版本**: v14 → v15 | **类型**: 切片冲刺+门控修复
 
 ### v15 成果
@@ -2645,3 +2661,159 @@ v4 上线后暴露 3 类严重问题：
 | `tests/run_eval.py` | ⑥⑦⑧ 3 项新硬断言 |
 | `tests/TEST_REPORT.md` | 6 轮迭代评测报告归档 |
 | `tests/audit_ingestion.py` | 新增 v4 白盒审计脚本 |
+
+---
+
+## 二十二、SDK 切片元数据净化 — 代码注释污染治理 (v18)
+
+> **日期**: 2026-07-29 | **版本**: v17 → v18 | **类型**: PDF 切片管道元数据修复
+
+### 22.1 背景与问题
+
+**发现**: OpenR6 SDK 轨道（`c_sdk`）的切片 `section_title` 元数据被 Python 代码注释严重污染。Chunk `c_OpenR6_365` 出现以下症状：
+
+| 字段 | 修复前（脏数据） | 修复后（净化） |
+|------|-----------------|---------------|
+| `section_title` | `"时间等待3秒"`（Python 注释 `#时间等待3秒`） | `"机械臂上电"`（真正的主标题） |
+| `function_names` | `end_communication, set_joint_emergency_stop, set_robot_arm_emergency_stop, set_robot_power_on`（4个API混合） | `set_robot_power_on`（仅当前块主API） |
+
+**根因链**:
+1. `_v4_extract_headings()` 中 `^#{1,4}\s+` 模式无法区分 Markdown 标题与 Python 代码注释（`# 机械臂上电` 在示例代码块中不是标题，而是注释）
+2. `_v4_parse_sdk_state_machine()` 的标题二次提取中 `^#{1,4}\s+[^\n]+` 分支将代码注释重复提权为 Block 标题
+3. `_sanitize_section_title()` 没有黑名单机制过滤已知伪标题模式
+4. `_clean_pdf_text()` Step 6 中的 `_\n` 正则可能误杀正常的代码换行
+
+### 22.2 4 项修复详情
+
+#### (1) `_v4_extract_headings()` — 上下文感知代码注释拦截
+
+**文件**: `src/pdf_loader.py` L640-651
+
+新增 `#` 开头标题的代码上下文验证：提取匹配点前后 ±120 字符窗口，检测 `restype`/`argtypes`/`CDLL`/`ctypes`/`robot.`/`c_int`/`c_float`/`import ` 共 8 个代码特征词。任一命中 → 该 `#` 行被判定为代码注释 → 拒绝提权为 Heading。
+
+```python
+if full.startswith('#'):
+    context_start = max(0, pos - 120)
+    context_end = min(len(text), pos + 120)
+    line_context = text[context_start:context_end]
+    _CODE_KEYWORDS = ['restype', 'argtypes', 'CDLL', 'ctypes', 'robot.', 'c_int', 'c_float', 'import ']
+    if any(kw in line_context for kw in _CODE_KEYWORDS):
+        continue  # 这是代码注释，不是标题
+```
+
+#### (2) `_v4_parse_sdk_state_machine()` — 标题二次提取净化
+
+**文件**: `src/pdf_loader.py` L1390-1393
+
+剔除标题二次提取正则中的 `|^#{1,4}\s+[^\n]+` 分支，防止状态机内部再次将 Python 注释提权为 Block 标题。保留数字标题 + `函数名称` + `函数说明` 三个可靠分支。
+
+同时 `_SDK_BLOCK_BOUNDARY_RE` 本身（L1237-1245）也被精简为仅匹配 `数字标题` 和 `函数名称/函数说明` 两类可验证的边界，移除 `^#{1,4}` 模式。
+
+#### (3) `_sanitize_section_title()` — 伪标题黑名单 + 父级继承
+
+**文件**: `src/pdf_loader.py` L1248-1275
+
+新增 `_PSEUDO_SECTION_BLACKLIST`（frozenset 10 项）:
+```
+"时间等待", "命令发送", "示例代码", "代码示例", "调用示例",
+"参数说明", "返回值", "功能描述", "函数说明", "注意事项", "备注"
+```
+
+清洗逻辑：若标题长度 < 15 字符且包含任一黑名单关键词 → 返回空字符串 `""`。调用方（`_v4_build_child_docs_v2` / `_emit_child`）在 `_clean_sec` 为空时自动继承父级 H2 标题，确保 section_title 绝不落空。
+
+#### (4) `_clean_pdf_text()` Step 6 — 换行正则修正
+
+**文件**: `src/pdf_loader.py` L575-584
+
+修正了原 `_\n` 正则的四个模式：
+- ① 修复 `robot\n_\npower` 下划线多行拆碎
+- ② 修复 `set\nrobot`/`robot\npower` SDK 关键字跨行
+- ③ 修复 `robot.\nset` 点号跨行
+- 所有替换仅限 `[a-zA-Z0-9_]` 字符范围，避免误触中文文本
+
+### 22.3 Golden TOC 目录树预解析引擎
+
+**新增**: `_v4_extract_sdk_toc()` (L591-614) — 从 SDK 文档前 2500 字符提取 `{28: "28. 机械臂电源上电", 3: "3. 连接机械臂", ...}` 官方目录映射。当前作为预留基础设施，待后续接入 `_sanitize_section_title` 的空值回退链路。
+
+### 22.4 有效性验证
+
+| 指标 | 修复前 | 修复后 |
+|------|--------|--------|
+| `c_OpenR6_365` 伪标题 `"时间等待3秒"` | 1 个 | **0 个** ✅ |
+| 同一 Chunk 包含多 API | 3 API/Chunk | **1 API/Chunk** ✅ |
+| `function_names` 元数据污染 | 4 函数名混合 | **1-2 函数名**（主API在前） ✅ |
+
+### 22.5 变更文件
+
+| 文件 | 变更 |
+|------|------|
+| `src/pdf_loader.py` | `_v4_extract_headings()` 代码注释拦截; `_v4_parse_sdk_state_machine()` 移除 `^#` 分支; `_sanitize_section_title()` 伪标题黑名单; `_clean_pdf_text()` Step 6 正则修正; `_v4_extract_sdk_toc()` 新增 |
+| `CLAUDE.md` | 更新切片规则与状态机边界触发条件 |
+| `README.md` | 新增 C-SDK Golden Section 继承机制说明 |
+| `dev_log.md` | 本章节（二十二） |
+
+---
+
+## 二十三、C-SDK 轨健康度系统级重构 — Multi-API 排他锁 + 完整闭环 + 4 级 Title 兜底 (v19)
+
+> **日期**: 2026-07-29 | **版本**: v18 → v19 | **类型**: PDF 切片管道架构级重构
+
+### 23.1 背景
+
+切片审计暴露 C-SDK 轨健康度仅 **25.5 分**，三项核心指标均严重偏离：
+
+| 指标 | v18 状态 | 根因 |
+|------|---------|------|
+| Multi-API Sticky | 7.3% | `_SDK_BLOCK_BOUNDARY_RE` 漏抓 C 函数声明格式；Auto-Merge 无排他锁 |
+| Bare Fragments | 21% | 示例代码与 API 规格被边界切断后分离 |
+| Corrupted Title | 10.8% | Title 仅 2 级回退，空值/伪标题落库 |
+
+### 23.2 三项架构级修复
+
+#### (1) `_SDK_BLOCK_BOUNDARY_RE` 扩容 + Auto-Merge API 排他锁
+
+**边界正则扩容**: 新增 2 个边界模式：
+- ③ C 函数声明：`^\s*\|?\s*(?:int|void|char\*|double|bool|float|POSE|Joint)\s+\w+\s*\([^)]*\)\s*;`
+  - 允许行首可选的 Markdown 表格管道符 `|`（OpenC3 表格行首）
+  - 支持 `char*`、`POSE`、`Joint` 等指针/结构体返回值
+  - 要求行尾 `;` 确保是函数声明而非调用
+- ④ 独行 snake_case 函数定义：`^(?:[a-zA-Z_][a-zA-Z0-9_]*_[a-zA-Z0-9_]{2,})\s*\([^)]*\)\s*$`
+  - 行尾锚定 `$` 确保独占一行，不误匹配参数引用
+
+**新增 `_extract_primary_api_name()`**: 三层提取策略（中文表头 → C 声明 → snake_case），为 Auto-Merge 排他锁提供判定依据。
+
+**Auto-Merge API 排他锁**: 合并前提取双方主 API 函数名，不同则强制提交缓冲区 + 另起新块。末尾残留碎片同样执行排他检查。
+
+#### (2) API 块完整闭环 — 示例代码后向吸附
+
+在 `_v4_parse_sdk_state_machine()` 新增 Step 3：
+- 检测 Block 末尾 3 行是否仅有 "示例代码" 标签但无实际代码
+- 向后吸附下一 Block 的前部连续代码行（`#` + `robot.xxx()` + `ctypes` + `res =` + `print(` + `import`）
+- 吸附后自动更新 N+1 的起始位置
+- 若 N+1 剩余长度 < 15 字符 → 整体吞噬，避免产生空 Block
+
+#### (3) 4 级 Title Fallback 链
+
+**c_sdk 路径** (`_v4_build_child_docs_v2`):
+```
+L1: _sanitize_section_title(block_title)     → 状态机标题
+L2: _sanitize_section_title(breadcrumb)      → 面包屑路径
+L3: Parent H2 section_title (headings 回溯)  → 父级章节标题
+L4: "SDK 接口说明"                            → 硬兜底
+```
+
+**非 c_sdk 路径** (`_emit_child` in `_split_text_into_children`):
+```
+L1: _sanitize_section_title(section_title)   → 传入标题
+L2: _sanitize_section_title(breadcrumb)      → 面包屑路径
+L4: "技术文档"                                → 硬兜底
+```
+
+**`_build_child_prefix` 去重清洗**: 移除函数内部的 `_sanitize_section_title` 调用——调用方已通过 4 级 Fallback 链完成清洗，消除双重清洗。
+
+### 23.3 变更文件
+
+| 文件 | 变更 |
+|------|------|
+| `src/pdf_loader.py` | `_SDK_BLOCK_BOUNDARY_RE` 扩容（+C 声明 + snake_case 独行）; 新增 `_extract_primary_api_name()`; Auto-Merge API 排他锁; 示例代码后向吸附（含空块吞噬）; 4 级 Title Fallback 链; `_build_child_prefix` 去重清洗; `_emit_child` 3 级 Fallback |
+| `dev_log.md` | 本章节（二十三） |

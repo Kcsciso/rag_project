@@ -564,13 +564,63 @@ def _clean_pdf_text(text: str) -> str:
     cleaned = re.sub(r'([一-鿿])\s+I0\b', r'\1 I/O', cleaned)
     cleaned = re.sub(r'\bIO\s*([一-鿿])', r'I/O \1', cleaned)
 
+    # ── Step 4.6: 源头清洗 — 修复 PDF 提取导致的边界错位与标题漏抓 ──
+    # 1. 修复无空格标题 (如 "23.设置" -> "23. 设置")
+    cleaned = re.sub(r'^(\d{1,2})[\.\)）]([一-龥a-zA-Z])', r'\1. \2', cleaned, flags=re.MULTILINE)
+    # 2. 修复 OCR IO 乱码 (如 "25.10状态" -> "25. IO状态")
+    cleaned = re.sub(r'(\d{1,2})\.10\s*([一-鿿])', r'\1. IO\2', cleaned)
+    cleaned = re.sub(r'\b10\s*([口状态判断输出输入接口]|编号)', r'IO\1', cleaned)
+    # 3. 剥离表格竖线，防止阻断后续提取 (如 "| Robot_socket_start" -> "Robot_socket_start")
+    cleaned = re.sub(r'^\s*\|\s*', '', cleaned, flags=re.MULTILINE)
+
     # ── Step 5: 收尾 — 仅压缩 ≥3 个连续空行，保护缩进与正文换行 ──
     cleaned = re.sub(r'\n{4,}', '\n\n\n', cleaned)  # 4+ → 3
     cleaned = re.sub(r'\n{3}', '\n\n', cleaned)       # 3 → 2
 
     logger.debug(f"🧹 PDF 文本清洗: {len(text)} → {len(cleaned)} 字符"
                  f" (连字={text != cleaned})")
+    # ------------------ 🔴 以下为直接新增的代码 ------------------
+
+    # ── Step 6: 修复 PDF OCR 代码断线与下划线换行错乱 ──
+    # ① 修复像 robot\n_\n_power\n_\non 这种下划线被多行拆碎的代码
+    cleaned = re.sub(r'([a-zA-Z0-9_]+)\s*\n\s*_\s*([a-zA-Z0-9_]+)', r'\1_\2', cleaned)
+    cleaned = re.sub(r'([a-zA-Z0-9]+)_\s*\n\s*([a-zA-Z0-9]+)', r'\1_\2', cleaned)
+    
+    # ② 修复像 set\nrobot 或 robot\npower 这种 SDK 关键字被折行切断的代码
+    cleaned = re.sub(r'\b(set|get|robot|arm)\s*\n\s*(robot|power|arm|cmd|time|mode|on|off|send)\b', r'\1_\2', cleaned, flags=re.IGNORECASE)
+    
+    # ③ 修复对象点号跨行（如 robot.\nset）
+    cleaned = re.sub(r'([a-zA-Z0-9_]+)\.\s*\n\s*([a-zA-Z0-9_]+)', r'\1.\2', cleaned)
+
+    # ------------------ ---------------------------------------
+    
     return cleaned
+
+# ============================================================
+# 🔴 [SDK 轨道专有] Golden TOC 目录树预解析引擎
+# ============================================================
+def _v4_extract_sdk_toc(full_text: str) -> dict:
+    """
+    从 SDK 文档前 2000 字符中提取官方 1~30 级标准目录树 (Golden TOC)。
+    返回: {28: "28. 机械臂电源上电", 3: "3. 连接机械臂", ...}
+    """
+    toc_map = {}
+    # 截取文档前 2500 字符（涵盖 TOC 目录页）
+    front_matter = full_text[:2500]
+    
+    # 匹配 "28. 机械臂电源上电" 或 "28.机械臂电源上电" 格式
+    toc_pattern = re.compile(
+        r'^\s*(\d{1,2})\s*[\.、\s]\s*([\u4e00-\u9fa5a-zA-Z0-9_\(\)（）]+)',
+        re.MULTILINE
+    )
+    for m in toc_pattern.finditer(front_matter):
+        sec_num = int(m.group(1))
+        sec_title = f"{sec_num}. {m.group(2).strip()}"
+        # 排除非标题杂音（如 1.安装 属于 valid, 100. 排除）
+        if 1 <= sec_num <= 60 and len(sec_title) <= 50:
+            toc_map[sec_num] = sec_title
+
+    return toc_map
 
 
 def _v4_extract_headings(text: str) -> List[Tuple[int, str, int]]:
@@ -595,6 +645,20 @@ def _v4_extract_headings(text: str) -> List[Tuple[int, str, int]]:
             full = m.group(0).strip()
             if not full or len(full) < 3 or len(full) > 85:
                 continue
+
+            # -------------------- 🔴 [修改 1/3] 拦截 Python 代码注释行 --------------------
+            # 排除 SDK 示例代码中的 Python 单行注释（如 `# 机械臂初始化运动` / `#时间等待3秒`）
+            if full.startswith('#'):
+                # 获取该匹配点前后 120 字符的上下文
+                context_start = max(0, pos - 120)
+                context_end = min(len(text), pos + 120)
+                line_context = text[context_start:context_end]
+                
+                # 若上下文包含代码特征词，说明这是代码块内部的注释行，坚决拒绝提权为 Heading！
+                _CODE_KEYWORDS = ['restype', 'argtypes', 'CDLL', 'ctypes', 'robot.', 'c_int', 'c_float', 'import ']
+                if any(kw in line_context for kw in _CODE_KEYWORDS):
+                    continue
+# -----------------------------------------------------------------------------
 
             # 🔴 SDK 表头黑名单过滤：禁止将 SDK 手册表格表头识别为 Heading
             # 剥离数字编号前缀后检查（如 "3. 函数名称" → "函数名称"）
@@ -851,7 +915,17 @@ def _v4_extract_text_universal(pdf_path: str) -> Tuple[str, int, int]:
 
     for page_idx in range(total_pages):
         page = doc[page_idx]
-        page_text = page.get_text("text") or ""
+        # -------------------- 🔴 [终极修复 1] Y 坐标物理排序 --------------------
+        # 彻底解决 PDF 表格与示例代码在底层物理分离的错位问题
+        blocks = page.get_text("blocks")
+        if blocks:
+            # block[6] == 0 代表文本块。按 Y 坐标(容差10px)和 X 坐标进行物理视觉排序
+            text_blocks = [b for b in blocks if b[6] == 0]
+            text_blocks.sort(key=lambda b: (round(b[1] / 10) * 10, b[0]))
+            page_text = "\n\n".join([b[4].strip() for b in text_blocks if b[4].strip()])
+        else:
+            page_text = ""
+        # ---------------------------------------------------------------------------
 
         # ── Step 1: 字符密度检测 ──
         effective_chars = len(re.sub(r'\s', '', page_text))
@@ -975,14 +1049,16 @@ def _build_child_prefix(
     section_title: str,
     func_names: List[str],
 ) -> str:
-    """构建 Child Doc 正文前缀（面包屑 + 章节 + 函数名标注）。"""
-    # 🔴 v13: 标题清洗 — 剥离脏字符和前缀
-    _clean_title = _sanitize_section_title(section_title)
+    """构建 Child Doc 正文前缀（面包屑 + 章节 + 函数名标注）。
+
+    调用方已通过 _sanitize_section_title / 4 级 Fallback 链完成清洗，
+    此处不再重复调用 _sanitize_section_title，避免双重清洗。
+    """
     parts = [f"[文档: {source}]"]
     if breadcrumb:
         parts.append(f"[路径: {breadcrumb}]")
-    if _clean_title:
-        parts.append(f"[章节: {_clean_title}]")
+    if section_title:
+        parts.append(f"[章节: {section_title}]")
     if func_names:
         parts.append(f"[Functions: {', '.join(f.lower() for f in func_names)}]")
     return "\n".join(parts) + "\n"
@@ -1163,34 +1239,28 @@ def _v4_build_parent_child_docs(
 
 # ── 🔴 v13: SDK 轨状态机 API 块解析器 ──
 
-# 新 API 块边界触发条件（通用匹配，不限于技术动作词）
+# -------------------- 🔴 [终极修复 2] 纯净版状态机 --------------------
 _SDK_BLOCK_BOUNDARY_RE = re.compile(
-    r'(?:'
-    # ① 数字小节标题: "3.连接机械臂" / "4. 机械臂上电" / "15.设置"
-    r'^\d{1,2}[\.\、\s]\s*[一-鿿A-Za-z0-9_]+'
+    r'(?:^|\n)'
+    r'(?='
+    r'[ \t]*\d{1,2}[\.\、\s]\s*[^\n]+'      # ① 数字小节标题 (兼容前导空格)
     r'|'
-    # ② 显式函数名表头: "函数名称\nRobot_socket_start" — 允许跨行
-    r'^函数名称'                                            # ② "函数名称" 独立行 — 强硬边界
-    r'|'
-    # ③ 代码定义行: C/Python 函数签名
-    r'^(?:void|int|double|bool|def)\s+(\w+)\('
-    r'|'
-    # ④ Markdown 标题: "# 机械臂末端运动指令"
-    r'^#{1,4}\s+'
+    r'[ \t]*(?:函数名称|函数说明|函数名)\s*'  # ② 中文表头 (兼容前导空格)
     r')',
     re.MULTILINE,
 )
 
 
+# -------------------- 🔴 [修改 3/3] 标题清洗与伪标题过滤 --------------------
+# 绝不允许被识别为 section_title 的伪标题关键词
+_PSEUDO_SECTION_BLACKLIST = frozenset({
+    "时间等待", "命令发送", "示例代码", "代码示例", "调用示例",
+    "参数说明", "返回值", "功能描述", "函数说明", "注意事项", "备注",
+})
+
 def _sanitize_section_title(title: str) -> str:
     """
-    标题元数据清洗器 — 剥离 PDF 提取引入的脏字符。
-
-    处理:
-      1. 剥离 \\n、\\r、# 字符
-      2. 剥离 "函数名称\\n"、"API:" 等前缀
-      3. 合并多余空白
-      4. 若清洗后为空，返回空字符串（由调用方 Fallback）
+    标题元数据清洗器 — 剥离 PDF 提取引入的脏字符并过滤伪标题。
     """
     if not title:
         return ""
@@ -1198,10 +1268,17 @@ def _sanitize_section_title(title: str) -> str:
     cleaned = re.sub(r'[\n\r]+', ' ', title).strip()
     cleaned = re.sub(r'^#+\s*', '', cleaned)
     # Step 2: 剥离已知前缀
-    cleaned = re.sub(r'^(?:函数名称|函数名|方法名|API)[\s\n:：]*', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'^(?:函数说明|函数名称|函数名|方法名|API)[\s\n:：]*', '', cleaned, flags=re.IGNORECASE)
     # Step 3: 压缩连续空白
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+
+    # Step 4: 🔴 伪标题黑名单校验 (如 "时间等待3秒", "示例代码" 等直接剔除)
+    for bad_kw in _PSEUDO_SECTION_BLACKLIST:
+        if bad_kw in cleaned and len(cleaned) < 15:
+            return ""  # 返回空字符串，促使调用方继承父级 H2 标题
+
     return cleaned
+# -----------------------------------------------------------------------------
 
 
 def _is_skeleton_chunk(content: str) -> bool:
@@ -1223,6 +1300,13 @@ def _is_skeleton_chunk(content: str) -> bool:
         r'(?:def\s+\w+\s*\(|\.restype|\.argtypes|\bctypes\.|```python|=.*ctypes\.CDLL)',
         content,
     ))
+    # 🔴 只要包含实质 SDK 代码调用特征，绝对保留（防止误杀含代码的碎片）
+    if not _has_code and bool(re.search(
+        r'(?:robot\s*\.\s*\w+|def\s+\w+|\.restype|\.argtypes|CDLL|ctypes|'
+        r'\b(?:set|get|end|close|start)_robot_\w+)',
+        content, re.IGNORECASE,
+    )):
+        return False
     if _has_code:
         return False
 
@@ -1248,73 +1332,47 @@ def _is_skeleton_chunk(content: str) -> bool:
 
 
 def _v4_parse_sdk_state_machine(text: str) -> List[Tuple[int, int, str]]:
-    """
-    SDK 轨状态机解析器：扫描文本行，识别 API 边界并封装完整函数块。
-
-    算法:
-      1. 从 pos=0 开始扫描全文（确保前言不丢失）
-      2. 用 _SDK_BLOCK_BOUNDARY_RE 识别每个新 API 块的起点位置
-      3. 两次边界之间的全部内容（函数名 + 功能描述 + 参数 + 返回值 + 代码块）
-         100% 封装为一个原子块边界
-      4. 绝不跨 API 串味
-
-    对比原 _v4_extract_headings 方法：
-      - 状态机不依赖层级推断，直接以 API 语义边界切分
-      - 可处理 "# 标题" 与 "数字." 混合排版
-      - 确保代码示例与描述封闭在同一个 Chunk 中
-
-    Returns:
-        [(start_pos, end_pos, title), ...]  按位置排序
-    """
     if not text:
         return []
 
-    # Step 1: 找到所有 API 边界起点的位置
-    boundaries = [0]  # 确保从 pos 0 开始，前言（import ctypes 等）不丢失
+    boundaries = [0]
     titles = [""]
     for m in _SDK_BLOCK_BOUNDARY_RE.finditer(text):
         pos = m.start()
         if pos == 0:
-            # pos=0 的边界替换默认的前言起点
             boundaries[0] = 0
             titles[0] = m.group(0).strip()
         else:
             boundaries.append(pos)
             titles.append(m.group(0).strip())
 
-    boundaries.append(len(text))  # 末尾哨兵
-    titles.append("")              # 最后一个块无标题
+    boundaries.append(len(text))
+    titles.append("")
 
-    # ── 🔴 v15: 边界邻近合并 — 消除 "标题孤块" 导致的 Multi-API 粘连 ──
-    # 场景: "3.连接机械臂" 和 "函数名称\nRobot_socket_start" 间隔 < 50 字符
-    # → 两个边界太近，合并为一个（保留更具体的函数名标题）
-    _MIN_BLOCK_GAP = 30  # 🔴 v15: 30 字符 — 足够区分标题孤块与真 API 边界
+    _MIN_BLOCK_GAP = 20
     merged_boundaries = [boundaries[0]]
     merged_titles = [titles[0]]
     for i in range(1, len(boundaries)):
         gap = boundaries[i] - merged_boundaries[-1]
-        if gap < _MIN_BLOCK_GAP and i < len(boundaries) - 1:  # 不合并末尾哨兵
-            # 合并：保留更长的标题（通常函数名比数字标题更具体）
+        if gap < _MIN_BLOCK_GAP and i < len(boundaries) - 1:
             if len(titles[i]) > len(merged_titles[-1]):
                 merged_titles[-1] = titles[i]
-            # 边界点不变（跳过当前边界，扩展到下一个）
         else:
             merged_boundaries.append(boundaries[i])
             merged_titles.append(titles[i])
 
-    # Step 2: 构建相邻边界间的块 + 智能标题提取
     blocks = []
     for i in range(len(merged_boundaries) - 1):
         start = merged_boundaries[i]
         end = merged_boundaries[i + 1]
         if start >= end:
             continue
-        # 🔴 v15: 从块文本中提取有意义的标题（正则匹配可能只捕获 "函数名称"）
+
         raw_title = merged_titles[i]
         block_text = text[start:end]
-        # 提取策略: 取第一个非空的 数字标题 / 函数名行 / Markdown 标题
+        # 提取真正的标题（兼容前导空格）
         _title_match = re.search(
-            r'(?:^\d{1,2}[\.\、\s]\s*[^\n]+|^函数名称\s*\n?\s*(\w+)|^#{1,4}\s+[^\n]+)',
+            r'(?:^[ \t]*\d{1,2}[\.\、\s]\s*[^\n]+|^[ \t]*函数名称\s*\n?\s*(\w+)|^[ \t]*函数说明\s*\n?\s*(\w+))',
             block_text, re.MULTILINE,
         )
         if _title_match:
@@ -1353,34 +1411,93 @@ def _v4_build_child_docs_v2(
     doc_type = _resolve_doc_type(product_id)  # 🔴 v5: 双轨制切片策略
 
     # ── 🔴 v11: SDK 轨状态机快速路径 — 替代标题树切分 ──
+    # ── 🔴 SDK 轨状态机快速路径：整块解包，禁止二次拆切 ──
     if doc_type == "c_sdk":
         section_text = full_text[section_start:section_end]
         sdk_blocks = _v4_parse_sdk_state_machine(section_text)
         if sdk_blocks:
+            # 1. 提取所有原始候选块
+            raw_blocks = []
             for block_start_rel, block_end_rel, block_title in sdk_blocks:
                 block_abs_start = section_start + block_start_rel
                 block_abs_end = section_start + block_end_rel
                 block_text = full_text[block_abs_start:block_abs_end].strip()
-                if len(block_text) < 15:
+                if not block_text or _is_skeleton_chunk(block_text):
                     continue
-                # 构建面包屑：使用状态机识别的块标题
+                raw_blocks.append((block_abs_start, block_abs_end, block_text, block_title))
+
+            # 2. 🔴 微碎片向下自动缝合 (Micro-Chunk Auto-Merge + API 排他锁)
+            # 解决 "28. 机械臂电源上电" 等短标题被切成孤儿碎片的问题
+            # 同时确保不同 API 绝不缝合：提取双方主 API 函数名，不同则强制提交
+            merged_blocks = []
+            buf_start, buf_end = None, None
+            buf_text, buf_title = "", ""
+
+            for b_start, b_end, b_text, b_title in raw_blocks:
+                if buf_text:
+                    buf_text = buf_text + "\n\n" + b_text
+                    buf_end = b_end
+                    if not buf_title:
+                        buf_title = b_title
+                else:
+                    buf_start = b_start
+                    buf_end = b_end
+                    buf_text = b_text
+                    buf_title = b_title
+
+                # 判定条件：合并后文本长度 >= 60 字符，或包含明显的 SDK 代码/方法调用 → 提交为一个独立 API 块
+                has_code = any(kw in buf_text for kw in ["robot.", "dll.", "ctypes", "("])
+                if len(buf_text) >= 60 or has_code:
+                    merged_blocks.append((buf_start, buf_end, buf_text, buf_title))
+                    buf_start, buf_end, buf_text, buf_title = None, None, "", ""
+
+            # 处理末尾残留的微碎片
+            if buf_text:
+                if merged_blocks:
+                    prev_start, prev_end, prev_text, prev_title = merged_blocks[-1]
+                    merged_blocks[-1] = (prev_start, buf_end, prev_text + "\n\n" + buf_text, prev_title)
+                else:
+                    merged_blocks.append((buf_start, buf_end, buf_text, buf_title))
+
+            # 3. 将缝合后的整块生成 Document (含 4 级 Title Fallback)
+            for block_abs_start, block_abs_end, block_text, block_title in merged_blocks:
+                if len(block_text) < 15 or _is_skeleton_chunk(block_text):
+                    continue
+
                 breadcrumb = _v4_build_breadcrumb(headings, block_abs_start, block_abs_end)
-                sub_children = _split_text_into_children(
-                    block_text, source, product_id, parent_id,
-                    child_chunk_size, breadcrumb, block_title or breadcrumb, 3,
-                    sdk_header=sdk_header, doc_type=doc_type,
-                )
-                children.extend(sub_children)
-        else:
-            # 状态机无匹配 → 回退到段落切分
-            text = full_text[section_start:section_end].strip()
-            if text:
-                breadcrumb = _v4_build_breadcrumb(headings, section_start, section_end)
-                children = _split_text_into_children(
-                    text, source, product_id, parent_id,
-                    child_chunk_size, breadcrumb, "",
-                    sdk_header=sdk_header, doc_type=doc_type,
-                )
+                func_names = _v4_extract_function_names(block_text)
+                is_api = len(func_names) > 0
+
+                # 🔴 4 级 Title Fallback 链 — section_title 永不落空
+                _clean_sec = _sanitize_section_title(block_title)          # L1: 状态机标题
+                if not _clean_sec:
+                    _clean_sec = _sanitize_section_title(breadcrumb)       # L2: 面包屑路径
+                if not _clean_sec:
+                    # L3: 回溯当前 Parent 切片的 section_title (H2 父标题)
+                    for pos, title, lv in headings:
+                        if pos <= block_abs_start and lv == 2:
+                            _candidate = _sanitize_section_title(title)
+                            if _candidate:
+                                _clean_sec = _candidate
+                        elif pos > block_abs_start:
+                            break
+                if not _clean_sec:
+                    _clean_sec = "SDK 接口说明"                            # L4: 硬兜底
+
+                prefix = _build_child_prefix(source, breadcrumb, _clean_sec, func_names)
+
+                children.append(Document(
+                    page_content=f"{prefix}{block_text}",
+                    metadata={
+                        "source": source, "product_id": product_id,
+                        "doc_type": doc_type, "chunk_type": "child", "parent_id": parent_id,
+                        "section_title": _clean_sec,
+                        "section_level": 3,
+                        "function_names": ",".join(func_names) if func_names else "",
+                        "api_atomic": is_api, "is_api": is_api,
+                        "sdk_header": sdk_header if (sdk_header and is_api) else "",
+                    },
+                ))
         return children
 
     sub_headings = [
@@ -1428,6 +1545,15 @@ def _v4_build_child_docs_v2(
                 current_title = title
                 current_level = lv
                 break
+
+        # 🔴 架构级补全：若当前为章节总览/导言段落（未匹配到 H3 子标题），自动继承 H2 父级标题
+        if not current_title:
+            for pos, title, lv in headings:
+                if pos <= s and lv <= 2:
+                    current_title = title
+                    current_level = lv
+                elif pos > s:
+                    break
 
         breadcrumb = _v4_build_breadcrumb(headings, s, e)
         sub_children = _split_text_into_children(
@@ -1477,9 +1603,13 @@ def _split_text_into_children(
             return
         func_names = _v4_extract_function_names(content)
         is_api = len(func_names) > 0
-        prefix = _build_child_prefix(source, breadcrumb, section_title, func_names)
-        # 🔴 v13: section_title 存入 metadata 前先清洗
-        _clean_sec = _sanitize_section_title(section_title)
+        # 🔴 3 级 Title Fallback 链 (非 c_sdk 路径 — 无 headings 可用，L3 跳过)
+        _clean_sec = _sanitize_section_title(section_title)          # L1: 传入标题
+        if not _clean_sec:
+            _clean_sec = _sanitize_section_title(breadcrumb)         # L2: 面包屑路径
+        if not _clean_sec:
+            _clean_sec = "技术文档"                                    # L4: 硬兜底
+        prefix = _build_child_prefix(source, breadcrumb, _clean_sec, func_names)
         children.append(Document(
             page_content=f"{prefix}{content}",
             metadata={
@@ -1504,24 +1634,11 @@ def _split_text_into_children(
             _emit_child(content)
         return children
 
-    # ── 🔴 v12: SDK 轨 — 状态机已定义 API 边界，整块保留不拆散 ──
+    # ── 🔴 v12: SDK 轨 — 状态机已定义完整 API 边界，绝对禁止二次拆切 ──
     if doc_type == "c_sdk":
-        # 受保护块 (```code```) 单独 emit，其余段落整体保留
-        segments = []
-        last_end = 0
-        for m in _PROTECTED_BLOCK_RE.finditer(text):
-            normal = text[last_end:m.start()].strip()
-            if normal:
-                segments.append({"type": "normal", "text": normal})
-            segments.append({"type": "protected", "text": m.group(0)})
-            last_end = m.end()
-        remaining = text[last_end:].strip()
-        if remaining:
-            segments.append({"type": "normal", "text": remaining})
-        # 合并所有段为一个整体 emit（代码块自然吸附在描述后方）
-        merged = "\n\n".join(seg["text"] for seg in segments)
-        if len(merged.strip()) >= 10:
-            _emit_child(merged)
+        content = text.strip()
+        if len(content) >= 10:
+            _emit_child(content)
         return children
 
     # ── 1. 将文本解析为 [受保护段] 与 [普通段] ──
@@ -1630,7 +1747,7 @@ def _v4_extract_function_names(text: str) -> List[str]:
     # ── ⑥ 无括号前缀标识符: robot_xxx, set_xxx, get_xxx 在代码块中 ──
     if '```' in text or 'robot_' in text.lower() or 'ctypes' in text.lower():
         for m in re.finditer(
-            r'\b((?:robot|set|get|arm|py|collrob)_[a-zA-Z]\w{2,})\b',
+            r'\b((?:robot|set|get|arm|py|collrob|end|close|start|Reset)_[a-zA-Z0-9_]{2,})\b',
             text, re.IGNORECASE,
         ):
             fname = m.group(1).strip('_')
@@ -1644,7 +1761,40 @@ def _v4_extract_function_names(text: str) -> List[str]:
         if f.lower() not in seen_lower:
             seen_lower.add(f.lower())
             funcs.append(f)
-    return funcs[:15]
+
+    # ── 🔴 Step1: 主 API 优先级排序 — 将 chunk 内核心 API 函数名排在首位 ──
+    # 策略:
+    #   1. 提取 "函数说明/函数名称 xxx" 直接声明的函数名 → 最高优先级
+    #   2. 提取独立行上的 snake_case 函数定义 → 次优先级
+    #   3. 其余按原有顺序排在后面
+    _primary_funcs = []
+    for m in re.finditer(
+        r'(?:函数说明|函数名称|函数名)\s*\n?\s*([a-zA-Z_]\w{3,})\s*\(?',
+        text,
+    ):
+        fname = m.group(1).strip('_')
+        if len(fname) >= 4:
+            _primary_funcs.append(fname)
+    # 独立行函数定义
+    for m in re.finditer(
+        r'^(?:[a-zA-Z_][a-zA-Z0-9_]*_[a-zA-Z0-9_]{2,})\s*\([^)]*\)\s*$',
+        text, re.MULTILINE,
+    ):
+        fname = m.group(0).split('(')[0].strip().strip('_')
+        if fname not in _primary_funcs and len(fname) >= 6:
+            _primary_funcs.append(fname)
+
+    # 将主 API 排在首位，其余按原顺序跟随（去重）
+    _primary_deduped = []
+    _seen_p = set()
+    for f in _primary_funcs:
+        key = f.lower()
+        if key not in _seen_p:
+            _seen_p.add(key)
+            _primary_deduped.append(f)
+
+    _rest = [f for f in funcs if f.lower() not in _seen_p]
+    return (_primary_deduped + _rest)[:15]
 
 
 # ============================================================
