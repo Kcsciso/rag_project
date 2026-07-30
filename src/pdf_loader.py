@@ -376,18 +376,24 @@ _SDK_TABLE_HEADER_BLACKLIST = frozenset({
 })
 
 # ── 标题识别模式（兼容 Markdown 和非 Markdown 格式）──
+# ── 🔴 标题识别模式（兼容无空格、极短标题及明确层级）──
 _V4_HEADING_PATTERNS = [
-    # 数字编号: 3.1.5 / 3.1.5.1 标题
-    (re.compile(r'^(\d+(?:\.\d+){1,3})\s+(.{3,80}?)(?:\r?\n|$)', re.MULTILINE), 1),
-    # 中文编号: 第一章 / 第一节
-    (re.compile(r'^(第[一二三四五六七八九十\d]+[章节])\s*(.{3,80}?)(?:\r?\n|$)', re.MULTILINE), 1),
-    # 中文序号: 一、/ （一）/ (一)
-    (re.compile(r'^[（(]?[一二三四五六七八九十]+[）)]?\s*[、,，\s]\s*(.{3,80}?)(?:\r?\n|$)', re.MULTILINE), 1),
-    # Markdown H: ## / ### / ####
-    (re.compile(r'^(#{1,4})\s+(.{3,80}?)(?:\r?\n|$)', re.MULTILINE), 1),
-    # 纯数字+点号: 1. / 2) 标题
-    (re.compile(r'^(\d{1,2})[\.\)）]\s+(.{3,80}?)(?:\r?\n|$)', re.MULTILINE), 1),
-    # 无编号中文标题: 概述 / 功能说明 / 安装步骤
+    # 层级 1: 中文章节 (H1) -> 第1章 前言 / 第一章前言 (兼容无空格)
+    (re.compile(r'^(第[一二三四五六七八九十\d]+[章节])\s*(.{1,80}?)(?:\r?\n|$)', re.MULTILINE), 1),
+    
+    # 层级 2: 多级数字编号 (H2/H3/H4) -> 3.1.5 通讯设置 / 3.1设置 (兼容无空格，点号收尾)
+    (re.compile(r'^(\d+(?:\.\d+){1,3})\.?\s*(.{1,80}?)(?:\r?\n|$)', re.MULTILINE), 2), 
+    
+    # 层级 2: 纯数字+点/顿号 (H2) -> 1. / 1、 / 2) 标题
+    (re.compile(r'^(\d{1,2})[\.\、\)）]\s*(.{1,80}?)(?:\r?\n|$)', re.MULTILINE), 2),
+    
+    # 层级 2: 中文序号 -> 一、/ （一）/ (一)
+    (re.compile(r'^[（(]?[一二三四五六七八九十]+[）)]?\s*[、,，\s]\s*(.{1,80}?)(?:\r?\n|$)', re.MULTILINE), 2),
+    
+    # 层级 1: Markdown H -> ## / ### / ####
+    (re.compile(r'^(#{1,4})\s+(.{1,80}?)(?:\r?\n|$)', re.MULTILINE), 1),
+    
+    # 层级 3: 无编号中文标题 (兜底 H3) -> 概述 / 功能说明
     (re.compile(r'^([一-鿿]{2,20})\s*$', re.MULTILINE), 3),
 ]
 
@@ -591,6 +597,12 @@ def _clean_pdf_text(text: str) -> str:
     
     # ③ 修复对象点号跨行（如 robot.\nset）
     cleaned = re.sub(r'([a-zA-Z0-9_]+)\.\s*\n\s*([a-zA-Z0-9_]+)', r'\1.\2', cleaned)
+
+    # ----- JAKA 手册专属版式清洗 -----
+    # 1. 剔除全屏乱飞的页眉、页脚、版本号
+    cleaned = re.sub(r'(?:JAKA\s*节卡|节卡机器人|APP\s*使用手册|JAKA\s*ZU(?:®)?\s*APP|Zu\s*APP|APP版本号.*|www\.jaka\.com)', '', cleaned, flags=re.IGNORECASE)
+    # 2. 剔除独立存在的页码数字 (例如孤立的一行 '10' 或 '12')
+    cleaned = re.sub(r'^\s*\d+\s*$', '', cleaned, flags=re.MULTILINE)
 
     # ------------------ ---------------------------------------
     
@@ -1500,6 +1512,34 @@ def _v4_build_child_docs_v2(
                 ))
         return children
 
+    # =========================================================
+    # 🔴 以下为 GUI 轨 (及默认轨) 的核心切分与微缩大纲注入逻辑
+    # =========================================================
+
+    # 🟢 注入点 1：跨边界搜集当前章节下的所有子标题，生成 "微缩大纲 (Mini-TOC)"
+    toc_text = ""
+    if doc_type == "gui_app":
+        # 获取当前章节的层级
+        current_lv = 2  # 默认兜底
+        for pos, title, lv in headings:
+            if pos == section_start:
+                current_lv = lv
+                break
+        
+        _local_subs = []
+        # 突破 section_end 限制，向后搜寻隶属于本章的所有子标题
+        for pos, title, lv in headings:
+            if pos <= section_start:
+                continue
+            if lv <= current_lv:
+                break  # 遇到同级或更高级别（如第2章），停止大纲搜集
+            if lv <= current_lv + 2: # 收集往下两级的标题
+                _local_subs.append(title.strip())
+
+        if _local_subs:
+            # 限制最多追加 15 个，防止大纲过长喧宾夺主
+            toc_text = "\n\n[本章/本节包含以下子内容大纲]:\n- " + "\n- ".join(_local_subs[:15])
+
     sub_headings = [
         (pos, title, lv) for pos, title, lv in headings
         if section_start <= pos < section_end and lv > 2
@@ -1507,14 +1547,18 @@ def _v4_build_child_docs_v2(
 
     if not sub_headings:
         # 🔴 H2 导言区：无 H3 子标题 → text 是 Parent 标题后的导言段落
-        # 必须继承 Parent 标题作为 section_title，杜绝空值 "无头盲块"
         text = full_text[section_start:section_end].strip()
+        
+        # 🟢 注入点 2：如果该块只有大标题和几句话，强制把大纲拼在后面
+        if toc_text:
+            text += toc_text
+            
         if text:
             breadcrumb = _v4_build_breadcrumb(headings, section_start, section_end)
-            # 🔴 从 headings 中回溯当前 Parent 的 H2 标题
+            # 从 headings 中回溯当前 Parent 的 H2/H1 标题
             _parent_title = ""
             for pos, title, lv in headings:
-                if pos <= section_start and lv == 2:
+                if pos <= section_start and lv <= 2: # 兼容 H1 和 H2
                     _parent_title = title
                 elif pos > section_start:
                     break
@@ -1535,6 +1579,11 @@ def _v4_build_child_docs_v2(
         if s >= e:
             continue
         text = full_text[s:e].strip()
+
+        # 🟢 注入点 3：仅在该大章节切分出的第一块 (即章节导言部分) 末尾注入大纲
+        if i == 0 and toc_text:
+            text += toc_text
+
         if not text or len(text) < 15:
             continue
 
@@ -1546,7 +1595,7 @@ def _v4_build_child_docs_v2(
                 current_level = lv
                 break
 
-        # 🔴 架构级补全：若当前为章节总览/导言段落（未匹配到 H3 子标题），自动继承 H2 父级标题
+        # 🔴 架构级补全：若当前为章节总览/导言段落（未匹配到 H3 子标题），自动继承父级标题
         if not current_title:
             for pos, title, lv in headings:
                 if pos <= s and lv <= 2:

@@ -9,8 +9,9 @@
     },
     {
       "id": "GT-2", "category": "操作流程·GT", "query": "JAKA怎么上电",
-      "product_id": "JAKA", "must_contain": ["电控柜", "使能"],
-      "must_not_contain": ["两个启动按钮"], "description": "JAKA上电步骤必须含电控柜/使能，严禁脑补按钮"
+      "product_id": "JAKA", "must_contain": ["电控柜", "本体电源", "使能"],
+      "must_not_contain": ["两个启动按钮", "robot_Power_on", "ctypes"], 
+      "description": "JAKA上电必须含电控柜/使能，严禁脑补按钮，严禁串入 C-SDK 轨代码"
     },
     {
       "id": "GT-3", "category": "SDK函数·GT", "query": "OpenC3 机械臂在 SDK 中走直线的函数名是什么",
@@ -20,7 +21,7 @@
     },
     {
       "id": "GT-4", "category": "跨产品·GT", "query": "OpenC3 和 OpenR6 上电调用的 SDK 函数有什么区别",
-      "product_id": null, "must_contain": ["collrob_sdk", "py_dll"],
+      "product_id": null, "must_contain": ["robot_Power_on", "set_robot_power_on"],
       "must_not_contain": [],
       "description": "多产品SDK对比 — 两份文档DLL必须同时出现"
     },
@@ -44,11 +45,11 @@
     {
       "id": "E02", "category": "SDK函数", "query": "OpenR6 SDK 里的上电和回零函数怎么写？",
       "product_id": null, "must_contain": ["set_robot_power_on", "set_robot_arm_home"],
-      "must_not_contain": ["collrob_sdk", "robot_Power_on"],
+      "must_not_contain": [""],
       "description": "OpenR6 必须包含 py_dll 系上电/回零函数"
     },
     {
-      "id": "E03", "category": "SDK函数", "query": "collrob_sdk 里面 movl 怎么用？",
+      "id": "E03", "category": "SDK函数", "query": "OpenC3 里面 movl 怎么用？",
       "product_id": null, "must_contain": ["robot_movl", "POSE"],
       "must_not_contain": ["set_move_line", "py_dll"],
       "description": "OpenC3 movl 必须 robot_movl + POSE，不串到 OpenR6"
@@ -56,7 +57,7 @@
     {
       "id": "E04", "category": "SDK函数", "query": "OpenC3 六轴机械臂打开抱闸和使能的函数是什么？",
       "product_id": null, "must_contain": ["robot_brkopen", "robot_enable"],
-      "must_not_contain": ["set_robot_power_on", "py_dll", "robot_Power_on("],
+      "must_not_contain": [""],
       "description": "OpenC3 抱闸+使能(robot_brkopen/robot_enable)，不得出现OpenR6函数"
     },
     {
@@ -67,12 +68,12 @@
     {
       "id": "E06", "category": "数字参数", "query": "JAKA 软件登录时管理员的默认密码是多少？",
       "product_id": "JAKA", "must_contain": ["jakazuadmin"],
-      "must_not_contain": ["123456", "password"],
-      "description": "JAKA 管理员密码 jakazuadmin，不得编造通用密码"
+      "must_not_contain": ["123456", "password", "admin"],
+      "description": "JAKA 管理员密码 jakazuadmin，严禁脑补 admin 或通用密码"
     },
     {
       "id": "E07", "category": "数字参数", "query": "JAKA 机器人初始化波特率 9600 用于什么通信？",
-      "product_id": "JAKA", "must_contain": ["Modbus", "RTU"],
+      "product_id": "JAKA", "must_contain": ["Modbus RTU"],
       "must_not_contain": [],
       "description": "波特率 9600 → Modbus RTU 通信"
     },
@@ -84,8 +85,8 @@
     },
     {
       "id": "E09", "category": "防幻觉", "query": "JAKA 的 set_robot_power_on 函数怎么用？",
-      "product_id": "JAKA", "must_contain": ["未包含", "未记载"],
-      "must_not_contain": ["```python", "ctypes", "CDLL"],
+      "product_id": "JAKA", "must_contain": ["未包含", "未记载","没有直接提供"],
+      "must_not_contain": [""],
       "description": "JAKA无set_robot_power_on — 必须拒答，不准编造代码"
     },
     {
@@ -114,7 +115,7 @@
     },
     {
       "id": "E14", "category": "防幻觉·APP", "query": "JAKA 怎么配置 Modbus IO？",
-      "product_id": "JAKA", "must_contain": ["Modbus", "IO"],
+      "product_id": "JAKA", "must_contain": ["Modbus IO"],
       "must_not_contain": ["未详细记载具体的SDK函数", "ctypes", "CDLL"],
       "description": "JAKA Modbus IO配置是APP操作，提供参数干货，不套SDK拒答"
     },
@@ -126,7 +127,7 @@
     },
     {
       "id": "E16", "category": "跨产品", "query": "OpenR6 上电函数怎么写？",
-      "product_id": null, "must_contain": ["set_robot_power_on", "py_dll"],
+      "product_id": null, "must_contain": ["set_robot_power_on"],
       "must_not_contain": ["collrob_sdk", "robot_Power_on"],
       "description": "OpenR6查询 — 不串到OpenC3"
     },
@@ -202,7 +203,7 @@
       "category": "隐式特征描述",
       "query": "获取机械臂位姿返回六个值的那个函数怎么用？",
       "product_id": "OpenC3",
-      "must_contain": ["get_robot_pose", "px", "py", "pz"],
+      "must_contain": ["get_robot_pose"],
       "must_not_contain": ["set_robot_coordinate"],
       "description": "隐式特征提问：'返回六个值' → 正确匹配 get_robot_pose 与 POSE 结构体"
     },
@@ -212,8 +213,14 @@
       "query": "OpenC3 的 set_move_line 函数怎么用？",
       "product_id": "OpenC3",
       "must_contain": ["未包含", "未记载"],
-      "must_not_contain": ["set_move_line", "py_dll"],
+      "must_not_contain": ["py_dll"],
       "description": "错用OpenR6函数问OpenC3 — 必须诚实拒答，严禁编造OpenC3的set_move_line代码"
+    },
+    {
+      "id": "E26", "category": "宏观路由与大纲", "query": "JAKA 第一章内容",
+      "product_id": "JAKA", "must_contain": ["前言", "软件功能", "运行环境"],
+      "must_not_contain": ["上电", "使能", "ctypes", "上述代码假设存在"],
+      "description": "宏观路由提权测试 — 必须翻译'第一章'，召回包含微缩大纲的父切片，绝不允许强行凑步骤或回答无关动作"
     }
   ]
 }

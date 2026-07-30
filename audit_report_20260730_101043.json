@@ -1,0 +1,17 @@
+{
+  "1. 骨架/目录占位块 (Skeleton Chunks)": [
+    {
+      "chunk_id": "c_parent_JAKA_37_0593",
+      "product": "JAKA",
+      "detail": "[文档: 1.7 JAKA ZU APP-使用手册.pdf] [路径: 2. 点击添加键] [章节: 2. 点击添加键]",
+      "content_preview": "[文档: 1.7 JAKA ZU APP-使用手册.pdf]\n[路径: 2. 点击添加键]\n[章节: 2. 点击添加键]\n2. 点击添加键\n，界面弹出\"确定开始轨迹记录\"，点击\"是\"，同时APP 顶部状态栏会出\n\n现\"轨迹记录中\"按钮。\n\n3. 通过拖拽模式或者手动操作，让机器人做期望的动作轨迹。"
+    }
+  ],
+  "2. 多 API 跨边界强行粘连 (Multi-API Sticky)": [],
+  "3. 标题/元数据脏化 (Corrupted Section Title)": [],
+  "4. PDF 代码下划线/空格断裂 (OCR Artifacts)": [],
+  "5. GUI 轨孤立图注碎片 (Isolated Caption)": [],
+  "6. 面包屑死循环与语义脱节 (Corrupted Breadcrumb)": [],
+  "7. SDK 碎化与低自包含度 (Low-Containment SDK)": [],
+  "8. AST 章节序号倒挂 (AST Hierarchy Collapse)": []
+}

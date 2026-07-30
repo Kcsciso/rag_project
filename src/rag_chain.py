@@ -571,6 +571,12 @@ def _preprocess_query(query: str) -> str:
     """
     cleaned = query.strip()
 
+    # 🔴 新增：中文大写数字转阿拉伯数字，解决“第一章”和“第1章”无法匹配的检索断层
+    cn_num_map = {'一': '1', '二': '2', '三': '3', '四': '4', '五': '5', '六': '6', '七': '7', '八': '8', '九': '9'}
+    for cn, num in cn_num_map.items():
+        cleaned = re.sub(rf'第{cn}章', f'第{num}章', cleaned)
+        cleaned = re.sub(rf'第{cn}节', f'第{num}节', cleaned)
+
     # 🔄 迭代剥离前缀和后缀，直到收敛
     max_iterations = 5
     for _ in range(max_iterations):
@@ -1602,6 +1608,7 @@ API 接口、开发指南和使用手册的问题。
      - 文档写"等待完成升级"→ 只能说"等待完成升级"，禁止说"等待约30秒完成升级"
    - 🚫 严禁推测或补充步骤的前置状态、中间状态、后续状态
    - 🔴 只输出参考资料中**逐字出现**的描述，不增减任何修饰词、时间词、颜色词、位置词
+   - 🔴 针对 GUI 手册或概念介绍类问题，问什么答什么。绝对禁止在回答末尾强行补充“未提及如何上电、如何使能”等毫无关联的免责声明！
 
 12. 🔴【通用属性对齐·Few-Shot 示例（泛化版）】以下示例演示"严格原文 KV 关联复述"的规范：
 
@@ -1620,6 +1627,11 @@ API 接口、开发指南和使用手册的问题。
     【关键原则】
     - 每个数值必须与其 Context 原文中的属性词绑定，不可互换
     - 步骤描述只复述原文，不补充任何观察/推测/时间/位置/颜色变化
+13. 🔴【工程术语严格区分 — 绝对不可混淆】
+   - 工业控制中，“上电” (Power On) 与 “使能/上使能” (Enable) 是两个完全不同的物理步骤！
+   - “下电” (Power Off) 与 “下使能” (Disable) 绝对不可混淆！
+   - 用户询问“上电”时，绝不能输出“使能”的函数代码（如 robot_enable）；用户询问“使能”时，绝不能输出“上电”的函数代码（如 robot_Power_on）。
+   - 你必须仔细核对【参考资料】中的小节标题，精确匹配用户的术语，绝不可互相替代或张冠李戴！
 
 🔧 回答格式硬约束（不可覆盖）：
 - 🔴 所有回答必须使用**纯 Markdown 格式**，使用标准 Markdown 语法（标题 ##、列表 -、代码块 ```python、加粗 **）
@@ -1707,6 +1719,9 @@ API 接口、开发指南和使用手册的问题。
 🛑 输出格式硬约束（不可覆盖）：
 - 请直接给出清晰的代码与说明，严禁输出任何重复的标点符号或感叹号！
 - 单次回答的总长度控制在 1024 字符以内，超出部分将被截断
+# 👇 追加下面这一行
+- 🔴 代码块写完一个即可，绝对禁止陷入死循环重复输出相同或相似的代码片段！
+# 👆
 """
 
 # ============================================================
@@ -1811,7 +1826,7 @@ def _expand_parent_sections(
     retrieved_docs: List,
     vector_store,
     product_id: Optional[str] = None,
-    max_siblings: int = 2,
+    max_siblings: int = 4,
 ) -> List:
     """
     父子切片上下文扩展 v2: 兄弟切片 + Parent 文档合并。
@@ -1877,8 +1892,11 @@ def _expand_parent_sections(
     for doc in retrieved_docs:
         m = _SECTION_ID_RE.search(doc.page_content)
         if m:
-            section_id = m.group(1)
-            section_ids.add(section_id)
+            # 提取数字标识
+            if m.group(1):
+                section_ids.add(f"第{m.group(1)}章") # 命中 "第1章"
+            elif m.group(2):
+                section_ids.add(m.group(2))         # 命中 "3.1.5"
 
     siblings = []
     for sid in section_ids:
@@ -1956,7 +1974,7 @@ def _build_messages(
     # 🔴 Step1: SDK 轨道动态放大 Context 上限 2000→4000
     #   确保 Autocut Top-6 切片 (≈2400 chars) 不被物理截断
     _is_sdk_context = ("c_sdk" in _doc_types) or _is_sdk_code_query(query)
-    _MAX_CONTEXT_CHARS = 4000 if _is_sdk_context else 2000
+    _MAX_CONTEXT_CHARS = 8000 if _is_sdk_context else 4000  # 🔴 扩容，确保装得下 10 个切片
 
     child_parts = []   # 【精确定位小节】
     parent_parts = []  # 【章节背景】
@@ -2202,41 +2220,54 @@ def _build_messages(
 
     # ── 🔴 v17: 双轨制 Prompt 控制 — Python 动态提取章节信息 ──
     _dual_track_prefix = ""
-    if _doc_types == {"gui_app"}:
-        # 🔴 JAKA 轨: 从 context_docs[0] 提取真实 source + section，100% 确定性注入
-        _doc_name = "参考文档"
-        _doc_section = ""
-        if context_docs:
-            _first = context_docs[0]
-            if hasattr(_first, 'metadata'):
-                _doc_name = _first.metadata.get("source", _doc_name)
-                _doc_section = _first.metadata.get("section_title", "")
+    
+    # 🟢 统一提取：不管是什么文档，先提取当前的文档名和章节号
+    _doc_name = "参考文档"
+    _doc_section = ""
+    if context_docs:
+        _first = context_docs[0]
+        if hasattr(_first, 'metadata'):
+            _doc_name = _first.metadata.get("source", _doc_name)
+            _doc_section = _first.metadata.get("section_title", "")
         # 若无 section，回退到 page_content 中的 [章节: ...] 标记
-        if not _doc_section and context_docs:
-            _ct = context_docs[0].page_content if hasattr(context_docs[0], 'page_content') else ""
+        if not _doc_section:
+            _ct = _first.page_content if hasattr(_first, 'page_content') else str(_first)
             _sec_m = re.search(r'\[章节:\s*(.+?)\]', _ct)
             if _sec_m:
                 _doc_section = _sec_m.group(1).strip()
 
+    # 🟢 针对不同轨道，套用不同的强制模板
+    if _doc_types == {"gui_app"}:
         if _doc_section:
             _dual_track_prefix = (
                 "【首句强制红线】你的回答第一句必须完全按照以下内容开头，字面严禁改变：\n"
                 f"根据《{_doc_name}》【章节: {_doc_section}】的记载：\n\n"
-                "用 1. 2. 3. 步骤列表回答，绝对禁止输出任何代码。\n"
-                "🚫 严禁声明'参考文档未包含详细步骤'或'具体步骤未记载'。\n\n"
+                "【🔴 APP 手册模式】若涉及操作流程用步骤列表；若涉及概念/大纲请直接输出自然段摘要。\n"
+                "🚫 绝对禁止输出代码！绝对禁止在结尾补充任何免责声明！问什么答什么，就此止步。\n\n"
             )
         else:
             _dual_track_prefix = (
-                "【🔴 APP 操作手册模式】用 1. 2. 3. 步骤列表回答，严禁输出任何代码。\n"
-                "🚫 严禁声明'参考文档未包含详细步骤'或'具体步骤未记载'。\n\n"
+                "【🔴 APP 手册模式】若涉及操作流程用步骤列表；若涉及概念/大纲请直接摘要。\n"
+                "🚫 绝对禁止输出代码！绝对禁止在结尾补充任何免责声明。\n\n"
             )
+            
     elif "c_sdk" in _doc_types:
-        _dual_track_prefix = (
-            "【🔴 SDK 极简模式】\n"
-            "请直接给出完整的 ctypes 调用 Python 代码块。\n"
-            "1. 严格使用【参考资料】中为当前产品记载的准确函数名与参数，不得拼写错误、改写或混用其他产品函数。\n"
-            "2. 第一行直接输出 ```python 代码块，禁止输出任何前言套话或'假设存在'、'未包含'等免责声明。\n\n"
-        )
+        if _doc_section:
+            _dual_track_prefix = (
+                "【🔴 SDK 标准回复模版】\n"
+                "你的回答必须严格采用以下模版结构，绝不能有任何偏离：\n"
+                f"根据《{_doc_name}》【章节: {_doc_section}】的记载：\n"
+                "```python\n"
+                "# 完整的 ctypes 调用代码\n"
+                "```\n"
+                "🚫 绝对禁止在代码块之后追加“上述代码假设存在”、“如果参考资料没有”等任何客套话与免责声明！代码块输出完毕必须立刻停止生成！\n\n"
+            )
+        else:
+            _dual_track_prefix = (
+                "【🔴 SDK 标准回复模版】\n"
+                "请直接给出 ```python 代码块。\n"
+                "🚫 绝对禁止在代码块之后追加“上述代码假设存在”等任何免责声明！代码块输出完毕必须立刻停止生成！\n\n"
+            )
 
     # ---- 构建当前轮次的用户消息（含明确边界标记） ----
     current_user_message = f"""{_anti_bleed_prefix}{_dual_track_prefix}{_cond_constraint}【参考资料】
@@ -2321,8 +2352,8 @@ def _build_messages(
 # Autocut 动态自适应截断 — 基于 RRF 分数断崖检测
 # ============================================================
 
-_AUTOCUT_MIN_K = 3   # 🔴 v11: 硬下限 3 — 绝不低于 3 个 Chunk，多步骤 SDK 流程不丢关键切片
-_AUTOCUT_MAX_K = 5   # 🔴 上限 5 切片：配合 Parent 合并，确保长流程/多步骤不丢关键切片
+_AUTOCUT_MIN_K = 4   # 🔴 v11: 硬下限 3 — 绝不低于 3 个 Chunk，多步骤 SDK 流程不丢关键切片
+_AUTOCUT_MAX_K = 10   # 🔴 上限 5 切片：配合 Parent 合并，确保长流程/多步骤不丢关键切片
 
 # ============================================================
 # 意图路由器 — 闲聊/身份/能力拦截
@@ -2916,7 +2947,8 @@ def _hybrid_retrieve_single(
                 _query_anchors.add(_m.group(1))
             for _m in re.finditer(
                 r'(?:Modbus|Profinet|EtherCAT|TCP|RTU|RS485|RS232|'
-                r'波特率|端口号|IP地址|寄存器|从站|主站|末端传感器)',
+                r'波特率|端口号|IP地址|寄存器|从站|主站|末端传感器|'
+                r'上电|下电|上使能|下使能|使能|回零|停止)', # 🔴 补充机械臂核心硬动作词
                 query, re.IGNORECASE,
             ):
                 _query_anchors.add(_m.group(0).lower())
