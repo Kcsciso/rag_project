@@ -257,10 +257,17 @@ def load_pdfs_from_directory(
     import bisect as _bisect
     import re as _re
     _HEADING_PATTERNS = [
-        _re.compile(r'^(\d+(?:\.\d+)+)\s+(.+?)(?:\r?\n|$)', _re.MULTILINE),
+        # 多级数字: 3.1.5 通讯设置 / 3.1设置
+        _re.compile(r'^(\d+(?:\.\d+)+)\s*(.+?)(?:\r?\n|$)', _re.MULTILINE),
+        # 🔴 新增：单级数字标题兼容: 1. / 1、 / 1.安装需要的模块 (兼容无空格)
+        _re.compile(r'^(\d+)\.\s*([^\d\s].+?)(?:\r?\n|$)', _re.MULTILINE),
+        # 中文章节: 第1章 / 第一章前言
         _re.compile(r'^(第[一二三四五六七八九十\d]+[章节])\s*(.+?)(?:\r?\n|$)', _re.MULTILINE),
+        # 中文序号: 一、/ （一）
         _re.compile(r'^([（(]?[一二三四五六七八九十]+[）)]?[\s、,，])\s*(.+?)(?:\r?\n|$)', _re.MULTILINE),
+        # Markdown H1~H4
         _re.compile(r'^(#{1,4})\s+(.+?)(?:\r?\n|$)', _re.MULTILINE),
+        # 特殊符号标题
         _re.compile(r'^(?:[■□◆◇●○]|##?)\s*(?:(\d+(?:\.\d+)*)\s+)?(.+?)(?:\r?\n|$)', _re.MULTILINE),
     ]
 
@@ -1339,6 +1346,10 @@ def _is_skeleton_chunk(content: str) -> bool:
     lines = [l.strip() for l in content.split('\n') if l.strip()]
     if len(lines) <= 2 and all(re.match(r'^\d{1,2}[\.\、\s]', l) for l in lines):
         return True
+
+    # 🔴 注入免死金牌：只要这段话里有底层 SDK 初始化的核心词，绝对不准丢弃！
+    if any(kw in content for kw in ["import ctypes", "CDLL", "collrob_sdk", "py_dll", "动态链接库"]):
+        return False
 
     return False
 

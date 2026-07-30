@@ -352,7 +352,7 @@ def _release_vllm_lock():
 # ============================================================
 
 def _call_llm(client: OpenAI, model: str, messages: List[Dict[str, str]],
-              max_tokens: int = 1024, temperature: float = 0.2) -> str:
+              max_tokens: int = 2058, temperature: float = 0.0) -> str:
     """
     调用 LLM 完成非流式推理，返回完整回答文本。
 
@@ -424,8 +424,8 @@ def _stream_llm(
       - max_tokens=512: 硬限制单次最大输出长度
       - repetition_penalty=1.15: 惩罚连续重复 token，阻断 Lz27→Lz28 循环
     """
-    _max_tokens = 1024  # 🔴 v16: 1024 — 代码+步骤已完全充裕，从源头消解 400
-    _temperature = 0.2
+    _max_tokens = 2048  # 🔴 v16: 1024 — 代码+步骤已完全充裕，从源头消解 400
+    _temperature = 0.0
 
     for _attempt in range(3):  # 🔴 v12: 最多 3 次（原始 + 裁 Context + 再裁 Context）
         try:
@@ -1973,13 +1973,19 @@ def _build_messages(
     # Token 预算控制统一由末尾总 Context Cap 按整块剔除。
     # 🔴 Step1: SDK 轨道动态放大 Context 上限 2000→4000
     #   确保 Autocut Top-6 切片 (≈2400 chars) 不被物理截断
-    _is_sdk_context = ("c_sdk" in _doc_types) or _is_sdk_code_query(query)
-    _MAX_CONTEXT_CHARS = 8000 if _is_sdk_context else 4000  # 🔴 扩容，确保装得下 10 个切片
+    # ── 🔴 v18: 动态 Context 上限控制 (修复跨产品大截断) ──
+    # 不再盲目扩容到 12000 字符，因为大模型的 Context Window (输入窗口) 是有限的。
+    # 我们通过限制物理切片数量，把筛选压力交给前面完美的 RRF 排名，防止切片过多导致末尾被连根裁掉。
+    _MAX_CONTEXT_CHARS = 6000 
+    
+    # 🔴 物理锁死：最多只喂给大模型前 6 个最强相关的切片！
+    # 这样既能保证包含双文档（比如 3 个 OpenC3 + 3 个 OpenR6），又绝不会触发总长度溢出截断。
+    _safe_docs = context_docs[:6]
 
     child_parts = []   # 【精确定位小节】
     parent_parts = []  # 【章节背景】
 
-    for i, doc in enumerate(context_docs, start=1):
+    for i, doc in enumerate(_safe_docs, start=1):
         source = doc.metadata.get("source", "未知来源")
         content = doc.page_content.strip()
         # 清洗文档内容中的 null 字节和控制字符
@@ -2255,18 +2261,19 @@ def _build_messages(
         if _doc_section:
             _dual_track_prefix = (
                 "【🔴 SDK 标准回复模版】\n"
-                "你的回答必须严格采用以下模版结构，绝不能有任何偏离：\n"
+                "你的回答必须且只能是一个完整的 Python 代码块，严格按照以下模版结构：\n"
                 f"根据《{_doc_name}》【章节: {_doc_section}】的记载：\n"
                 "```python\n"
-                "# 完整的 ctypes 调用代码\n"
+                "import ctypes\n"
+                "# 代码逻辑...\n"
                 "```\n"
-                "🚫 绝对禁止在代码块之后追加“上述代码假设存在”、“如果参考资料没有”等任何客套话与免责声明！代码块输出完毕必须立刻停止生成！\n\n"
+                "【执行最高纪律】：代码块闭合（```）后，必须立即结束回答，绝对不要输出任何额外解释或说明！\n\n"
             )
         else:
             _dual_track_prefix = (
-                "【🔴 SDK 标准回复模版】\n"
-                "请直接给出 ```python 代码块。\n"
-                "🚫 绝对禁止在代码块之后追加“上述代码假设存在”等任何免责声明！代码块输出完毕必须立刻停止生成！\n\n"
+                "【🔴 SDK 极简模版】\n"
+                "请直接给出【唯一一个】完整的 ```python 代码块。\n"
+                "【执行最高纪律】：代码块闭合（```）后，必须立即结束回答，不提供任何补充文字！\n\n"
             )
 
     # ---- 构建当前轮次的用户消息（含明确边界标记） ----
@@ -2942,13 +2949,14 @@ def _hybrid_retrieve_single(
 
             fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
 
+            # ── 1. 实体锚点提权 (Entity Anchor Boost) ──
             _query_anchors = set()
             for _m in re.finditer(r'\b(\d{2,})\b', query):
                 _query_anchors.add(_m.group(1))
             for _m in re.finditer(
                 r'(?:Modbus|Profinet|EtherCAT|TCP|RTU|RS485|RS232|'
                 r'波特率|端口号|IP地址|寄存器|从站|主站|末端传感器|'
-                r'上电|下电|上使能|下使能|使能|回零|停止)', # 🔴 补充机械臂核心硬动作词
+                r'上电|下电|上使能|下使能|使能|回零|停止)', 
                 query, re.IGNORECASE,
             ):
                 _query_anchors.add(_m.group(0).lower())
@@ -2958,8 +2966,7 @@ def _hybrid_retrieve_single(
                 _boosted_count = 0
                 for _doc_id, _score in fused:
                     _doc_content = doc_map.get(_doc_id, None)
-                    if _doc_content is None:
-                        continue
+                    if not _doc_content: continue
                     _text = _doc_content.page_content.lower() if hasattr(_doc_content, 'page_content') else str(_doc_content).lower()
                     for _anchor in _query_anchors:
                         if _anchor.lower() in _text:
@@ -2970,35 +2977,28 @@ def _hybrid_retrieve_single(
                     logger.info(f"  ⚓ Entity Anchor: {len(_query_anchors)} 锚点 → {_boosted_count} chunks boost")
                 fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
 
+            # ── 2. 函数名提权 (Function Names Boost) ──
             if _query_code_entities:
                 _fn_boost = 0.08
                 _fn_boosted = 0
                 for _doc_id, _score in fused:
                     _doc = doc_map.get(_doc_id, None)
-                    if _doc is None:
-                        continue
-                    _meta_fn = ""
-                    if hasattr(_doc, 'metadata'):
-                        _meta_fn = _doc.metadata.get("function_names", "")
+                    if not _doc: continue
+                    _meta_fn = _doc.metadata.get("function_names", "") if hasattr(_doc, 'metadata') else ""
                     if _match_function_names(_meta_fn, _query_code_entities):
                         rrf_scores[_doc_id] += _fn_boost
                         _fn_boosted += 1
                 if _fn_boosted:
-                    logger.info(
-                        f"  🔧 Function Names Boost: {len(_query_code_entities)} entities → "
-                        f"{_fn_boosted} chunks boosted"
-                    )
+                    logger.info(f"  🔧 Function Names Boost: {len(_query_code_entities)} entities → {_fn_boosted} chunks boosted")
                 fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
 
+            # ── 3. 纯文本切片提权 (Text-Chunk Rebalance) ──
             _text_boost = 0.03
-            _text_boosted = 0
+            _text_boosted = 0  # 🔴 完美初始化
             for _doc_id, _score in fused:
                 _doc = doc_map.get(_doc_id, None)
-                if _doc is None:
-                    continue
-                _meta_fn = ""
-                if hasattr(_doc, 'metadata'):
-                    _meta_fn = _doc.metadata.get("function_names", "")
+                if not _doc: continue
+                _meta_fn = _doc.metadata.get("function_names", "") if hasattr(_doc, 'metadata') else ""
                 if not _meta_fn:
                     _has_text = bool(re.search(r'[一-鿿]{4,}', _doc.page_content or ""))
                     if _has_text:
@@ -3008,9 +3008,26 @@ def _hybrid_retrieve_single(
                 logger.info(f"  📄 Text-Chunk Rebalance: {_text_boosted} 纯文本切片 +{_text_boost} RRF")
             fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
 
+            # ── 4. 章节与大纲精确提权 (Macro-Routing Boost) ──
+            _chap_match = re.search(r'(第\d+章|第\d+节)', _query_normalized)
+            _is_broad_query = len(_query_normalized) < 15 and not _query_code_entities
+            
+            _macro_boosted = False
+            for _doc_id, _score in fused:
+                _doc = doc_map.get(_doc_id)
+                if _doc:
+                    if "[本章/本节包含以下子内容大纲]" in _doc.page_content:
+                        if _chap_match or _is_broad_query:
+                            rrf_scores[_doc_id] += 5.0  # 🔴 直接登顶
+                            _macro_boosted = True
+            
+            if _macro_boosted:
+                fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+                logger.info(f"🚀 Macro-Routing: 命中微缩大纲特征，已将父切片推至 Top-1")
+
             rrf_score_list = [score for _, score in fused]
-            # 🔴 Step1: SDK 检索放宽 Autocut 下限 3→6
-            #   确保 set_robot_power_on / robot_Power_on 等 API 切片不因排名靠后被截断
+            
+            # ── 5. 动态 Autocut 截断 ──
             _CSDK_PRODUCTS = {"OpenC3", "OpenR6"}
             _is_sdk_retrieval = (
                 (product_id and product_id in _CSDK_PRODUCTS) or
@@ -3669,28 +3686,27 @@ def shutdown_clients():
             _deepseek_client = None
 
 def _fix_and_close_sdk_code(answer: str, doc_type: str = "") -> str:
-    """
-    纯 Python 1ms 确定性代码修复与 Markdown 闭合（零 LLM 开销）。
-    解决 7B 模型随机漏写 CDLL 以及输出 Token 耗尽导致代码块未闭合的问题。
-    """
-    if not answer:
-        return answer
+    if not answer: return answer
 
-    # 1. 物理检查并自动闭合 Markdown 反引号代码块
-    fences = re.findall(r'```', answer)
-    if len(fences) % 2 != 0:
-        answer = answer.rstrip() + "\n```\n"
+    # 1. 物理静默斩尾
+    import re
+    answer = re.sub(r'注意[：:].*?(?:假设|没有明确|未包含|仅供参考).*', '', answer, flags=re.DOTALL|re.IGNORECASE)
+    answer = re.sub(r'(?:上述|以上)代码(?:假设|仅为).*', '', answer, flags=re.DOTALL|re.IGNORECASE)
+    answer = answer.strip()
 
-    # 2. 自动补全 ctypes.CDLL 加载语句（仅限生成了 Python 代码块但漏写了 CDLL 的场景）
-    if "```python" in answer and "CDLL(" not in answer:
-        # 根据回答上下文判定使用哪个动态库
-        if "openr6" in answer.lower() or "py_dll" in answer.lower():
-            dll_name = "py_dll.dll"
+    # 2. 如果包含 robot. 但没有反引号，强行套壳
+    if "```" not in answer and any(kw in answer for kw in ["robot.", "ctypes", "CDLL"]):
+        parts = answer.split("的记载：")
+        if len(parts) > 1:
+            header = parts[0] + "的记载：\n"
+            code_body = parts[1].strip()
+            answer = f"{header}\n```python\n{code_body}\n```\n"
         else:
-            dll_name = "collrob_sdk.dll"
-            
-        fix_header = f"import ctypes\ndll = ctypes.CDLL(\"{dll_name}\")\n"
-        answer = answer.replace("```python\n", f"```python\n{fix_header}")
+            answer = f"```python\n{answer}\n```"
+
+    # 3. 🔴 暴力闭合：如果结尾不是 ```，且前面有 ```python，强行补上
+    if "```python" in answer and not answer.rstrip().endswith("```"):
+        answer = answer.rstrip() + "\n```"
 
     return answer
 

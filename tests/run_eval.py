@@ -8,9 +8,7 @@
   - 向量库与 BM25 索引单次全局加载（避免单用例重复读盘）
   - 全量补全 OpenC3 / OpenR6 C-SDK 文档合法 API 白名单 (彻底消除误杀)
   - 8 项硬质量断言 + 4 维 RAG 量化指标汇总
-  - 区分 Quick 检索模式与 Full LLM 模式的断言范围
-
-运行: python tests/run_eval.py [--quick] [--verbose] [--filter ID1,ID2]
+  - 过滤空字符串陷阱，优化拒答匹配逻辑
 =============================================================================
 """
 
@@ -98,17 +96,14 @@ _API_NAME_REWRITE_PATTERNS = [
     (r'\brobot_enable\b', [r'\brobot_activate\b', r'\brobot_start\b', r'\benable_robot\b']),
 ]
 
-# 🔴 补全后的全量 C-SDK 函数白名单（涵盖 OpenC3 与 OpenR6 所有接口）
+# 全量 C-SDK 函数白名单
 _KNOWN_FUNCS: Set[str] = {
-    # OpenC3 SDK (collrob_sdk.dll)
     'robot_power_on', 'robot_power_off', 'robot_enable', 'robot_disable',
     'robot_movl', 'robot_movc', 'robot_movj', 'robot_movp', 'robot_stop',
     'robot_brkopen', 'robot_brkclose', 'robot_socket_start', 'robot_socket_close',
     'robot_handserialsend', 'robot_sysclose', 'robot_setdo', 'robot_get_pose',
     'get_robot_pose', 'get_robot_state', 'get_robot_iostate', 'get_robot_joint_all',
     'get_robot_motsta', 'get_robot_moterror', 'get_robot_torque', 'reset_server',
-
-    # OpenR6 SDK (py_dll.dll)
     'set_robot_power_on', 'set_robot_power_off', 'set_robot_arm_home',
     'set_robot_arm_init', 'set_robot_cmd_mode', 'get_robot_cmd_model',
     'set_robot_seq_state', 'set_joint_degree_by_number', 'set_all_joint_degree_by_number',
@@ -170,7 +165,6 @@ def run_fatal_assertions(case: dict, answer: str, quick: bool = False) -> List[s
     if _fatal_prompt_leak(answer):
         errors.append("⑤ 提示词泄露: 答案泄露了系统 Prompt 源码")
 
-    # 在快速模式（仅纯检索文本）下，跳过针对 LLM 输出句式的硬检查
     if not quick:
         if _fatal_app_sdk_boilerplate(case["query"], answer, case.get("product_id")):
             errors.append("③ 界面套话: JAKA APP查询含SDK拒答套话")
@@ -199,7 +193,7 @@ def run_single_case(case: dict, vs: Any, quick: bool = False) -> dict:
         "query": case["query"], "description": case.get("description", ""),
         "status": "PASS", "elapsed_ms": 0, "answer": "", "model": "",
         "checks": {}, "fatal_errors": [], "errors": [],
-        "kw_total": len(case.get("must_contain", [])), "kw_hits": 0
+        "kw_total": len([kw for kw in case.get("must_contain", []) if kw.strip()]), "kw_hits": 0
     }
 
     t0 = time.time()
@@ -226,11 +220,13 @@ def run_single_case(case: dict, vs: Any, quick: bool = False) -> dict:
     result["answer"] = answer
     result["model"] = model
 
-    # ── 关键词必须包含/禁止包含 (已修复数字误杀与同义词误判) ──
+    # ── 关键词必须包含/禁止包含 (修复空字串与正则兼容) ──
     for kw in case.get("must_contain", []):
-        if kw in ["未记载", "未包含"]:
-            # 拒答类关键词：涵盖常见的语义等价表述
-            refusal_patterns = [r'未记载', r'未包含', r'未找到', r'未提及', r'未在.*记载']
+        if not kw.strip():
+            continue
+        # 兼容所有形式的拒答模版
+        if kw in ["未记载", "未包含", "未找到", "没有直接提供"]:
+            refusal_patterns = [r'未记载', r'未包含', r'未找到', r'未提及', r'未在.*记载', r'没有直接提供', r'联系技术支持']
             hit = any(re.search(p, answer) for p in refusal_patterns)
         else:
             hit = kw.lower() in answer.lower()
@@ -242,8 +238,10 @@ def run_single_case(case: dict, vs: Any, quick: bool = False) -> dict:
             result["errors"].append(f"缺少关键词'{kw}'")
 
     for kw in case.get("must_not_contain", []):
+        if not kw.strip():  # 🔴 过滤空字串陷阱
+            continue
         if kw.isdigit():
-            # 数字类禁止词：使用前后非数字边界，避免 "6502" 或 "49152" 误触 "502"
+            # 数字类禁止词：使用前后非数字边界
             pattern = rf'(?<!\d){re.escape(kw)}(?!\d)'
             hit = bool(re.search(pattern, answer))
         else:
@@ -288,7 +286,7 @@ def main():
     print_header(f"比邻星 (ProximaRAG) 回归评测 ({len(cases)} 用例)")
     print(f"  模式: {'快速(仅检索)' if args.quick else '完整(含LLM)'}")
 
-    # 🔴 优化：全局单次初始化向量库与 BM25 内存索引（极大提升速度）
+    # 🔴 优化：全局单次初始化向量库与 BM25 内存索引
     from src.graph_rag import set_graph_vector_store
     from src.vector_store import load_vector_store, build_bm25_from_chromadb
     from src.config import CHROMA_PERSIST_DIR

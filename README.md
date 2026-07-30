@@ -1,108 +1,141 @@
 # 📰 比邻星 (ProximaRAG) — 湖南比邻星科技文档智能问答系统
 
-基于 **RAG（Retrieval-Augmented Generation）** 架构的官方技术文档与使用手册智能问答系统。专为**湖南比邻星科技有限公司**的开发者和用户打造，采用双 A100 GPU 算力底座，底层搭载 **vLLM + 开源大模型**实现完全私有化、低延迟的本地推理。
+基于 **RAG（Retrieval-Augmented Generation）** 架构的官方技术文档与使用手册智能问答系统。专为**湖南比邻星科技有限公司**的开发者与用户打造，采用双 A100 GPU 算力底座，底层搭载 **vLLM + Qwen2.5-7B-Instruct-AWQ** 实现完全私有化、低延迟的本地推理。
 
 ---
 
-## 🚀 核心特性
+## 🏛️ RAG 四层系统架构
 
-### 🤖 智能推理引擎
-- **四层金字塔容灾**：本地 vLLM → 智谱 GLM-4.7-Flash 云端 API → 智能结构化纯检索直出（行级归一化去重）→ 优雅错误提示，极端故障下仍可服务。
-- **显卡智能自适应部署**：`start_services.sh` 通过 `nvidia-smi` 实时扫描所有 GPU 空闲显存，自动绑定剩余空间最大的 GPU，避免硬编码导致的 OOM 崩溃。`detect_best_gpu()` 函数的 stdout/stderr 已严格隔离，杜绝日志污染变量。
-- **毫秒级流式秒回**：FastAPI SSE 异步非阻塞线程池隔离 + 前端 50ms 节流渲染，LLM 读取超时激进缩短至 12s。
+比邻星 (ProximaRAG) 遵循工业级 RAG 四层架构设计：
 
-### 🔍 智能检索优化（ADR-7/ADR-8）
-- **中文专优嵌入**（`BAAI/bge-small-zh-v1.5`）：512 维中文语义向量，精准匹配中文技术查询与 C 函数名。
-- **BM25 + Vector 混合检索**：Dense 向量召回 (bge 语义) + Sparse BM25 关键词召回 (jieba 分词 + 正则标识符保护) → RRF (Reciprocal Rank Fusion) 融合排序。
-- **Autocut 动态截断**（`_autocut_knee`）：基于 RRF 分数断崖/跳变点 (Knee Point) 检测，自适应确定最佳截断位置 [2, 8]。
-- **C 函数 Header Injection**（`[Functions: xxx]`）：切片头部自动注入所含函数名，极大增强 Dense/Sparse 检索敏感度。
-- **Query 预处理**（`_preprocess_query`）：多层迭代剥离口语化噪音（25+ 模式）。
-- **产品级物理隔离**（ADR-6）：入库自动打标 → 检索 `where={"product_id":"OpenR6"}` → 未指定时主动反问。
-
-### 🧠 智能上下文扩展与防幻觉（ADR-9 ~ ADR-17）
-- **双轨制文档隔离与路由**（ADR-17）：JAKA(gui_app) / OpenC3&OpenR6(c_sdk) 双轨分治 — GUI 轨绝对禁止代码，SDK 轨 API 即答案 + 字面强锚定。
-- **SDK Header Dependency Injection**：自动提取 CDLL 加载 + POSE/Joint 结构体 → 挂载至每个 API Child 切片顶部。
-- **C-SDK 切片元数据净化**（v18）：代码注释拦截（8 特征词上下文校验）+ 伪标题黑名单（10 项）+ 父级 H2 标题自动继承 + Golden TOC 目录树预留回退。杜绝 `section_title` 被 Python 注释（`# 时间等待3秒`）污染。
-- **1 API = 1 Chunk 原子切分**（v18）：状态机仅匹配 `数字标题` + `函数名称/函数说明` 两类可验证边界，Micro-Chunk Auto-Merge 碎片缝合。API 切片绝不跨函数粘连。
-- **HyDE 假想文档生成**：7B 轻量调用生成假想技术文档片段增强向量检索语义密度。SDK 轨道产品级硬禁用（OpenC3/OpenR6 直接跳过）。
-- **LangGraph v3 Plan-Execute-Synthesize**（ADR-14）+ **v4 标题树切分**（ADR-15）：47P + 574C，102 API 原子块。
-- **多模态 OCR + 面包屑注入**（ADR-16）+ **PDF 连字清洗** + **原始大小写保留**。
-- **8 项硬断言**：JSON泄露 / 重复检查 / 界面套话 / 函数签名 / 提示词泄露 / API幻觉 / 零脑补 / 代码截断。
-- **SDK 重试硬熔断** + **SemanticDedup** + **安全注入防御** (中英文双防护)。
-- **ABSTAIN 硬弃答网关**: Context 中实体缺失时直接返回诚实拒答，零 LLM 调用（26ms）。
-- **Contextual Prefixing**: 每个切片注入 `[文档: X | 章节: Y]` 前缀，从物理切片源头隔离参数概念。
-- **父子切片上下文扩展**（Parent-Child Chunking）：检索命中子切片时，自动按章节 ID 捞取同章节兄弟切片，补充完整流程上下文，彻底解决 TCP 四点法、关机步骤等长流程因截断导致总结不完整的问题。
-- **柔性 Grounding 提示**：动态检测 query 中含数字请求（密码/端口/IP），若 Context 中无具体数值则自动追加诚实提示，引导模型明确告知"文档未记载"而非猜测 `admin`、`502` 等通用默认值。
-- **多轮对话 Citation 前缀清洗**：剥离 chat_history 中助理回复的章节溯源长前缀（`根据《X》第 Y.Z 节【...】`），防止后续轮次复读背景幻觉。
-- **章节标题自动注入切片**（`[章节: 2.2.4.3 版本升级]`）：PDF 解析阶段自动识别 5 类标题模式（编号型/章型/中文序号型/Markdown # 型/装饰符型）并注入切片头部，大幅提升向量检索对章节关键词的召回率。
-- **文档术语自动提取**（`_auto_extract_and_register_terms`）：BM25 构建时自动扫描章节标题、表格表头、英文缩写、SDK 函数名，批量注册到 jieba 分词词典（零人工维护）。
-- **Context Token 预算控制**：3 切片 × 200 字符截断 + `max_tokens=384`，确保总请求 ≤ 3584 + 384 < 4096 vLLM 硬限制。
-
-### 🔒 企业级安全与稳定性
-- **全栈输入防御**：防路径遍历（`sanitize_filename`）、Null 字节与控制字符清洗（`sanitize_query`）、Prompt 注入过滤（`_contains_injection_pattern`）、历史消息角色白名单（`validate_chat_history`）。
-- **滑动窗口记忆**：多轮对话最多保留 3 轮历史，防止上下文超出 4096 Token 限制。
-- **全链路异常自动降级**：覆盖 9 种故障场景（含 SSE 客户端断开），OOM/超时/限流自动跌落至纯检索直出。
-- **资源泄露防范**：`shutdown_clients()` 释放 LLM 连接池 + `cleanup_vector_store()` 释放嵌入模型显存，FastAPI `shutdown` 事件自动触发。
-
-### 🎨 现代化 Web 体验
-- **比邻星 (ProximaRAG)** 科技蓝深色主题，双栏布局（对话 + 上传/状态面板）。
-- SSE 流式打字机效果 + Markdown 实时渲染 + `highlight.js` 代码高亮。
-
----
-
-## 📁 项目目录结构
-
-```text
-rag_project/
-├── src/
-│   ├── config.py              # 全局配置中心 + GPU 智能探测 API
-│   ├── agent_state.py         # LangGraph v3 RAGState（21 字段，PES 架构）
-│   ├── graph_rag.py           # LangGraph v3 状态图引擎（9 节点 + 5 条件边）
-│   ├── attribute_tool.py      # 动态属性意图工具（v3，LLM 提取 + BM25 搜索）
-│   ├── kv_extractor.py        # 离线 KV 属性提取器（phase-out 中）
-│   ├── pdf_loader.py          # v4 PDF 加载器（API 原子切分 + OCR 注入 + Parent-Child）
-│   ├── pdf_loader.py          # PDF 解析与递归字符级文本分块
-│   ├── vector_store.py        # ChromaDB 向量库（HF→ONNX 双轨嵌入）
-│   ├── multimodal_loader.py   # 多模态解析（PyMuPDF + pdfplumber 表格→Markdown）
-│   ├── attribute_tool.py      # 动态属性意图工具（v3）
-│   ├── kv_extractor.py        # 离线 KV 属性提取器
-│   ├── rebuild_v4.py          # v4 向量库重建脚本
-│   └── rag_chain.py           # RAG 四层容灾 + 混合检索 + 口语化预处理 + 安全防御
-├── templates/
-│   └── index.html             # 比邻星 聊天与文档交互主页面
-├── static/
-│   ├── style.css              # 科技蓝深色主题样式
-│   └── app.js                 # SSE 流式通信 + 50ms 节流渲染
-├── data/                      # 用户上传的 PDF 文档目录
-├── vector_db/                 # ChromaDB 向量数据持久化目录
-├── app.py                     # FastAPI 异步应用入口（含安全中间件）
-├── tunnel.py                  # ngrok 公网穿透脚本
-├── check_status.py            # 统一服务健康检查（GPU 实时监测）
-├── start_services.sh          # 一键自适应启动脚本（GPU 智能选择）
-├── tests/
-│   ├── eval_cases.json        # 统一评测用例集 v4.3（30 用例）
-│   ├── run_eval.py            # 统一评测运行器
-│   └── TEST_REPORT.md         # 评测报告归档
-├── test_stability.py          # 多轮对话 + 并发 + 异常降级压力测试
-├── dev_log.md                 # 完整开发与迭代演进日志（20 章）
-├── CLAUDE.md                  # AI 协同开发规范与系统红线
-└── README.md                  # 本文件
+```
+                            ┌──────────────────────────────┐
+                            │   FastAPI Gateway (:8000)     │
+                            │ (输入清洗 / 路径防御 / SSE)   │
+                            └─────────────┬────────────────┘
+                                          │
+              ┌───────────────────────────┼───────────────────────────┐
+              │                           │                           │
+              ▼                           ▼                           ▼
+┌─────────────────────────┐ ┌─────────────────────────┐ ┌─────────────────────────┐
+│  L1: 数据摄入与切片层    │ │  L2: 检索与重排层        │ │  L3: 上下文组装与指令层   │
+│                         │ │                         │ │                         │
+│ • PDF 通用文本提取      │ │ • Dense 向量 (bge-zh)   │ │ • System Prompt 210行   │
+│ • 7 步 PDF 文本清洗     │ │ • Sparse BM25 (jieba)   │ │ • 双轨制 Prompt 前缀     │
+│ • 5 类标题模式识别      │ │ • RRF 四大提权引擎      │ │ • 反跨产品泄露门控       │
+│ • 代码注释拦截 (8特征词) │ │ • Autocut 断崖动态截断   │ │ • Context Cap 整块剔除   │
+│ • 伪标题黑名单 (10项)   │ │ • HyDE 防毒化 (SDK禁用) │ │ • 历史沉渣净化 + 滑动窗口 │
+│ • Parent-Child 双层索引 │ │ • 三层保底召回机制       │ │ • 柔性 Grounding 提示     │
+│ • SDK 状态机 API 原子块 │ │ • 代码实体 BM25 3倍写入  │ │ • 父子结构化组装          │
+│ • 4 级 Title Fallback   │ │ • 产品级物理隔离 (where) │ │ • SDK Header 单次注入     │
+│ • OCR 图片文本归位      │ │                         │ │                         │
+└────────────┬────────────┘ └────────────┬────────────┘ └────────────┬────────────┘
+             │                           │                           │
+             └───────────────────────────┼───────────────────────────┘
+                                         │
+                                         ▼
+┌────────────────────────────────────────────────────────────────────────────────┐
+│  L4: 生成控制与后处理层                                                         │
+│                                                                                │
+│  ┌─────────────────┐  ┌──────────────────┐  ┌─────────────────┐  ┌───────────┐ │
+│  │ 四层容灾金字塔   │  │ SDK 自纠错回路   │  │ 静默斩尾         │  │ 属性词    │ │
+│  │ L1 vLLM → L2 智谱│  │ (set_前缀/CDLL/  │  │ _strip_hedging_  │  │ 硬改写    │ │
+│  │ → L3 直出 → L4   │  │  argtypes)       │  │ tail()           │  │ Extract   │ │
+│  │ 硬拒答           │  │ 硬熔断 retry≤2   │  │ 8 模式正则       │  │ Align     │ │
+│  └─────────────────┘  └──────────────────┘  └─────────────────┘  └───────────┘ │
+└────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+### L1 — 数据摄入与切片层 (pdf_loader.py, ~1938 行)
+
+**处理流程**: `PDF 文件` → `_v4_extract_text_universal()` (PyMuPDF + OCR 归位) → `_clean_pdf_text()` (7 步清洗) → `_v4_build_parent_child_docs()` (标题树切分 + 双层索引)
+
+| 能力 | 实现 | 说明 |
+|------|------|------|
+| 标题识别 | `_v4_extract_headings()` 5 类模式 | 数字编号/中文章节/Markdown #/中文序号/装饰符 |
+| 代码注释拦截 | ±120 字符窗口 + 8 特征词校验 | 防止 `# 时间等待3秒` 提权为 Heading |
+| 伪标题黑名单 | `_PSEUDO_SECTION_BLACKLIST` frozenset 10 项 | 触发后自动继承父级 H2 标题 |
+| API 原子块 | `_v4_parse_sdk_state_machine()` 状态机 | 仅 `数字标题` + `函数名称/函数说明` 两类可验证边界 |
+| 微碎片缝合 | Micro-Chunk Auto-Merge (≥60ch 或含代码 → 提交) | API 排他锁：不同函数名不合并 |
+| 骨架过滤 | `_is_skeleton_chunk()` | <150ch + 无代码 + 无实质参数 → 丢弃 |
+| Parent-Child | H2 章节级 Parent(1000ch) + H3/H4 函数级 Child(400ch) | 标题树驱动，零厂商硬正则 |
+| Title Fallback | 4 级链 | L1 状态机标题 → L2 面包屑 → L3 父级 H2 → L4 硬兜底 |
+| PDF 清洗 | 7 步 `_clean_pdf_text()` | Unicode 连字/括号空格/下划线归一化/I/O 修复/边界错位/表格竖线/JAKA 版式 |
+
+### L2 — 检索与重排层 (rag_chain.py + vector_store.py)
+
+**处理流程**: `Query` → `_preprocess_query()` (口语剥离) → `_normalize_punctuation()` → `_generate_hyde_doc()` (SDK 轨禁用) → `_hybrid_retrieve()` (向量 + BM25 + RRF + Autocut)
+
+| 能力 | 实现 | 说明 |
+|------|------|------|
+| 向量检索 | ChromaDB cosine (bge-small-zh-v1.5, 512维) | 候选池放大 fetch_factor=5×, SDK 查询 8× |
+| BM25 检索 | jieba + 标识符保护 + jieba 自定义词典 | snake_case 函数名不被切碎 |
+| RRF 融合 | K=60, BM25 weight=1.2× | 四大提权引擎同时生效 |
+| 实体锚点提权 | Entity Anchor Boost (+0.05) | Query 中的数字/协议名/动作词精确匹配 |
+| 函数名提权 | Function Names Boost (+0.08) | metadata function_names 与 query 代码实体模糊匹配 |
+| 文本平衡 | Text-Chunk Rebalance (+0.03) | 纯文本切片在 RRF 中不被代码切片完全压制 |
+| 代码实体三倍写入 | `[CODE:xxx]` → BM25 tokens ×3 | 等效 Boost=3.0，对抗 Dense Vector 盲区 |
+| Autocut | `_autocut_knee()` 断崖检测 | 找 RRF 分数相邻差值最大点 (Knee Point) |
+| 保底召回 | 三层防护 | 阈值 0→原始 Top-3 / 噪声全杀→kept_docs 恢复 / 最终空→BM25 第二机会 |
+| 产品隔离 | ChromaDB `where={"product_id":"xxx"}` | 入库打标 + 检索物理隔离 + 未指定时 Search-First 软路由 |
+| 跨产品检索 | `cross_product_retrieval_node` 全库并行 | 多产品拆分 + 交错合并 |
+| HyDE 防毒化 | 3 条 skip 条件 | 短 Query/非技术符号/精确 API 签名 → 禁用 |
+
+### L3 — 上下文组装与指令层 (rag_chain.py `_build_messages` + `RAG_SYSTEM_PROMPT`)
+
+| 能力 | 实现 | 说明 |
+|------|------|------|
+| 双轨制 Prompt | c_sdk (API 即答案) / gui_app (步骤列表,禁止代码) | `_resolve_doc_type()` 根据 product_id 自动分轨 |
+| 首句 Python 锚定 | `_dual_track_prefix` f-string 提取真实 source+section | 消除 LLM 编造章节引用 |
+| 反跨产品泄露 | `_anti_bleed_prefix` metadata + 正文双重确认 | 仅目标产品缺失 API 且非目标产品泄露时注入 |
+| Context Cap | 非SDK 4000 / SDK 8000 字符整块剔除 | Parent 背景优先丢弃 |
+| SDK Header 注入 | 单次挂载到 Context 顶部 | CDLL 加载 + POSE/Joint 结构体 |
+| 滑动窗口 | `MAX_HISTORY_TURNS=2` (4 条消息) | 超限自动裁剪至最近 2 轮 |
+| 历史净化 | `sanitize_chat_history()` 5 步清洗 | Citation 剥离/代码块替换/拒答过滤/尾部套话擦除/注入检测 |
+| 柔性 Grounding | `_NUMERIC_QUERY_RE` 动态检测 | Context 无数值 → 追加诚实提示 |
+| 父子结构化组装 | Child【精确定位小节】优先 + Parent【章节背景】附后 | 确保 LLM 先读精确定位再读章节背景 |
+
+### L4 — 生成控制与后处理层 (graph_rag.py 后处理节点 + rag_chain.py LLM 调用)
+
+| 能力 | 实现 | 说明 |
+|------|------|------|
+| 四层容灾金字塔 | L1 本地 vLLM → L2 智谱 API → L3 纯检索直出 → L4 硬拒答 | 每层独立 try/except + NEVER-EMPTY 保证 |
+| 静默斩尾 | `_strip_hedging_tail()` 8 模式 | "上述代码假设存在"/"参考文档未包含详细步骤"等 |
+| 属性词硬改写 | `extract_align_node` 50+ 领域词库 | 数值前后 12+8 字符窗口 + Context 原词强制覆盖 |
+| SDK 自纠错 | `sdk_verify_node` → `llm_generation` 回环 | set_前缀/CDLL/argtypes 检测 + 硬熔断 retry≤2 |
+| 代码块闭合 | `_fix_and_close_sdk_code()` | Markdown ``` 自动闭合 + CDLL 智能补全 |
+| SemanticDedup | trigram overlap > 0.55 截断 | 消除 1.5B 小模型段落重复 |
+| 流式输出 | SSE async/await + bounded queue(256) | 线程池隔离 + 客户端断开取消保护 |
+| Temperature | 非流式 0.2 / 流式 0.01 | 代码生成近确定性输出 |
+
 ---
 
-## ⚙️ 系统环境与约束
+## ⚙️ 系统环境与配置
 
-| 项目 | 说明 |
-|------|------|
+| 项目 | 值 |
+|------|-----|
 | **硬件底座** | 2 × NVIDIA A100-PCIE-40GB（CUDA 12.4） |
 | **环境管理器** | Conda（`rag_agent`，Python 3.10） |
-| **推理引擎** | vLLM 0.16.0（OpenAI 兼容 API，端口 **8001**） |
-| **默认模型** | `Qwen/Qwen2.5-7B-Instruct-AWQ`（4-bit ~8 GB，GPU 自适应部署）|
-| **云端降级** | 智谱 GLM-4.7-Flash（免费模型，`open.bigmodel.cn`） |
-| **嵌入模型** | `BAAI/bge-small-zh-v1.5`（512 维，中文专优）→ ONNX 自动回退 |
-| **相似度阈值** | 0.68（cosine distance，配合 BM25+RRF 混合检索） |
-| **Web 框架** | FastAPI + Jinja2（API `7860`/前端 UI `8501`） |
+| **推理引擎** | vLLM 0.16.0 @ 端口 **8001** |
+| **默认模型** | `Qwen/Qwen2.5-7B-Instruct-AWQ` (4-bit ~8 GB) |
+| **云端降级** | 智谱 GLM-4.7-Flash (`open.bigmodel.cn`) |
+| **嵌入模型** | `BAAI/bge-small-zh-v1.5` (512 维，中文专优) → ONNX 自动回退 |
+| **Web 框架** | FastAPI (`8000`) + Jinja2 + 前端 UI (`8501`) |
+| **当前向量库** | 120 Parent + 376 Child = **496 chunks** (v4 dual index) |
+
+### 关键配置参数
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `RETRIEVAL_K` | 10 | 单次检索召回数 |
+| `SIMILARITY_THRESHOLD` | 0.68 | Cosine 距离阈值 |
+| `_AUTOCUT_MIN_K` | 4 (SDK: 6) | Autocut 硬下限 |
+| `_AUTOCUT_MAX_K` | 10 | Autocut 硬上限 |
+| `_MAX_CONTEXT_CHARS` | 4000 / 8000 (SDK) | Context 字符 Cap |
+| `max_tokens` | 1024 | LLM 最大输出 |
+| `MAX_HISTORY_TURNS` | 2 | 滑动窗口轮数 |
+| `CHILD_CHUNK_SIZE` | 400 | 子层切片 |
+| `PARENT_CHUNK_SIZE` | 1000 | 父层切片 |
 
 **🔴 核心锁定依赖（严禁升级）**：
 - `torch==2.6.0+cu124` / `torchvision==0.21.0+cu124` / `torchaudio==2.6.0+cu124`
@@ -111,48 +144,35 @@ rag_project/
 
 ---
 
-## 🚀 部署与启动指南
+## 🚀 部署与启动
 
 ### 1. 准备文档
 
-将湖南比邻星科技有限公司的开发文档、API 规范或产品使用手册（PDF 格式）放入 **`data/`** 目录。
+将 PDF 文档放入 **`data/`** 目录。
 
 ### 2. 一键启动（推荐）
 
 ```bash
 chmod +x start_services.sh
 
-# 完整启动（智能 GPU 检测 → vLLM → FastAPI）
-./start_services.sh
-
-# 仅启动 vLLM 推理服务
-./start_services.sh --vllm-only
-
-# 仅启动 FastAPI 后端（vLLM 已运行）
-./start_services.sh --fastapi-only
-
-# 手动指定 GPU（覆盖自动检测）
-./start_services.sh --gpu 0
+./start_services.sh                    # 完整启动 (GPU 智能检测 → vLLM → FastAPI)
+./start_services.sh --vllm-only        # 仅 vLLM
+./start_services.sh --fastapi-only     # 仅 FastAPI
+./start_services.sh --gpu 0            # 手动指定 GPU
 ```
 
-### 3. 手动启动（终端 A + B）
+### 3. 手动启动
 
 **终端 A — vLLM 推理服务**：
 ```bash
 conda activate rag_agent
-export HF_ENDPOINT=https://hf-mirror.com
-export PYTHONUNBUFFERED=1
 CUDA_VISIBLE_DEVICES=1 python -m vllm.entrypoints.openai.api_server \
-    --model Qwen/Qwen2.5-1.5B-Instruct \
-    --served-model-name Qwen/Qwen2.5-1.5B-Instruct \
-    --max-model-len 4096 \
-    --port 8001 \
-    --gpu-memory-utilization 0.20 \
-    --trust-remote-code \
-    --enforce-eager
+    --model Qwen/Qwen2.5-7B-Instruct-AWQ \
+    --port 8001 --gpu-memory-utilization 0.25 \
+    --max-model-len 8192 --enforce-eager --quantization awq
 ```
 
-**终端 B — 比邻星 (ProximaRAG) FastAPI 后端 (端口 7860)**：
+**终端 B — 比邻星 FastAPI 后端**：
 ```bash
 conda activate rag_agent
 export HF_ENDPOINT=https://hf-mirror.com
@@ -160,239 +180,99 @@ export HF_HUB_OFFLINE=1
 python app.py
 ```
 
-**终端 C — 前端 UI (端口 8501)**：
+**终端 C — 前端 UI**：
 ```bash
 conda activate rag_agent
 python frontend_server.py
 ```
 
-访问：**`http://localhost:8501`**（页面标题：**比邻星**）｜API 文档：`http://localhost:7860/docs`
+访问：**`http://localhost:8501`** | API 文档：`http://localhost:8000/docs`
 
-### 4. 外网端口映射
-
-| 服务 | 内部端口 | 外部端口 | 外部访问 URL |
-|------|---------|---------|-------------|
-| FastAPI 后端 | 7860 | 50003 | `http://<服务器IP>:50003` |
-| 前端 UI | 8501 | 50004 | `http://<服务器IP>:50004` |
-| vLLM 推理 | 8001 | — | 仅内网 |
-
-### 5. 一键停止所有服务
+### 4. v4 向量库重建
 
 ```bash
-fuser -k 7860/tcp 2>/dev/null   # 停止 FastAPI
-fuser -k 8501/tcp 2>/dev/null   # 停止前端
-pkill -f "vllm.entrypoints" 2>/dev/null  # 停止 vLLM
+# 全量重建 (物理清空旧库 → 重新解析所有 PDF → 创建双索引)
+conda run -n rag_agent python rebuild_v4.py
+
+# 增量上传 (MD5 去重 + 级联清理旧数据 → 仅处理新/更新的 PDF)
+curl -X POST -F "file=@your_document.pdf" http://localhost:8000/api/upload
+```
+
+`rebuild_v4.py` 流程：
+1. **物理隔离**: `shutil.rmtree(CHROMA_PERSIST_DIR)` 彻底清除旧 SQLite/Parquet
+2. **文档解析**: `load_pdfs_v4_dual()` Parent-Child 双层构建
+3. **手动嵌入**: SentenceTransformer 本地 batch=64，无 ONNX 下载
+4. **原生写入**: ChromaDB `collection.add(embeddings=precomputed)`，网络免疫
+5. **BM25 同步**: jieba 分词 + 标识符保护 + 术语自动注册
+
+### 5. 一键停止
+
+```bash
+fuser -k 8000/tcp 2>/dev/null    # FastAPI
+fuser -k 8501/tcp 2>/dev/null    # 前端
+pkill -f "vllm.entrypoints"      # vLLM
 ```
 
 ### 6. 系统健康检查
 
 ```bash
 python check_status.py                # 一次性完整报告
-python check_status.py --watch 10     # 每 10 秒自动刷新
-```
+python check_status.py --watch 10     # 每 10 秒刷新
 
-### 6. 环境变量覆盖
-
-```bash
-export LLM_BASE_URL="http://localhost:8001/v1"           # 本地 vLLM
-export LLM_MODEL_NAME="Qwen/Qwen2.5-1.5B-Instruct"
-export VLLM_GPU_ID=0                                      # 手动指定 GPU
+# 切片健康度审计
+python audit_chunks.py
 ```
 
 ---
 
 ## 🧪 自动化测试
 
-**统一评测入口**: `python tests/run_eval.py --verbose`（30 用例）
+**统一评测入口**: `python tests/run_eval.py --verbose`（30 用例，8 硬断言）
 
 | 脚本 | 覆盖范围 | 命令 |
 |------|---------|------|
-| `tests/run_eval.py` | 30 用例 (GT + SDK 函数 + 安全注入 + 多轮指代 + 错别字容错 + 多文档对比) | `python tests/run_eval.py --verbose` |
+| `tests/run_eval.py` | 30 用例 (GT + SDK 函数 + 安全注入 + 多轮指代 + 错别字容错) | `python tests/run_eval.py --verbose` |
 | `test_stability.py` | 多轮对话 + 并发保护 + 7 种异常降级 | `python test_stability.py` |
+| `audit_chunks.py` | 切片 8 维健康度审计 (骨架/粘连/标题/OCR/碎片/面包屑/SDK/倒挂) | `python audit_chunks.py` |
 
-📊 **最新评测** (v17 管道重构, 7B-AWQ): `tests/TEST_REPORT.md`
-Health Score **91.8** 🏆 · Search-First 软路由 · 首句 Python 确定性锚定 · 反问零占位符
+📊 **最新评测** (v21, 7B-AWQ, 496 chunks): 切片健康度 **近满分** (8 项指标 7 项零缺陷, 仅 1 骨架块) · Multi-API Sticky 0 · Corrupted Title 0 · OCR Artifacts 0 · SDK 碎化 0 · AST Collapse 0
 
 ---
 
-## 📡 API 接口文档
+## 📡 API 接口
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| `GET` | `/` | 渲染 **比邻星 (ProximaRAG)** 主页面 |
-| `POST` | `/api/chat` | RAG 对话（SSE 流式）。参数：`query`（必填）、`history`（可选 JSON）、`stream`（默认 true） |
-| `POST` | `/api/upload` | 上传 PDF 并自动重建向量库 |
-| `GET` | `/api/status` | 返回向量库就绪状态与已索引文档片段数 |
+| `GET` | `/` | 渲染 比邻星 (ProximaRAG) 主页面 |
+| `POST` | `/api/chat` | RAG 对话 (SSE 流式)。`query`(必填) / `history`(JSON可选) / `stream`(默认true) / `product_id`(可选) |
+| `POST` | `/api/upload` | 上传 PDF 并增量更新向量库 (MD5 去重 + 级联清理) |
+| `GET` | `/api/status` | 向量库就绪状态与文档片段数 |
+| `GET` | `/api/products` | 已入库产品 ID 列表 |
+| `GET` | `/api/debug/inspect_chunks` | 切片检查器 (按产品/关键词过滤) |
+| `POST` | `/api/debug/retrieve` | 检索沙盒 (不调 LLM，仅输出管线中间结果) |
 
----
+### 外网端口映射
 
-## 📝 开发与排错日志
+| 服务 | 内部端口 | 外部端口 |
+|------|---------|---------|
+| FastAPI 后端 | 8000 | 50003 |
+| 前端 UI | 8501 | 50004 |
+| vLLM 推理 | 8001 | 仅内网 |
 
-有关环境排查、兼容补丁、四层容灾、GPU 自适应、安全加固、混合检索、人类模拟测试等 20 个章节的详细开发记录与架构决策（ADR），请参阅 [dev_log.md](./dev_log.md)。
+### 环境变量覆盖
 
-经过从 2026-07-20 到 07-24 的多轮迭代，比邻星 (ProximaRAG) 已经从早期的”单向线性 RAG 管道”**完全演进为**基于 LangGraph 的”Plan-Execute-Synthesize + Extract-Render”确定性 Agent 状态图架构。
-
-系统彻底废弃了针对特定数字/函数的硬编码补丁，形成了具备**高容灾、多产品隔离、语义精准对齐与确定性代码生成**的产品级 RAG 架构。
-
----
-
-## 🏛️ 升级后系统整体架构拓扑
-
-整体架构分为**接入防护层**、**LangGraph 智能调度控制层**、**双轨混合检索层**、**确定性渲染层**与**四层金字塔容灾底座**。
-
-```
-                              ┌──────────────────────────────────┐
-                              │  前端 WebUI / FastAPI Gateway    │
-                              │ (输入清洗 / 路径防御 / SSE 异步) │
-                              └────────────────┬─────────────────┘
-                                               │
-                                               ▼
-                              ┌──────────────────────────────────┐
-                              │    第 0 步：Product Router       │
-                              │ (产品意图识别 / 未指定主动反问)  │
-                              └────────────────┬─────────────────┘
-                                               │
-                                               ▼
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│                        LangGraph 状态图引擎 (RAGState v3.0)                             │
-│                                                                                        │
-│  ┌──────────────────────┐    ┌───────────────────────┐    ┌──────────────────────────┐ │
-│  │  Sub-Goal Planner    │ ──►│    ABSTAIN Gateway    │ ──►│   Hybrid Retrieval Node  │ │
-│  │ (Map-Reduce 多产品)  │    │  (Context缺失硬弃答)   │    │  (Dense+BM25+Autocut)    │ │
-│  └──────────────────────┘    └───────────────────────┘    └────────────┬─────────────┘ │
-│                                                                        │               │
-│  ┌──────────────────────┐    ┌───────────────────────┐                 │               │
-│  │ Extract-Render Node  │◄───│  llm_generation_node  │◄────────────────┘               │
-│  │(确定性代码/步骤渲染) │    │  (小模型结构化 JSON)  │                                 │
-│  └──────────┬───────────┘    └───────────┬───────────┘                                 │
-│             │                            │ (SDK代码校验失败)                            │
-│             │                            ▼                                             │
-│             │                ┌───────────────────────┐                                 │
-│             │                │    SDK_VerifyNode     │ ──► (回环重试 max_retries=2)     │
-│             │                │  (前缀/CDLL/参数自纠) │                                 │
-│             │                └───────────┬───────────┘                                 │
-│             │                            │                                             │
-│             ▼                            ▼                                             │
-│  ┌───────────────────────────────────────────────────┐                                 │
-│  │                 ExtractAlignNode                  │                                 │
-│  │      (通用物理属性词与数值对齐 / 防属性词颠倒)     │                                 │
-│  └───────────────────────────┬───────────────────────┘                                 │
-└──────────────────────────────┼─────────────────────────────────────────────────────────┘
-                               │
-                               ▼
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│                             四层金字塔容灾底座 (Failover)                               │
-│  ┌───────────────────┐  ┌────────────────────┐  ┌──────────────────┐  ┌──────────────┐ │
-│  │ Layer 1: 本地vLLM │─►│ Layer 2: 云端 API  │─►│ Layer 3: 结构化  │─►│ Layer 4: 503 │ │
-│  │  (GPU 智能选择)   │  │ (GLM-4.7-Flash)    │  │ CPU 直出模式     │  │ 友好错误提示 │ │
-│  └───────────────────┘  └────────────────────┘  └──────────────────┘  └──────────────┘ │
-└────────────────────────────────────────────────────────────────────────────────────────┘
-
+```bash
+export LLM_BASE_URL="http://localhost:8001/v1"
+export LLM_MODEL_NAME="Qwen/Qwen2.5-7B-Instruct-AWQ"
+export VLLM_GPU_ID=0
+export ZHIPU_API_KEY="your-key-here"
 ```
 
 ---
 
-## 🧩 核心模块与架构升级细节
+## 📝 开发日志与架构审计
 
-### 1. 核心控制层：LangGraph 状态图与 Agent 工作流
-
-系统核心调度完全基于 `LangGraph` 状态图（`RAGState` 扩展至 14 个控制字段），实现逻辑剥离与决策可逆：
-
-* **Product Router (第 0 步路由)**：
-根据 `PRODUCT_ROUTER_RULES` 自动匹配用户 Query 意图。若未提及产品，不盲目全库搜索，而是触发 `_build_clarification_response()` 主动反问澄清。
-* **Sub-Goal Planner (Map-Reduce 规划器)**：
-当识别到跨产品对比（如 OpenC3 与 OpenR6 对比）时，自动将 Query 拆解为平行子目标，并行触发单库检索后再进行交错融合（Reduce）。
-* **ABSTAIN Gateway (硬弃答网关)**：
-当 Query 中包含的实体在 Context 中完全不存在时，直接触发硬弃答，零开销拦截幻觉，不调用 LLM。
-* **Extract-Render 两层分离架构 (ADR-12)**：
-* **抽取层**：System Prompt 约束 LLM 仅输出结构化 JSON 提取块（包含函数名、参数、步骤原文）。
-* **确定性渲染层**：由 Python 渲染器通过代码模板渲染 Python ctypes 代码、编号步骤与出处引用。避免 1.5B 小模型在自由文本生成时语法错乱。
-
-
-* **后处理自纠错环路 (ADR-11)**：
-* **`SDK_VerifyNode`**：自动扫描生成代码中的 `set_` 前缀缺失、CDLL 加载缺失与 `.argtypes` 声明缺失。未通过时带反馈触发 `llm_generation` 重试（最多 2 次）。
-* **`ExtractAlignNode`**：使用 50+ 领域物理属性词库，扫描数值与其前后 20 字符窗口，强制用 Context 原词修正 LLM 颠倒或篡改的属性词。
-
-
-
----
-
-### 2. 数据解析与物理隔离机制
-
-* **多模态增强解析 (`multimodal_loader.py`)**：
-结合 `pdfplumber` 表格提取与 `PyMuPDF` 图片 Caption 注入；自动化提取 PDF 中的 C 函数名并执行 Header Injection（`[Functions: xxx]`），提升代码检索敏感度。
-* **动态产品打标与 100% 物理隔离**：
-入库时通过 `PRODUCT_MAPPING_RULES` 自动将切片打上 `product_id` 标签；检索时通过 ChromaDB 的 `where={"product_id": "..."}` 实现物理隔离，杜绝跨产品代码张冠李戴。
-
----
-
-### 3. 双轨混合检索与上下文工程
-
-* **Code-Aware BM25 分词器**：
-自定义正则在 jieba 分词前预提取 `set_move_line`、`robot_brkopen` 等 C/Python 变量和函数，确保 SDK 接口名不被切碎。
-* **Dense + Sparse RRF 混合检索**：
-向量检索（ChromaDB Cosine）与 BM25 结合，放大 candidate 池后通过 RRF 融合。
-* **Autocut 动态自适应截断**：
-基于 RRF 得分断崖点（Knee Point）自动截断无用切片，将召回数自适应钳制在 2~8 片之间。
-* **父子切片上下文扩展 (Parent-Child Expansion)**：
-提取已命中切片的 `[章节: X.Y.Z]` 标识，自动捞取同章节兄弟切片，解决长步骤跨块被截断的问题。
-* **保底召回机制 (Fallback Retrieval)**：
-当阈值过滤或噪声拦截导致 0 结果时，自动强行保留原始向量 Top-3 切片，不直接硬拦截，确保后续 LLM 读写能力生效。
-
----
-
-### 4. 四层金字塔容灾底座 (Failover Pyramid)
-
-系统具备应对 GPU 卡死、网络断连、API 限流与向量库异常的全自动平滑降级能力：
-
-| 容灾层级 | 运行环境 | 触发条件 | 输出形式 |
-| --- | --- | --- | --- |
-| **Layer 1: 本地 vLLM** | GPU (Qwen2.5-1.5B/7B) | 主通道健康且获得线程锁 | 智能对话 + 完整代码渲染 |
-| **Layer 2: 云端 API** | Cloud (智谱 GLM-4.7-Flash) | 本地 vLLM 超时 (2s/12s)、OOM 或未启动 | 无缝无感切换云端 LLM 输出 |
-| **Layer 3: 结构化直出** | CPU-Only (零显存/零 API 费) | vLLM 与云端 API 均不可用 | 智能提取函数/参数/示例，Markdown 结构化直出 |
-| **Layer 4: 优雅错误** | API Gateway | 向量库损坏等极端故障 | 503 HTTP 响应 + 中文友好提示 JSON |
-
----
-
-### 5. 基础设施、安全与运维工具链
-
-* **智能 GPU 动态探测**：`start_services.sh` 与 `src/config.py` 实时扫描所有 GPU 空闲显存，自动绑定空闲显存最大的 GPU 节点（如自动识别绑定 GPU 0 或 GPU 1）。
-* **纵深防御安全体系**：
-* 路径遍历清洗（`sanitize_filename`）；
-* Prompt 注入启发式检测（防 DAN 越狱、角色扮演、指令覆盖）；
-* Null 字节与控制字符清洗（`sanitize_query`）。
-
-
-* **异步非阻塞 SSE 与并发保护**：
-* 使用 `asyncio.Queue` (maxsize=256) 隔离线程池与主事件循环；
-* `_vllm_lock` 互斥锁防止 GPU 多线程并发 OOM；
-* 客户端断开自动捕获 `CancelledError` 停止 GPU 算力浪费。
-
-
-* **运维工具链**：
-* `check_status.py`：实时服务健康检查与 GPU 显存/温度轮询（v4 支持双索引统计）；
-* `start_services.sh`：一键自动探测 GPU、检查端口并拉起服务（含端口冲突自动修复）；
-* `rebuild_v4.py`：v4 Parent-Child 双索引向量库离线重建脚本。
-
----
-
-## 🏗️ 企业级架构审查
-
-完整审查报告见 **[ARCHITECTURE_REVIEW.md](ARCHITECTURE_REVIEW.md)**（评分 B+/82）。
-
-### 核心发现
-
-| 等级 | 数量 | 关键问题 |
-|------|------|----------|
-| 🔴 P0 安全红线 | 5 | API Key 硬编码泄露、零认证鉴权、文件上传无魔数校验、全局变量并发不安全、SSE 线程泄漏 |
-| 🟡 P1 可靠性 | 6 | 31 处裸 `except Exception`、ChromaDB 连接泄漏、嵌入 GPU 未启用、BM25 无持久化、日志无动态控制、LLM 调用无重试 |
-| 🟢 P2 架构增强 | 10 | 多用户会话、Prometheus 监控、A/B 测试、用户反馈闭环、Docker 化、向量版本管理等 |
-
-### 优先修复路线
-
-| 阶段 | 内容 | 预估 |
-|------|------|------|
-| Week 1 | 删除硬编码 API Key + API 鉴权中间件 + 文件魔数校验 | 3d |
-| Week 2 | 全局状态并发锁 + SSE 线程追踪 + ChromaDB 连接池 | 3d |
-| Week 3 | 异常处理规范化 + 嵌入 GPU 修复 + 动态日志 + LLM 超时重试 | 3d |
-| Week 4+ | P2 架构增强（按需选做） | N/A |
+- **[dev_log.md](./dev_log.md)**: 从 2026-07-20 至今共 25 章完整开发记录与架构决策
+- **[ARCHITECTURE_AUDIT.md](./ARCHITECTURE_AUDIT.md)**: v21 全盘四层架构审计报告 (10 项隐患 + 三阶段修复路线图)
+- **[CLAUDE.md](./CLAUDE.md)**: AI 协同开发规范 (含四层架构排雷法思想钢印)
+- **[tests/TEST_REPORT.md](./tests/TEST_REPORT.md)**: 评测报告归档

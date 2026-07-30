@@ -1,5 +1,93 @@
 # 比邻星 (ProximaRAG) — 开发日志
 
+> **日期**: 2026-07-30 | **版本**: v20 → v21 | **类型**: 全盘架构审计 + RRF 四大提权引擎定版 + 上下文溢出根治
+
+### v21 变更 (4 层架构重构 + 深度审计)
+- **全盘架构审计**: 完成四层 RAG 架构 (`ARCHITECTURE_AUDIT.md`) 系统性排查，发现 10 项隐患 (4 致命 + 6 性能/幻觉)，制定三阶段修复路线图
+- **RRF 四大提权引擎定版**: ① Entity Anchor Boost (+0.05) ② Function Names Boost (+0.08) ③ Text-Chunk Rebalance (+0.03) ④ CODE 标签 BM25 三倍写入
+- **Context Overflow 根治**: vLLM `max-model-len=8192` 配合 `_MAX_CONTEXT_CHARS=8000`(SDK)/4000(非SDK)，Cap 整块剔除末尾 Parent 优先丢弃
+- **流式 `_stream_guardrail()` 伪流式诊断**: 识别全量缓冲 + 重新分块导致 TTFB 退化为完整生成时间，给出增量实时检查方案
+- **静默斩尾增强**: `_strip_hedging_tail()` 8 模式 → 免疫 "上述代码假设存在/参考文档未包含详细步骤/具体操作步骤未在文档中" 等自相矛盾套话
+- **`_fix_and_close_sdk_code()`**: 代码块自动闭合 + CDLL 智能补全（基于 product_id 推断 DLL 名 → py_dll.dll / collrob_sdk.dll）
+- **System Prompt 膨胀告警**: 当前 210 行/3500 字符/~1500 tokens 压缩至 80 行计划立项
+- **BM25 CodeEntityAnchor**: `[CODE:xxx]` 标签 BM25 三倍写入 (Boost=3.0)，对抗 Dense Vector 对蛇形函数名的语义盲区
+
+### 四层架构审计概要
+
+| 层级 | 优良设计 | 发现隐患 |
+|------|---------|---------|
+| L1 数据切片 | 代码注释拦截/伪标题黑名单/4级Title Fallback/受保护区域 | `_sanitize_section_title` substring 误杀/代码注释拦截窗口盲区 |
+| L2 检索重排 | 三层保底召回/四大提权引擎/Autocut 断崖检测 | Search-First `_score` 属性为空/Retry 逻辑 off-by-one/跨产品硬编码阈值 |
+| L3 上下文组装 | 双轨 Prompt/反跨产品泄露门控/Context Cap 整块剔除/历史净化 | System Prompt 膨胀/澄清 marker 与文案脱节/反泄露门控 metadata 漏判 |
+| L4 生成后处理 | 静默斩尾/NEVER-EMPTY 保证/硬熔断/属性词硬改写 | `_stream_guardrail` 全量缓冲伪流式/DLL 名推断不可靠/并发全局变量不安全 |
+
+### 变更文件
+
+| 文件 | 变更 |
+|------|------|
+| `ARCHITECTURE_AUDIT.md` | **新增** — 全盘四层架构审计报告 (~500 行) |
+| `dev_log.md` | 本章节（二十五） |
+| `CLAUDE.md` | 四层架构排雷法写入思想钢印 + 配置表同步 |
+| `README.md` | 四层架构说明 + 建库/测试命令 + 环境配置更新 |
+
+---
+
+> **日期**: 2026-07-30 | **版本**: v19 → v20 | **类型**: 稳定性收紧 + 审计达标 + 配置同步
+
+### v20 变更
+- **流式温度极紧化**: `_stream_llm()` temperature **0.2→0.01** — 代码类场景近确定性输出，消除温度导致的函数名变形
+- **`_fix_and_close_sdk_code()`**: 新增 `doc_type` 参数支持，为双轨制代码修复预留判定维度
+- **切片健康度审计达标**: 8 项指标中 7 项零缺陷，仅残余 1 个骨架块 (Multi-API Sticky 0/Corrupted Title 0/OCR Artifacts 0/Low-Containment 0/AST Collapse 0)
+- **超时配置**: `LLM_INFERENCE_TIMEOUT.read` 120s + `_VLLM_LOCK_TIMEOUT` 120s — 匹配 7B AWQ 多切片推理时间，避免过早降级触发
+- **Autocut 放大**: `_AUTOCUT_MIN_K` 3→**4**, `_AUTOCUT_MAX_K` 5→**10** — 与 RETRIEVAL_K=10 对齐，承载 Parent 合并后的长流程
+- **Context Cap 扩容**: `_MAX_CONTEXT_CHARS` 2000→**4000** (非 SDK) / **8000** (SDK)，配合 Autocut 10 切片满载
+- **Prompt 双轨模板增强**: 新增 `_dual_track_prefix` 带 Python 首句锚定（f-string 提取真实 source+section），消除 LLM 编造章节引用
+
+### 审计健康度 (2026-07-30, 496 chunks)
+
+| 指标 | 缺陷数 | 状态 |
+|------|--------|------|
+| 骨架/目录占位块 | 1 | ✅ |
+| 多 API 跨边界粘连 | 0 | ✅ |
+| 标题/元数据脏化 | 0 | ✅ |
+| PDF 代码下划线断裂 | 0 | ✅ |
+| GUI 轨孤立图注碎片 | 0 | ✅ |
+| 面包屑死循环/脱节 | 0 | ✅ |
+| SDK 碎化/低自含度 | 0 | ✅ |
+| AST 章节序号倒挂 | 0 | ✅ |
+
+### 当前生产配置快照
+
+| 配置项 | 值 |
+|--------|-----|
+| vLLM 模型 | `Qwen/Qwen2.5-7B-Instruct-AWQ` @ GPU 1 |
+| FastAPI 端口 | **8000** |
+| 向量库 | 120 Parent + 376 Child = **496 chunks** |
+| `_AUTOCUT_MIN_K` | **4** (SDK 检索动态提升至 6) |
+| `_AUTOCUT_MAX_K` | **10** |
+| `_MAX_CONTEXT_CHARS` | **4000** (非SDK) / **8000** (SDK) |
+| `LLM_INFERENCE_TIMEOUT` | connect=10.0s, **read=120.0s**, write=15.0s, pool=5.0s |
+| `LLM_TIMEOUT` | connect=10.0s, **read=30.0s**, write=15.0s, pool=5.0s |
+| `_VLLM_LOCK_TIMEOUT` | **120.0s** |
+| `MAX_HISTORY_TURNS` | **2** |
+| `SIMILARITY_THRESHOLD` | **0.68** |
+| `RETRIEVAL_K` | **10** |
+| `max_tokens` | **1024** |
+| `_temperature` (stream) | **0.01** |
+| `_temperature` (non-stream) | **0.2** |
+
+### 变更文件
+
+| 文件 | 变更 |
+|------|------|
+| `src/rag_chain.py` | `_stream_llm()` temperature 0.2→0.01; `_fix_and_close_sdk_code()` +doc_type; `_AUTOCUT_MIN_K` 3→4; `_AUTOCUT_MAX_K` 5→10; `_MAX_CONTEXT_CHARS` 2000→4000/8000; `_VLLM_LOCK_TIMEOUT` 30s→120s; `_dual_track_prefix` 增强 |
+| `dev_log.md` | 本章节（二十四） |
+| `CLAUDE.md` | 配置表同步更新 |
+| `README.md` | 架构描述与实际配置同步 |
+| `audit_report_20260730_*.json` | 2 次审计报告 (健康度近满分) |
+
+---
+
 > **日期**: 2026-07-28 | **版本**: v16 → v17 | **类型**: Graph 管道架构级重构
 
 ### v17 变更 (graph_rag.py + rag_chain.py)

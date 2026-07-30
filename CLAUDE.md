@@ -7,6 +7,62 @@
 - **默认**: GPU 1（:8001）→ vLLM Qwen2.5-7B-Instruct-AWQ (4-bit ~8GB)；GPU 0 → ChromaDB/嵌入。
 - **降级**: 空闲<5GB → 自动降级 1.5B。
 
+## 0. 🔴 四层架构排雷法（AI 辅助开发思想钢印 — v21 新增）
+
+**任何代码修改前，必须先声明该修改属于哪一层，并自检是否会破坏该层的核心特性。**
+
+### L1 — 数据摄入与切片层 (pdf_loader.py)
+| 核心特性 | 严禁破坏 |
+|----------|---------|
+| `_v4_extract_headings()` 代码注释拦截 | 8 特征词 ±120 字符上下文校验 |
+| `_sanitize_section_title()` 伪标题黑名单 | frozenset 10 项 + 触发父级 H2 继承 |
+| `_SDK_BLOCK_BOUNDARY_RE` 两类可验证边界 | 数字标题 + 函数名称/函数说明 |
+| `_is_skeleton_chunk()` 骨架过滤 | 150 字符 + 代码特征词 + 实质参数三重判定 |
+| `_clean_pdf_text()` 7 步清洗 | Step 6 SDK 代码换行修复不可省略 |
+| Micro-Chunk Auto-Merge API 排他锁 | `_extract_primary_api_name()` 提取后不同 API 不合并 |
+| 4 级 Title Fallback 链 | L1 状态机标题 → L2 面包屑 → L3 父级 H2 → L4 硬兜底 |
+| 受保护区域 | 代码块 (```) + Markdown 表格 绝不拦腰切断 |
+
+### L2 — 检索与重排层 (vector_store.py + rag_chain.py `_hybrid_retrieve`)
+| 核心特性 | 严禁破坏 |
+|----------|---------|
+| RRF 四大提权引擎 | Entity Anchor (+0.05) / Function Names (+0.08) / Text Rebalance (+0.03) / CODE BM25 三倍写入 |
+| 三层保底召回 | 阈值空 → 原始 Top-3 → kept_docs 恢复 |
+| Autocut 断崖检测 | `_autocut_knee()` — RRF 分数相邻差值 Knee Point |
+| BM25 标识符保护 | `_IDENTIFIER_RE` 正则预提取 → jieba 不拆蛇形函数名 |
+| HyDE 防毒化 | SDK 轨 (OpenC3/OpenR6) + 短 Query (<6ch) + 精确 API 签名 → 全部禁用 |
+| `[CODE:xxx]` 标签 | BM25 tokenizer 三倍写入实现 Boost=3.0 |
+| 跨产品检索阈值一致性 | 禁止在 `cross_product_retrieval_node` 中硬编码不同于全局 `SIMILARITY_THRESHOLD` 的值 |
+
+### L3 — 上下文组装与指令层 (rag_chain.py `_build_messages` + `RAG_SYSTEM_PROMPT`)
+| 核心特性 | 严禁破坏 |
+|----------|---------|
+| 双轨制 Prompt | gui_app: 首句强制红线 + 绝对禁止代码 / c_sdk: SDK 模板 + 字面锚定 |
+| `_anti_bleed_prefix` 反跨产品泄露 | metadata function_names + 正文双重确认 → 仅目标缺失 + 非目标有 API 时注入 |
+| Context Cap 整块剔除 | 从末尾 Parent 优先丢弃，不切割任何 Chunk 内部正文 |
+| 历史沉渣净化 | `sanitize_chat_history()` + Citation 前缀清洗 + 代码块替换 + 尾部拒答剥离 |
+| 柔性 Grounding 提示 | `_NUMERIC_QUERY_RE` 动态检测 → Context 无数值时追加诚实提示 |
+| System Prompt 篇幅约束 | 新增规则时必须评估 Token 成本，当前上限 ~2000 tokens |
+| `_last_numeric_context_missing` 线程安全 | 禁止在非请求作用域外读写此变量（已知并发 unsafe，待修复为 State 字段） |
+
+### L4 — 生成控制与后处理层 (graph_rag.py 后处理节点 + rag_chain.py LLM 调用)
+| 核心特性 | 严禁破坏 |
+|----------|---------|
+| 静默斩尾 `_strip_hedging_tail()` | 8 模式 regex — "上述代码假设存在"/"参考文档未包含详细步骤" 等 |
+| `_fix_and_close_sdk_code()` | Markdown 反引号闭合 + CDLL 智能补全（需 product_id 精确判定 DLL） |
+| `extract_align_node` 属性词硬改写 | 50+ 领域属性词库 + 数值前后 12+8 字符窗口 |
+| SDK 自纠错硬熔断 | `retry_count >= 2 → skip`（入口检测 + 循环检测 双保险） |
+| `_stream_guardrail()` 伪流式 | 已知问题：全量缓冲导致 TTFB 退化，待修复为增量检查 |
+| NEVER-EMPTY 保证 | 所有 4 层 + 流式/非流式双路径均覆盖终极兜底 |
+| Temperature 策略 | 非流式 t=0.2 / 流式 t=0.01（代码近确定性输出） |
+
+### 跨层数据流约束
+- **LangGraph 管线优先**: `app.py` → `run_graph`/`run_graph_stream`，`rag_chat`/`rag_chat_stream` 为废弃内部 fallback
+- **并发安全**: 模块级可变全局变量 (`_last_numeric_context_missing`, `_HYDE_CACHE`) 不保证线程安全，新逻辑优先使用 State 字段或请求作用域局部变量
+- **Vector Store 注入**: 通过 `set_graph_vector_store()` 统一注入，禁止节点内直接 import ChromaDB 客户端绕过
+
+---
+
 ## 2. 核心依赖红线（严禁升级）
 
 Conda `rag_agent` (Python 3.10)。**严禁 `pip install --upgrade`**：
@@ -30,7 +86,7 @@ Conda `rag_agent` (Python 3.10)。**严禁 `pip install --upgrade`**：
 | ADR | 版本 | 核心内容 | 关键函数/文件 |
 |-----|------|---------|-------------|
 | 6 | v1 | 产品物理隔离 | `_resolve_product_from_query()`, `PRODUCT_ROUTER_RULES` |
-| 7-8 | v1 | BM25+向量 RRF 混合检索 + Autocut 动态截断 | `_hybrid_retrieve()`, `_autocut_knee()`, `_AUTOCUT_MIN_K=3` |
+| 7-8 | v1 | BM25+向量 RRF 混合检索 + Autocut 动态截断 | `_hybrid_retrieve()`, `_autocut_knee()`, `_AUTOCUT_MIN_K=4`, `_AUTOCUT_MAX_K=10` |
 | 9-10 | v2 | 柔性 Grounding + 父子切片扩展 + Citation 清洗 | `_expand_parent_sections()`, `_build_messages()` |
 | 11 | v2 | LangGraph 后处理 (ExtractAlign + SDK_Verify 自纠错) | `extract_align_node`, `sdk_verify_node` (graph_rag.py), retry 硬熔断 |
 | 14 | v3 | Plan-Execute-Synthesize 三层架构 | `subgoal_planner_node`, `cross_product_retrieval_node` |
@@ -41,20 +97,26 @@ Conda `rag_agent` (Python 3.10)。**严禁 `pip install --upgrade`**：
 | v12-13 | v12-13 | 裁Context保输出/骨架过滤/标题清洗/下划线归一化 | `_is_skeleton_chunk()`, `_sanitize_section_title()`, `_clean_pdf_text()` Step 4.3 |
 | v16-17 | v16-17 | QueryFusion指代词门控/HyDE防毒化/Search-First软路由/确定性反问/首句章节Python注入/套话擦除 | `_search_first_soft_route()`, `build_product_clarification_response()`, `_strip_hedging_tail()` |
 | v18 | v18 | 🔴 代码注释污染治理: Heading上下文拦截/伪标题黑名单/状态机净化/Golden TOC预留 | `_v4_extract_headings()` 代码注释拦截, `_sanitize_section_title()` 伪标题黑名单, `_v4_extract_sdk_toc()` |
-| **当前** | **v18** | max_tokens=1024, MAX_HISTORY_TURNS=2, SDK Context Cap=4000, Autocut SDK min_k=6 | — |
+| **当前** | **v20** | max_tokens=1024, MAX_HISTORY_TURNS=2, _MAX_CONTEXT_CHARS=4000(SDK=8000), _AUTOCUT_MIN_K=4(SDK=6), _AUTOCUT_MAX_K=10 | — |
 
 ### 当前关键配置
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
 | max_tokens | 1024 | v17: 代码+步骤完全充裕，从源头消解 vLLM 400 |
-| _AUTOCUT_MIN_K | 3 | v11: 硬下限3，多步骤SDK不丢切片 |
-| _MAX_CONTEXT_CHARS | 2000 | v11: 总Context字符硬上限 |
+| _AUTOCUT_MIN_K | 4 | v20: 硬下限4，SDK 检索动态提升至 6 |
+| _AUTOCUT_MAX_K | 10 | v20: 上限10，与 RETRIEVAL_K=10 对齐 |
+| _MAX_CONTEXT_CHARS | 4000 / 8000(SDK) | v20: 非SDK 4000 / SDK 8000，配合 Autocut 满载 |
 | CHILD_CHUNK_SIZE | 400 | H3/H4 函数级子层 |
 | PARENT_CHUNK_SIZE | 1000 | H2 章节级父层 |
 | CHUNK_MODE | v4_dual | Parent+Child 双层索引 |
 | SIMILARITY_THRESHOLD | 0.68 | 向量检索阈值 |
-| MAX_HISTORY_TURNS | 3 | 滑动窗口 |
+| RETRIEVAL_K | 10 | 单次检索召回数 |
+| MAX_HISTORY_TURNS | 2 | v16: 滑动窗口 2 轮=4 条消息 |
+| LLM_INFERENCE_TIMEOUT | connect=10.0, read=120.0, write=15.0, pool=5.0 | v20: 匹配 7B AWQ 多切片推理 |
+| _VLLM_LOCK_TIMEOUT | 120.0s | v20: 对齐 inference read timeout |
+| _temperature (stream) | 0.01 | v20: 极紧温度，代码近确定性输出 |
+| _temperature (non-stream) | 0.2 | 非流式保持低随机性 |
 
 ---
 
@@ -166,14 +228,14 @@ BASE_URL     = "http://localhost:8001/v1"
 MODEL_NAME   = "Qwen/Qwen2.5-7B-Instruct-AWQ"
 DEEPSEEK_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 DEEPSEEK_MODEL    = "glm-4.7-flash"
-# max_tokens=2200 (v13: 裁Context保输出)
-LLM_INFERENCE_TIMEOUT = httpx.Timeout(connect=5.0, read=60.0, write=15.0, pool=5.0)
+# max_tokens=1024 (v16: 代码+步骤完全充裕，从源头消解 vLLM 400)
+LLM_INFERENCE_TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=15.0, pool=5.0)
 
 # 检索
 CHUNK_SIZE=300 / CHUNK_OVERLAP=50 / RETRIEVAL_K=10 / SIMILARITY_THRESHOLD=0.68
-_AUTOCUT_MIN_K=3 / _AUTOCUT_MAX_K=5  # SDK 检索时 MIN_K 动态提升至 6
+_AUTOCUT_MIN_K=4 / _AUTOCUT_MAX_K=10  # SDK 检索时 MIN_K 动态提升至 6
 CHUNK_MODE = "v4_dual"  # Parent(1000) + Child(400)
-_MAX_CONTEXT_CHARS = 2000  # SDK 检索时动态提升至 4000
+_MAX_CONTEXT_CHARS = 4000  # SDK 检索时动态提升至 8000
 
 # 嵌入
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-zh-v1.5"  # 512维, HF→ONNX 回退
