@@ -391,8 +391,8 @@ _V4_HEADING_PATTERNS = [
     # 层级 2: 多级数字编号 (H2/H3/H4) -> 3.1.5 通讯设置 / 3.1设置 (兼容无空格，点号收尾)
     (re.compile(r'^(\d+(?:\.\d+){1,3})\.?\s*(.{1,80}?)(?:\r?\n|$)', re.MULTILINE), 2), 
     
-    # 层级 2: 纯数字+点/顿号 (H2) -> 1. / 1、 / 2) 标题
-    (re.compile(r'^(\d{1,2})[\.\、\)）]\s*(.{1,80}?)(?:\r?\n|$)', re.MULTILINE), 2),
+    # 🔴 [终极修复 1] 层级 2: 纯数字+点 (H2) -> 1. 标题 (移除 、 和 ） 防止将 1、列表项误判为大纲导致父块碎裂)
+    (re.compile(r'^(\d{1,2})\.\s*(.{1,80}?)(?:\r?\n|$)', re.MULTILINE), 2),
     
     # 层级 2: 中文序号 -> 一、/ （一）/ (一)
     (re.compile(r'^[（(]?[一二三四五六七八九十]+[）)]?\s*[、,，\s]\s*(.{1,80}?)(?:\r?\n|$)', re.MULTILINE), 2),
@@ -1262,7 +1262,7 @@ def _v4_build_parent_child_docs(
 _SDK_BLOCK_BOUNDARY_RE = re.compile(
     r'(?:^|\n)'
     r'(?='
-    r'[ \t]*\d{1,2}[\.\、\s]\s*[^\n]+'      # ① 数字小节标题 (兼容前导空格)
+    r'[ \t]*\d{1,2}\.\s*[^\n]+'      # ① 数字小节标题 (严格限定为 点号. 排除 1、 列表项)
     r'|'
     r'[ \t]*(?:函数名称|函数说明|函数名)\s*'  # ② 中文表头 (兼容前导空格)
     r')',
@@ -1314,6 +1314,10 @@ def _is_skeleton_chunk(content: str) -> bool:
         return False
     content = content.strip()
 
+    # 🔴 注入免死金牌：只要这段话里有底层 SDK 初始化的核心词，绝对不准丢弃！
+    if any(kw in content for kw in ["import ctypes", "CDLL", "collrob_sdk", "py_dll", "动态链接库"]):
+        return False
+
     # 有实际代码 → 保留
     _has_code = bool(re.search(
         r'(?:def\s+\w+\s*\(|\.restype|\.argtypes|\bctypes\.|```python|=.*ctypes\.CDLL)',
@@ -1347,10 +1351,6 @@ def _is_skeleton_chunk(content: str) -> bool:
     if len(lines) <= 2 and all(re.match(r'^\d{1,2}[\.\、\s]', l) for l in lines):
         return True
 
-    # 🔴 注入免死金牌：只要这段话里有底层 SDK 初始化的核心词，绝对不准丢弃！
-    if any(kw in content for kw in ["import ctypes", "CDLL", "collrob_sdk", "py_dll", "动态链接库"]):
-        return False
-
     return False
 
 
@@ -1358,24 +1358,34 @@ def _v4_parse_sdk_state_machine(text: str) -> List[Tuple[int, int, str]]:
     if not text:
         return []
 
-    boundaries = [0]
-    titles = [""]
-    for m in _SDK_BLOCK_BOUNDARY_RE.finditer(text):
-        pos = m.start()
-        if pos == 0:
-            boundaries[0] = 0
-            titles[0] = m.group(0).strip()
-        else:
-            boundaries.append(pos)
-            titles.append(m.group(0).strip())
+    # ================= 修改开始 =================
+    # 不预设第一个边界为 0，让正则自己找边界。
+    # 如果开头有非标题内容，自然会形成一个独立的块，我们可以后续过滤。
+    matches = list(_SDK_BLOCK_BOUNDARY_RE.finditer(text))
+    
+    if not matches:
+        return [(0, len(text), "")]
+
+    boundaries = []
+    titles = []
+    
+    # 补齐开头的前言/目录块 (如果第一个匹配不是从 0 开始)
+    if matches[0].start() > 0:
+        boundaries.append(0)
+        titles.append("")  # 前言部分没有明确提取的 SDK 标题
+
+    for m in matches:
+        boundaries.append(m.start())
+        titles.append(m.group(0).strip())
 
     boundaries.append(len(text))
-    titles.append("")
+    titles.append("") # 最后一个结尾补充
+    # ================= 修改结束 =================
 
     _MIN_BLOCK_GAP = 20
     merged_boundaries = [boundaries[0]]
     merged_titles = [titles[0]]
-    for i in range(1, len(boundaries)):
+    for i in range(1, len(boundaries)-1):
         gap = boundaries[i] - merged_boundaries[-1]
         if gap < _MIN_BLOCK_GAP and i < len(boundaries) - 1:
             if len(titles[i]) > len(merged_titles[-1]):
@@ -1383,6 +1393,9 @@ def _v4_parse_sdk_state_machine(text: str) -> List[Tuple[int, int, str]]:
         else:
             merged_boundaries.append(boundaries[i])
             merged_titles.append(titles[i])
+    # 收尾最后一个边界
+    if len(text) - merged_boundaries[-1] > 0:
+        merged_boundaries.append(len(text))
 
     blocks = []
     for i in range(len(merged_boundaries) - 1):

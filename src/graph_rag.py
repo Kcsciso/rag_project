@@ -251,13 +251,11 @@ def _check_sdk_code_issues(code_text: str) -> List[str]:
 # ============================================================
 from .rag_chain import (
     _preprocess_query,
-    _fuse_short_query,
-    _resolve_clarification_followup,
+    # 🔴 删除了 _fuse_short_query, _resolve_clarification_followup 等旧轮子
     _resolve_product_from_query,
     _is_chitchat,
     _is_impossible_query,
-    _has_business_intent,
-    _is_product_name_only,
+    # 🔴 删除了 _has_business_intent, _is_product_name_only
     _build_messages,
     _expand_parent_sections,
     _hybrid_retrieve,
@@ -280,9 +278,9 @@ from .rag_chain import (
     _hard_refusal_stream,
     _build_clarification_response,
     _build_clarification_response_stream,
+    _rewrite_query_with_llm,  # 🟢 引入大模型重写引擎
 )
 from .vector_store import get_registered_products, search_similar_with_threshold
-
 # ── 短词查询最大长度阈值（低于此值触发短词融合）──
 _SHORT_QUERY_MAX_LEN = 15
 
@@ -314,58 +312,36 @@ def _node_safe(fallback: dict):
 
 
 # ============================================================
-# Node 1: QueryFusionNode — 多轮对话融合 + 短词补全
+# Node 1: QueryFusionNode — 多轮对话融合 (接入大模型意图重写)
 # ============================================================
 
 def query_fusion_node(state: RAGState) -> dict:
     """
-    对原始 query 进行：口语噪音剥离 → 澄清补全 → 短词融合。
+    接入大模型重写引擎：对原始 query 进行意图补全与代词消解 → 口语噪音剥离。
 
-    输入：state["query"], state["chat_history"], state["product_id"]
-    输出：fused_query, product_id（可能从澄清补全中解析）
+    输入：state["query"], state["chat_history"]
+    输出：fused_query (清洗后供向量检索), query (重写后的完整意图，供全局使用)
     """
     query = state.get("query", "")
     chat_history = state.get("chat_history")
-    product_id = state.get("product_id")
 
-    # 🔴 v14: 历史沉渣净化 — 传入融合节点前剥离拒答/免责套话
+    # 历史沉渣净化 — 传入融合节点前剥离拒答/免责套话
     if chat_history:
         from .rag_chain import sanitize_chat_history as _sanitize_hist
         chat_history = _sanitize_hist(chat_history)
 
     logger.info(f"🟢 [Node 1] QueryFusion: raw='{query[:60]}'")
 
-    # 第 1 步：澄清补全（检测上一轮是否为澄清反问 + 用户仅输入产品名）
-    if not product_id:
-        fused, resolved_pid = _resolve_clarification_followup(query, chat_history)
-        if resolved_pid:
-            product_id = resolved_pid
-            query = fused
-            logger.info(f"  ↳ 澄清补全: product_id='{product_id}', fused_query='{query[:80]}'")
+    # 🔴 核心：让大模型接管历史阅读、代词消解与意图重写
+    rewritten_query = _rewrite_query_with_llm(query, chat_history)
 
-    # 第 2 步：v16 指代词门控融合 — 仅当含明确指代词时才融合历史
-    # 独立短语（如 "电控柜 IO"、"延时命令"）保留原 Query，不强行粘连历史
-    _PRONOUN_TRIGGERS = re.compile(
-        r'(?:它|这个|那个|该功能|怎么用|参数呢|上面|前面|刚才|继续)',
-    )
-    _is_pronoun_query = bool(_PRONOUN_TRIGGERS.search(query))
-    if _is_pronoun_query and chat_history:
-        fused_query = _fuse_short_query(query, chat_history, product_id)
-        if fused_query != query:
-            query = fused_query
-            logger.info(f"  ↳ 指代词融合: '{query[:80]}'")
-    elif len(query.strip()) < _SHORT_QUERY_MAX_LEN and not _is_pronoun_query:
-        logger.info(f"  ↳ 短词但无指代词，保留原 Query: '{query[:60]}'")
-
-    # 第 3 步：口语噪音剥离
-    cleaned = _preprocess_query(query)
+    # 剥离口语噪音（交给底层 ChromaDB 检索的形态）
+    cleaned = _preprocess_query(rewritten_query)
 
     return {
         "fused_query": cleaned,
-        "query": query,  # 保留融合后的原始版本（含产品名关键词）供下游使用
-        "product_id": product_id,
+        "query": rewritten_query,  # 🔴 状态图中的 query 更新为补全后的完美意图
     }
-
 
 # ============================================================
 # Node 2: ProductRoutingNode — 产品识别 + 意图分类
@@ -504,7 +480,8 @@ def product_routing_node(state: RAGState) -> dict:
             _orig_query = state.get("query", "") or query
             # 🔴 v17: Search-First 软路由 — 后台跨产品预检索，断层领先则自动锁定
             _auto_locked_pid = None
-            if _has_business_intent(query) and len(_orig_query.strip()) >= 4:
+            # 🟢 移除了 _has_business_intent 校验，因为重写后的 query 已完全自洽
+            if len(_orig_query.strip()) >= 4:
                 try:
                     _auto_locked_pid = _search_first_soft_route(query)
                 except Exception:

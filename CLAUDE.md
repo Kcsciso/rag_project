@@ -28,7 +28,9 @@
 |----------|---------|
 | RRF 四大提权引擎 | Entity Anchor (+0.05) / Function Names (+0.08) / Text Rebalance (+0.03) / CODE BM25 三倍写入 |
 | 三层保底召回 | 阈值空 → 原始 Top-3 → kept_docs 恢复 |
-| Autocut 断崖检测 | `_autocut_knee()` — RRF 分数相邻差值 Knee Point |
+| Autocut 断崖检测 | `_autocut_knee()` — RRF 分数相邻差值 Knee Point; `_AUTOCUT_MIN_K=8` (SDK=10), `_AUTOCUT_MAX_K=15` |
+| 复合查询拆解 | `_decompose_compound_query()` + `_MIN_SUB_QUERY_LEN=2` — 两字核心动词不丢弃 |
+| LLM 意图重写 (ADR-19) | `_rewrite_query_with_llm()` 代词消解+产品补全 — 禁止回退正则缝合 |
 | BM25 标识符保护 | `_IDENTIFIER_RE` 正则预提取 → jieba 不拆蛇形函数名 |
 | HyDE 防毒化 | SDK 轨 (OpenC3/OpenR6) + 短 Query (<6ch) + 精确 API 签名 → 全部禁用 |
 | `[CODE:xxx]` 标签 | BM25 tokenizer 三倍写入实现 Boost=3.0 |
@@ -37,17 +39,19 @@
 ### L3 — 上下文组装与指令层 (rag_chain.py `_build_messages` + `RAG_SYSTEM_PROMPT`)
 | 核心特性 | 严禁破坏 |
 |----------|---------|
-| 双轨制 Prompt | gui_app: 首句强制红线 + 绝对禁止代码 / c_sdk: SDK 模板 + 字面锚定 |
+| 双轨制 Prompt | gui_app: 首句强制红线 + 绝对禁止代码 / c_sdk: SDK 两段式排版铁律 (首句出处+唯一代码块) |
+| `_term_alignment_prefix` 动态术语对齐 | 仅在命中特定产品+同义词对时按需注入 (如 OpenR6 "使能"→`set_robot_arm_init`)，零全局 Token 损耗 |
 | `_anti_bleed_prefix` 反跨产品泄露 | metadata function_names + 正文双重确认 → 仅目标缺失 + 非目标有 API 时注入 |
 | Context Cap 整块剔除 | 从末尾 Parent 优先丢弃，不切割任何 Chunk 内部正文 |
 | 历史沉渣净化 | `sanitize_chat_history()` + Citation 前缀清洗 + 代码块替换 + 尾部拒答剥离 |
 | 柔性 Grounding 提示 | `_NUMERIC_QUERY_RE` 动态检测 → Context 无数值时追加诚实提示 |
-| System Prompt 篇幅约束 | 新增规则时必须评估 Token 成本，当前上限 ~2000 tokens |
+| System Prompt 篇幅约束 | 新增规则时必须评估 Token 成本，当前上限 ~2000 tokens; 术语对齐规则已剥离至动态注入，严禁回填至全局 Prompt |
 | `_last_numeric_context_missing` 线程安全 | 禁止在非请求作用域外读写此变量（已知并发 unsafe，待修复为 State 字段） |
 
 ### L4 — 生成控制与后处理层 (graph_rag.py 后处理节点 + rag_chain.py LLM 调用)
 | 核心特性 | 严禁破坏 |
 |----------|---------|
+| SDK 两段式排版铁律 (ADR-22) | `_dual_track_prefix` 强制 "首句出处说明 + 唯一整合代码块"，`_dll_name` 基于 product_id 精确推断 |
 | 静默斩尾 `_strip_hedging_tail()` | 8 模式 regex — "上述代码假设存在"/"参考文档未包含详细步骤" 等 |
 | `_fix_and_close_sdk_code()` | Markdown 反引号闭合 + CDLL 智能补全（需 product_id 精确判定 DLL） |
 | `extract_align_node` 属性词硬改写 | 50+ 领域属性词库 + 数值前后 12+8 字符窗口 |
@@ -97,15 +101,18 @@ Conda `rag_agent` (Python 3.10)。**严禁 `pip install --upgrade`**：
 | v12-13 | v12-13 | 裁Context保输出/骨架过滤/标题清洗/下划线归一化 | `_is_skeleton_chunk()`, `_sanitize_section_title()`, `_clean_pdf_text()` Step 4.3 |
 | v16-17 | v16-17 | QueryFusion指代词门控/HyDE防毒化/Search-First软路由/确定性反问/首句章节Python注入/套话擦除 | `_search_first_soft_route()`, `build_product_clarification_response()`, `_strip_hedging_tail()` |
 | v18 | v18 | 🔴 代码注释污染治理: Heading上下文拦截/伪标题黑名单/状态机净化/Golden TOC预留 | `_v4_extract_headings()` 代码注释拦截, `_sanitize_section_title()` 伪标题黑名单, `_v4_extract_sdk_toc()` |
-| **当前** | **v20** | max_tokens=1024, MAX_HISTORY_TURNS=2, _MAX_CONTEXT_CHARS=4000(SDK=8000), _AUTOCUT_MIN_K=4(SDK=6), _AUTOCUT_MAX_K=10 | — |
+| v19 | v19 | LLM Query Rewriting 意图重写引擎 (ADR-19) | `_rewrite_query_with_llm()`, `REWRITE_SYSTEM_PROMPT`, 废弃 `_fuse_short_query`/`_resolve_clarification_followup`/`_has_business_intent` |
+| v20-22 | v20-22 | 四轮闭环重构 (ADR-20/21/22): 复合查询子任务阈值 4→2 / Autocut SDK 防误杀 / 动态术语对齐 / SDK 两段式排版铁律 | `_MIN_SUB_QUERY_LEN=2`, `_AUTOCUT_MIN_K=8`(SDK=10), `_AUTOCUT_MAX_K=15`, `_term_alignment_prefix`, `_dual_track_prefix` 两段式 |
+| **当前** | **v22** | max_tokens=1024, MAX_HISTORY_TURNS=2, _MAX_CONTEXT_CHARS=4000(SDK=8000), _AUTOCUT_MIN_K=8(SDK=10), _AUTOCUT_MAX_K=15, _MIN_SUB_QUERY_LEN=2 | — |
 
 ### 当前关键配置
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
 | max_tokens | 1024 | v17: 代码+步骤完全充裕，从源头消解 vLLM 400 |
-| _AUTOCUT_MIN_K | 4 | v20: 硬下限4，SDK 检索动态提升至 6 |
-| _AUTOCUT_MAX_K | 10 | v20: 上限10，与 RETRIEVAL_K=10 对齐 |
+| _AUTOCUT_MIN_K | 8 | v22: 硬下限8，SDK 检索动态提升至 10 |
+| _AUTOCUT_MAX_K | 15 | v22: 上限15，承载多参数/多步骤 SDK 切片 |
+| _MIN_SUB_QUERY_LEN | 2 | v22: 复合查询最小子句长度，两字动词不丢弃 |
 | _MAX_CONTEXT_CHARS | 4000 / 8000(SDK) | v20: 非SDK 4000 / SDK 8000，配合 Autocut 满载 |
 | CHILD_CHUNK_SIZE | 400 | H3/H4 函数级子层 |
 | PARENT_CHUNK_SIZE | 1000 | H2 章节级父层 |
@@ -233,7 +240,8 @@ LLM_INFERENCE_TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=15.0, pool
 
 # 检索
 CHUNK_SIZE=300 / CHUNK_OVERLAP=50 / RETRIEVAL_K=10 / SIMILARITY_THRESHOLD=0.68
-_AUTOCUT_MIN_K=4 / _AUTOCUT_MAX_K=10  # SDK 检索时 MIN_K 动态提升至 6
+_AUTOCUT_MIN_K=8 / _AUTOCUT_MAX_K=15  # SDK 检索时 MIN_K 动态提升至 10
+_MIN_SUB_QUERY_LEN=2  # v22: 复合查询最小子句长度，两字动词不丢弃
 CHUNK_MODE = "v4_dual"  # Parent(1000) + Child(400)
 _MAX_CONTEXT_CHARS = 4000  # SDK 检索时动态提升至 8000
 

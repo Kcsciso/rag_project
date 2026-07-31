@@ -75,11 +75,13 @@
 | 函数名提权 | Function Names Boost (+0.08) | metadata function_names 与 query 代码实体模糊匹配 |
 | 文本平衡 | Text-Chunk Rebalance (+0.03) | 纯文本切片在 RRF 中不被代码切片完全压制 |
 | 代码实体三倍写入 | `[CODE:xxx]` → BM25 tokens ×3 | 等效 Boost=3.0，对抗 Dense Vector 盲区 |
-| Autocut | `_autocut_knee()` 断崖检测 | 找 RRF 分数相邻差值最大点 (Knee Point) |
+| Autocut | `_autocut_knee()` 断崖检测 | 找 RRF 分数相邻差值最大点 (Knee Point); SDK 场景 min_k=10 防误杀 |
+| 复合查询拆解 | `_decompose_compound_query()` 顺序连接词 | `_MIN_SUB_QUERY_LEN=2` 保留两字核心动词 |
 | 保底召回 | 三层防护 | 阈值 0→原始 Top-3 / 噪声全杀→kept_docs 恢复 / 最终空→BM25 第二机会 |
 | 产品隔离 | ChromaDB `where={"product_id":"xxx"}` | 入库打标 + 检索物理隔离 + 未指定时 Search-First 软路由 |
 | 跨产品检索 | `cross_product_retrieval_node` 全库并行 | 多产品拆分 + 交错合并 |
 | HyDE 防毒化 | 3 条 skip 条件 | 短 Query/非技术符号/精确 API 签名 → 禁用 |
+| LLM 意图重写 | `_rewrite_query_with_llm()` ADR-19 | 代词消解 + 产品名补全 + 口语剥离 (t=0.0, max_tokens=50) |
 
 ### L3 — 上下文组装与指令层 (rag_chain.py `_build_messages` + `RAG_SYSTEM_PROMPT`)
 
@@ -87,6 +89,7 @@
 |------|------|------|
 | 双轨制 Prompt | c_sdk (API 即答案) / gui_app (步骤列表,禁止代码) | `_resolve_doc_type()` 根据 product_id 自动分轨 |
 | 首句 Python 锚定 | `_dual_track_prefix` f-string 提取真实 source+section | 消除 LLM 编造章节引用 |
+| 动态术语对齐 | `_term_alignment_prefix` 按需注入 | OpenR6 "使能"→`set_robot_arm_init` 防捏造，零全局 Token 损耗 |
 | 反跨产品泄露 | `_anti_bleed_prefix` metadata + 正文双重确认 | 仅目标产品缺失 API 且非目标产品泄露时注入 |
 | Context Cap | 非SDK 4000 / SDK 8000 字符整块剔除 | Parent 背景优先丢弃 |
 | SDK Header 注入 | 单次挂载到 Context 顶部 | CDLL 加载 + POSE/Joint 结构体 |
@@ -100,6 +103,7 @@
 | 能力 | 实现 | 说明 |
 |------|------|------|
 | 四层容灾金字塔 | L1 本地 vLLM → L2 智谱 API → L3 纯检索直出 → L4 硬拒答 | 每层独立 try/except + NEVER-EMPTY 保证 |
+| SDK 两段式排版铁律 | `_dual_track_prefix` 强制首句出处 + 唯一整合代码块 | 根除复读现象与排版坍塌，动态 DLL 名推断 |
 | 静默斩尾 | `_strip_hedging_tail()` 8 模式 | "上述代码假设存在"/"参考文档未包含详细步骤"等 |
 | 属性词硬改写 | `extract_align_node` 50+ 领域词库 | 数值前后 12+8 字符窗口 + Context 原词强制覆盖 |
 | SDK 自纠错 | `sdk_verify_node` → `llm_generation` 回环 | set_前缀/CDLL/argtypes 检测 + 硬熔断 retry≤2 |
@@ -129,8 +133,9 @@
 |------|-----|------|
 | `RETRIEVAL_K` | 10 | 单次检索召回数 |
 | `SIMILARITY_THRESHOLD` | 0.68 | Cosine 距离阈值 |
-| `_AUTOCUT_MIN_K` | 4 (SDK: 6) | Autocut 硬下限 |
-| `_AUTOCUT_MAX_K` | 10 | Autocut 硬上限 |
+| `_AUTOCUT_MIN_K` | 8 (SDK: 10) | Autocut 硬下限 |
+| `_AUTOCUT_MAX_K` | 15 | Autocut 硬上限 |
+| `_MIN_SUB_QUERY_LEN` | 2 | 复合查询拆解最小子句长度 |
 | `_MAX_CONTEXT_CHARS` | 4000 / 8000 (SDK) | Context 字符 Cap |
 | `max_tokens` | 1024 | LLM 最大输出 |
 | `MAX_HISTORY_TURNS` | 2 | 滑动窗口轮数 |

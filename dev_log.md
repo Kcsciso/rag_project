@@ -1,5 +1,57 @@
 # 比邻星 (ProximaRAG) — 开发日志
 
+> **日期**: 2026-07-31 | **版本**: v21 → v22 | **类型**: 四轮闭环重构 — 复合查询/切片截断/术语对齐/排版铁律
+
+### v22 变更 (ADR-20~22 四轮闭环重构)
+
+**背景**: 针对此前架构审计暴露的"长文本注意力丢失、复杂查询切片截断、小模型参数惯性导致的 API 命名幻觉"三大痛点，在 L2/L3/L4 层完成靶向闭环重构。
+
+- **ADR-20 — 复合查询子任务漏检修复 (L2)**: `_MIN_SUB_QUERY_LEN` 阈值从 **4→2** (`rag_chain.py:2331`)。彻底解决两字核心动词（"连接"、"上电"、"使能"、"抱闸"）被 `_decompose_compound_query()` 当作噪声丢弃的问题，保障多步长指令的召回完整性。两字动词在工业操作场景中是高密度信息单元——每一个都对应至少一个完整的 SDK API 调用流程。
+
+- **ADR-21a — Autocut SDK 防误杀 (L2)**: `_AUTOCUT_MIN_K` **4→8**, `_AUTOCUT_MAX_K` **10→15**, SDK 检索 `_min_k` 动态提升至 **10** (`rag_chain.py:1997-1998`, `rag_chain.py:2684`)。根治多参数 SDK 切片（如 `robot_movc(pos1, pos2, ...)`）因 PDF 排版换行导致 BM25 得分波动 → 被 Autocut 断崖检测错误截断 → 圆弧运动等查询答案不完整的问题。三重保障（全局硬下限×2 + 候选池扩容 50% + SDK 动态 10）确保关键切片不丢。
+
+- **ADR-21b — 动态术语对齐 `_term_alignment_prefix` (L3)**: 新增 Python 层动态条件注入 (`rag_chain.py:1906-1911`)，仅当检测到特定产品+高危同义词组合（如 OpenR6 "使能" → `set_robot_arm_init`）时按需挂载防幻觉铁律。**零全局 Token 损耗**——默认不注入，仅在命中时向当前轮用户消息追加 ~60 字符的强指令。彻底替代了在臃肿 System Prompt 中罗列所有产品×同义词映射表的旧方案，当前覆盖最高频误映射对，后续可按需扩展至外部配置文件。
+
+- **ADR-22 — SDK 两段式排版铁律 (L4)**: 在 `_dual_track_prefix` 中聚合所有相关章节出处，强制规范 LLM 输出为**"首句出处说明 + 唯一整合代码块"**的两段式结构 (`rag_chain.py:1891-1903`)。根源上解决了长文本生成中的两个顽疾：(1) **复读现象**——无结构约束时 LLM 倾向在代码块前后反复解释，两段式强制代码块闭合后立即结束；(2) **排版坍塌**——多章节 API 引用时 LLM 易将代码分散到多个小块，`【最高纪律】` 指令强制输出单一完整可执行代码块。动态 DLL 名注入 (`py_dll.dll`/`collrob_sdk.dll`) 基于 `product_id` 精确判定。
+
+**架构影响**:
+- 🔴 BUG 数: 4 → **2** (BUG-3.2 已删除, BUG-3.3 已缓解, BUG-4.2 可关闭见下方)
+- 🟡 幻觉风险: L2 1→0, L3 3→1, L4 1→0
+- System Prompt Token 负债: ADR-21b 将术语对齐规则从全局 Prompt 中剥离，节省 ~300+ tokens 常驻开销
+- BUG-4.2 (DLL 推断不可靠): 已通过 ADR-22 的 `product_id` 精确推断 (`_dll_name = "py_dll.dll" if _pid == "OpenR6" else "collrob_sdk.dll"`) + ADR-21b 的同义词纠偏双重解决
+
+### 变更文件
+
+| 文件 | 变更 |
+|------|------|
+| `src/rag_chain.py` | `_MIN_SUB_QUERY_LEN` 4→2; `_AUTOCUT_MIN_K` 4→8; `_AUTOCUT_MAX_K` 10→15; SDK `_min_k`→10; `_term_alignment_prefix` 新增; `_dual_track_prefix` SDK 两段式排版铁律 |
+| `ARCHITECTURE_AUDIT.md` | 复审更新 — ADR-20/21/22 文档 + 评分更新 + BUG 状态同步 |
+| `dev_log.md` | 本章节（二十六） |
+| `CLAUDE.md` | L2/L3/L4 四层排雷法更新 + 配置表同步 + 架构演进 ADR-20~22 |
+| `README.md` | L2 复合查询+Autocut 文档 / L3 动态术语对齐 / L4 两段式铁律 / 配置参数表同步 |
+
+### 当前生产配置快照
+
+| 配置项 | 值 |
+|--------|-----|
+| vLLM 模型 | `Qwen/Qwen2.5-7B-Instruct-AWQ` @ GPU 1 |
+| FastAPI 端口 | **8000** |
+| 向量库 | 120 Parent + 376 Child = **496 chunks** |
+| `_AUTOCUT_MIN_K` | **8** (SDK 检索动态提升至 **10**) |
+| `_AUTOCUT_MAX_K` | **15** |
+| `_MIN_SUB_QUERY_LEN` | **2** |
+| `_MAX_CONTEXT_CHARS` | **4000** (非SDK) / **8000** (SDK) |
+| `LLM_INFERENCE_TIMEOUT` | connect=10.0s, **read=120.0s**, write=15.0s, pool=5.0s |
+| `_VLLM_LOCK_TIMEOUT` | **120.0s** |
+| `MAX_HISTORY_TURNS` | **2** |
+| `SIMILARITY_THRESHOLD` | **0.68** |
+| `RETRIEVAL_K` | **10** |
+| `max_tokens` | **1024** |
+| `_temperature` (stream) | **0.01** |
+| `_temperature` (non-stream) | **0.2** |
+
+---
+
 > **日期**: 2026-07-30 | **版本**: v20 → v21 | **类型**: 全盘架构审计 + RRF 四大提权引擎定版 + 上下文溢出根治
 
 ### v21 变更 (4 层架构重构 + 深度审计)
