@@ -7,7 +7,7 @@
 - **默认**: GPU 1（:8001）→ vLLM Qwen2.5-7B-Instruct-AWQ (4-bit ~8GB)；GPU 0 → ChromaDB/嵌入。
 - **降级**: 空闲<5GB → 自动降级 1.5B。
 
-## 0. 🔴 四层架构排雷法（AI 辅助开发思想钢印 — v21 新增）
+## 0. 🔴 四层架构排雷法（AI 辅助开发思想钢印 — v24 更新）
 
 **任何代码修改前，必须先声明该修改属于哪一层，并自检是否会破坏该层的核心特性。**
 
@@ -33,8 +33,7 @@
 ### L2 — 检索与重排层 (vector_store.py + rag_chain.py `_hybrid_retrieve`)
 | 核心特性 | 严禁破坏 |
 |----------|---------|
-| RRF 四大提权引擎 | Entity Anchor (+0.05) / Function Names (+0.08) / Text Rebalance (+0.03) / CODE BM25 三倍写入 |
-| 🔴 RRF 第五/六提权引擎 (v23) | Title Exact Match (+5.0) subtitle 包含匹配 / Chapter Isolation (+20.0/-10.0) 章节绝对隔离 |
+| RRF 六大提权引擎 | Entity Anchor (+5.0) / Function Names (+0.08) / Text Rebalance (+0.03) / CODE BM25 三倍写入 / Title Exact Match (+5.0) / Chapter Isolation (+20.0/-10.0) |
 | 三层保底召回 | 阈值空 → 原始 Top-3 → kept_docs 恢复 |
 | Autocut 断崖检测 | `_autocut_knee()` — RRF 分数相邻差值 Knee Point; `_AUTOCUT_MIN_K=8` (SDK=10), `_AUTOCUT_MAX_K=15` |
 | 复合查询拆解 | `_decompose_compound_query()` + `_MIN_SUB_QUERY_LEN=2` — 两字核心动词不丢弃 |
@@ -47,35 +46,45 @@
 | 跨产品检索阈值一致性 | 禁止在 `cross_product_retrieval_node` 中硬编码不同于全局 `SIMILARITY_THRESHOLD` 的值 |
 
 ### L3 — 上下文组装与指令层 (rag_chain.py `_build_messages` + `RAG_SYSTEM_PROMPT`)
+
+🔴 **v24 核心架构变更: Markdown 模板强约束 (Template Masking)**
+
 | 核心特性 | 严禁破坏 |
 |----------|---------|
-| 双轨制 Prompt | gui_app: 🔴 六条铁律 (v23: 宏观总结/结构清晰/历史隔离/视觉屏蔽/禁止脑补/禁止代码) / c_sdk: SDK 两段式排版铁律 (首句出处+唯一代码块) |
+| 🔴 **System Prompt 极简原则 (v24)** | `RAG_SYSTEM_PROMPT` 严格控制在 **~250 tokens** 以内。禁止向 System Prompt 追加新规则——所有格式约束走 `_dual_track_prefix` 模板。 |
+| 🔴 **模板底端锚定 (v24)** | `_dual_track_prefix` 必须置于 **User Message 的末尾**（紧邻模型输出的前一个 token），利用 Recency Bias 实现注意力锚定。禁止将模板移至 System Prompt 或 User Message 中部。 |
+| 🔴 **槽位填充模式 (v24)** | gui_app: 首句出处声明 + `[填写步骤]` 槽位 / c_sdk: 首句出处声明 + `[准确函数名]([参数])` 槽位。模板中的 `[填写xxx]` 标记是给小模型的认知提示——禁止删除或改为自由文本。 |
+| 🔴 **双轨制模板 (v24 增强)** | gui_app: 六条铁律 (宏观总结/结构清晰/历史隔离/视觉屏蔽/禁止脑补/禁止代码) / c_sdk: SDK 两段式排版铁律 (首句出处+唯一代码块)。两条轨道有独立的输出格式模板。 |
+| 🔴 **Top-1 来源锚定 (v24)** | `_doc_section_str` 仅取排名第一的章节 (`_sections[0]`)。禁止拼接多个章节名为大杂烩来源声明——单一锚点降低小模型认知负担。 |
 | `_term_alignment_prefix` 动态术语对齐 | 仅在命中特定产品+同义词对时按需注入 (如 OpenR6 "使能"→`set_robot_arm_init`)，零全局 Token 损耗 |
 | `_anti_bleed_prefix` 反跨产品泄露 | metadata function_names + 正文双重确认 → 仅目标缺失 + 非目标有 API 时注入 |
 | Context Cap 整块剔除 | 从末尾 Parent 优先丢弃，不切割任何 Chunk 内部正文 |
 | 历史沉渣净化 | `sanitize_chat_history()` + Citation 前缀清洗 + 代码块替换 + 尾部拒答剥离 |
 | 柔性 Grounding 提示 | `_NUMERIC_QUERY_RE` 动态检测 → Context 无数值时追加诚实提示 |
-| System Prompt 篇幅约束 | 新增规则时必须评估 Token 成本，当前上限 ~2000 tokens; 术语对齐规则已剥离至动态注入，严禁回填至全局 Prompt |
 | `_last_numeric_context_missing` 线程安全 | 禁止在非请求作用域外读写此变量（已知并发 unsafe，待修复为 State 字段） |
 
 ### L4 — 生成控制与后处理层 (graph_rag.py 后处理节点 + rag_chain.py LLM 调用)
+
+🔴 **v24 核心架构变更: L4 从"擦屁股"简化为"兜底校验"**
+
 | 核心特性 | 严禁破坏 |
 |----------|---------|
+| 🔴 **render_node 极简透传 (v24)** | `render_node` 退化为纯文本透传——**禁止**向其中添加 JSON 解析或正则清洗逻辑。格式正确性由 L3 的模板约束保证，render_node 只负责传递。 |
+| 🔴 **流式极速穿透 (v24)** | `_stream_guardrail` 直接逐 chunk 透传，**绝对禁止**全量缓冲后再重新分块。TTFB 必须 <2s。任何需要在完整输出后才能执行的后处理逻辑必须移至流结束后的非关键路径。 |
+| 🔴 **L4 正则最小化原则 (v24)** | `extract_align_node` 中禁止新增"屠魔版"正则清洗规则。L4 的职责是 KV 实体对齐校验 + SemanticDedup + 静默斩尾——不再试图纠正本应由模板约束预防的格式错误。 |
 | SDK 两段式排版铁律 (ADR-22) | `_dual_track_prefix` 强制 "首句出处说明 + 唯一整合代码块"，`_dll_name` 基于 product_id 精确推断 |
 | 静默斩尾 `_strip_hedging_tail()` | 8 模式 regex — "上述代码假设存在"/"参考文档未包含详细步骤" 等 |
-| 🔴 L4 终极物理清洗引擎 (v23) | 5 道正则: 图片引用/图表单独行/截断提示/系统废话/多余空行 → 纯 Python 后处理，零 LLM 开销 |
-| `_fix_and_close_sdk_code()` | Markdown 反引号闭合 + CDLL 智能补全（需 product_id 精确判定 DLL） |
-| `extract_align_node` 属性词硬改写 | 50+ 领域属性词库 + 数值前后 12+8 字符窗口 |
-| 🔴 SemanticDedup JAKA 豁免 (v23) | `product_id == "JAKA"` → 完整保留重复句，GUI 操作步骤的重复是正常文档特征 |
-| SDK 自纠错硬熔断 | `retry_count >= 2 → skip`（入口检测 + 循环检测 双保险） |
-| `_stream_guardrail()` 伪流式 | 已知问题：全量缓冲导致 TTFB 退化，待修复为增量检查 |
+| `_fix_and_close_sdk_code()` 过渡期兜底 | v24 标注为"过渡期兜底"，函数名修正表不再膨胀。模板约束生效后逐步缩减修正规则 |
+| SemanticDedup JAKA 豁免 (v23) | `product_id == "JAKA"` → 完整保留重复句，GUI 操作步骤的重复是正常文档特征 |
+| SDK 自纠错硬熔断 | `retry_count >= 2 → skip`（入口检测 + 循环检测 双保险）。v24 模板约束下触发频率预期大幅下降 |
 | NEVER-EMPTY 保证 | 所有 4 层 + 流式/非流式双路径均覆盖终极兜底 |
 | Temperature 策略 | 非流式 t=0.2 / 流式 t=0.01（代码近确定性输出） |
 
 ### 跨层数据流约束
-- **LangGraph 管线优先**: `app.py` → `run_graph`/`run_graph_stream`，`rag_chat`/`rag_chat_stream` 为废弃内部 fallback
+- **LangGraph 管线优先**: `app.py` → `run_graph`/`run_graph_stream`，`rag_chat`/`rag_chat_stream` 为废弃内部 fallback（v25 目标正式移除）
 - **并发安全**: 模块级可变全局变量 (`_last_numeric_context_missing`, `_HYDE_CACHE`) 不保证线程安全，新逻辑优先使用 State 字段或请求作用域局部变量
 - **Vector Store 注入**: 通过 `set_graph_vector_store()` 统一注入，禁止节点内直接 import ChromaDB 客户端绕过
+- 🔴 **模板与后处理的边界 (v24)**: L3 模板负责**预防**格式错误，L4 后处理负责**兜底校验**。禁止在 L4 中为 L3 模板应预防的错误打补丁——发现格式错误应追溯到 L3 模板设计缺陷
 
 ---
 
@@ -97,7 +106,7 @@ Conda `rag_agent` (Python 3.10)。**严禁 `pip install --upgrade`**：
 - 输入/文件名清洗、Prompt 注入防御（role 白名单）、历史≤100条、查询≤2000字符、SSE 资源管理、shutdown_clients()。
 - 严禁删除 `site-packages/pyairports/` Shim 适配层。保持 `README.md` `CLAUDE.md` `dev_log.md` 与代码库同步。
 
-## 5. 架构演进摘要（ADR-6~ADR-17 → v15）
+## 5. 架构演进摘要（ADR-6~ADR-24）
 
 | ADR | 版本 | 核心内容 | 关键函数/文件 |
 |-----|------|---------|-------------|
@@ -116,7 +125,7 @@ Conda `rag_agent` (Python 3.10)。**严禁 `pip install --upgrade`**：
 | v19 | v19 | LLM Query Rewriting 意图重写引擎 (ADR-19) | `_rewrite_query_with_llm()`, `REWRITE_SYSTEM_PROMPT`, 废弃 `_fuse_short_query`/`_resolve_clarification_followup`/`_has_business_intent` |
 | v20-22 | v20-22 | 四轮闭环重构 (ADR-20/21/22): 复合查询子任务阈值 4→2 / Autocut SDK 防误杀 / 动态术语对齐 / SDK 两段式排版铁律 | `_MIN_SUB_QUERY_LEN=2`, `_AUTOCUT_MIN_K=8`(SDK=10), `_AUTOCUT_MAX_K=15`, `_term_alignment_prefix`, `_dual_track_prefix` 两段式 |
 | v23 | v23 | 🔴 GUI 轨专项攻坚: 双轨标题拦截 / 动态切片扩容 / 大纲降噪 / 章节隔离+标题强匹配提权 / GUI Prompt 六铁律 / L4 物理清洗引擎 / SemanticDedup 豁免 / HyDE JAKA 封杀 / GUI 噪声豁免 | `_v4_extract_headings()` +doc_type, `CHILD_CHUNK_SIZE=1500`(GUI), Chapter Isolation +20.0/-10.0, Title Exact Match +5.0, GUI Prompt 六条铁律, L4 5 道物理清洗正则 |
-| **当前** | **v23** | max_tokens=1024, MAX_HISTORY_TURNS=2, _MAX_CONTEXT_CHARS=4000(SDK=8000), _AUTOCUT_MIN_K=8(SDK=10), _AUTOCUT_MAX_K=15, _MIN_SUB_QUERY_LEN=2, CHILD_CHUNK_SIZE=400(GUI=1500) | — |
+| 🔴 **v24** | **v24** | **Markdown 模板强约束 (Template Masking) + 极速流式穿透: System Prompt 极简瘦身 (210→15行) / 模板底端锚定 (Recency Bias) / `_doc_section_str` Top-1 来源 / `_stream_guardrail` 零缓冲透传 / `render_node` 退化为文本透传 (废弃JSON解析) / L4 正则最小化 / `run_graph_stream` 双重输出Bug修复** | `RAG_SYSTEM_PROMPT` 重写, `_dual_track_prefix` 模板, `_stream_guardrail` 透传, `render_node` 退化, `extract_align_node` 简化 |
 
 ### 当前关键配置
 
@@ -137,6 +146,17 @@ Conda `rag_agent` (Python 3.10)。**严禁 `pip install --upgrade`**：
 | _VLLM_LOCK_TIMEOUT | 120.0s | v20: 对齐 inference read timeout |
 | _temperature (stream) | 0.01 | v20: 极紧温度，代码近确定性输出 |
 | _temperature (non-stream) | 0.2 | 非流式保持低随机性 |
+
+### 🔴 v24 新增关键约束
+
+| 约束 | 说明 |
+|------|------|
+| **System Prompt Token 预算** | `RAG_SYSTEM_PROMPT` 严格 ≤ **250 tokens**。所有格式约束走模板，不走 System Prompt |
+| **模板底端锚定** | `_dual_track_prefix` 必须在 User Message **末尾**（模型输出的前一个 token 位置） |
+| **Top-1 来源** | `_doc_section_str` 仅取 `_sections[0]`，禁止多章节拼接 |
+| **流式零缓冲** | `_stream_guardrail` 禁止全量缓冲，必须逐 chunk 透传 |
+| **render_node 纯透传** | 禁止向 render_node 添加 JSON 解析或正则清洗 |
+| **L4 正则最小化** | `extract_align_node` 禁止新增正则清洗规则——格式问题应追溯到 L3 模板设计 |
 
 ---
 
@@ -168,8 +188,8 @@ python app.py   # → http://localhost:8000 (比邻星 ProximaRAG) · API: /docs
 | `src/config.py` | 全局配置 — 双通道 LLM、GPU 探测、ChromaDB 路径、嵌入模型、检索参数 |
 | `src/pdf_loader.py` | PDF 加载(v4) — 状态机 SDK 解析、GUI Heading-to-Heading、Parent-Child 双层、OCR、下划线归一化、骨架过滤 |
 | `src/vector_store.py` | 向量知识库 — bge-small-zh-v1.5 + ONNX 回退、BM25 混合检索、增量 Upsert |
-| `src/rag_chain.py` | RAG 核心管线 — 四层容灾、混合检索、HyDE、双轨 Prompt、反泄露门控、历史净化 |
-| `src/graph_rag.py` | LangGraph 状态图引擎 — 9 节点 + 条件边 + SDK 自纠错 + 硬熔断 |
+| `src/rag_chain.py` | 🔴 RAG 核心管线 (~3,242 行, v25 计划拆分为 6 子模块) — 四层容灾、混合检索、HyDE、🔴 v24: Markdown 模板约束 + 极速流式穿透 |
+| `src/graph_rag.py` | 🔴 LangGraph 状态图引擎 (~1,926 行, v25 计划拆分为 4 子模块) — 9 节点 + 条件边 + SDK 自纠错 + 硬熔断 + 🔴 v24: render_node 退化 + 流式双重输出 Bug 修复 |
 | `src/agent_state.py` | RAGState TypedDict (21 字段) |
 | `src/attribute_tool.py` | 动态属性意图 — LLM 提取→BM25→正则 KV |
 | `app.py` | FastAPI (:8000) — /api/chat, /api/upload, /api/status, /api/products |
@@ -191,12 +211,17 @@ python app.py   # → http://localhost:8000 (比邻星 ProximaRAG) · API: /docs
 | `_clean_pdf_text()` | pdf_loader.py | 7 步通用文本清洗 + 🔴 Step 6 SDK 代码换行修复 |
 | `_v4_build_parent_child_docs()` | pdf_loader.py | 🔴 v23: 父级跨级扫描 + 动态切片容量分配 (GUI=1500/2000) + 前导文字保护 + 跨级大纲扫描 |
 | `_v4_build_child_docs_v2()` | pdf_loader.py | 🔴 v23: 微缩大纲上限 5 条 + 标签统一 `[章节大纲参考]` |
-| `_hybrid_retrieve()` | rag_chain.py | BM25+向量 RRF 混合检索 + 🔴 v23: 六大提权引擎 (含 Title Exact Match +5.0 / Chapter Isolation +20.0/-10.0) |
+| `_hybrid_retrieve()` | rag_chain.py | BM25+向量 RRF 混合检索 + 🔴 v23: 六大提权引擎 |
 | `_decompose_compound_query()` | rag_chain.py | 复合查询拆解 (顺序连接词) |
-| `_build_messages()` | rag_chain.py | Prompt 组装 + 双轨控制 + 反泄露门控 + 🔴 v23: GUI Prompt 六条铁律 |
+| `_rewrite_query_with_llm()` | rag_chain.py | 🔴 ADR-19: LLM 意图重写引擎 (代词消解+产品补全) |
+| `_build_messages()` | rag_chain.py | 🔴 v24: Prompt 组装 + 双轨模板底端锚定 + Top-1 来源 + 反泄露门控 |
 | `sanitize_chat_history()` | rag_chain.py | 历史沉渣净化中间件 |
-| `_fix_and_close_sdk_code()` | rag_chain.py | 🔴 代码块自动闭合 + CDLL 补全（替代已删除的 `_ensure_code_blocks_closed`） |
+| `_stream_guardrail()` | rag_chain.py | 🔴 v24: 极速流式透传（零缓冲，逐 chunk 直接 yield） |
+| `_fix_and_close_sdk_code()` | rag_chain.py | 🔴 v24: 过渡期兜底 — 代码块自动闭合 + CDLL 补全 + 函数名修正表（不再膨胀） |
 | `_call_llm()` / `_stream_llm()` | rag_chain.py | LLM 调用 + 400 拦截 + Context 裁切 |
+| `render_node()` | graph_rag.py | 🔴 v24: 退化为极简文本透传（废弃 JSON 解析） |
+| `extract_align_node()` | graph_rag.py | 🔴 v24: 简化版属性对齐校验 + SemanticDedup + 静默斩尾（移除屠魔版正则） |
+| `run_graph_stream()` | graph_rag.py | 🔴 v24: 流式图执行 + SDK 自纠错回路 + 双重输出 Bug 修复 |
 
 ### 🔴 PDF 切片规则 (v23)
 
@@ -213,52 +238,6 @@ python app.py   # → http://localhost:8000 (比邻星 ProximaRAG) · API: /docs
 #### 🔴 v23: 标题正则深度扩展
 
 多级数字编号 `{1,5}` 支持最高 6 级深度标题（如 `3.1.5.2.1`），兼容末尾带点和数字汉字粘连的极端排版。
-
-#### 🔴 v23: 动态双轨标题拦截 (`_v4_extract_headings`)
-
-`_v4_extract_headings(text, doc_type="gui_app")` — GUI 轨道绝对禁止将单数字编号（"1. 步骤A"、"2. 步骤B"）识别为标题，防止操作步骤列表被切成碎片。SDK 轨道保持原逻辑不变。
-
-#### Heading 代码注释拦截 (`_v4_extract_headings`)
-
-所有 `#` 开头的候选标题需通过 **±120 字符上下文校验**：
-```python
-_CODE_KEYWORDS = ['restype', 'argtypes', 'CDLL', 'ctypes', 'robot.', 'c_int', 'c_float', 'import ']
-```
-任一关键词出现在上下文窗口 → 该 `#` 行被判定为代码注释 → 拒绝提权为 Heading。
-
-#### 伪标题黑名单 (`_PSEUDO_SECTION_BLACKLIST`)
-
-```python
-frozenset({"时间等待", "命令发送", "示例代码", "代码示例", "调用示例",
-           "参数说明", "返回值", "功能描述", "函数说明", "注意事项", "备注"})
-```
-标题清洗后长度 < 15 字符 且 包含黑名单关键词 → 返回 `""` → 调用方自动继承父级 H2 标题。
-
-#### 🔴 v23: 父级标题跨级扫描修复
-
-`h_parent` 筛选条件 `lv <= parent_level`（v22: `lv == parent_level`）。防止章节级标题被错误丢弃。前导文字（第一个标题前的扉页/目录）自动保护为 "文档说明与前言"。
-
-#### 🔴 v23: 跨级大纲扫描终点
-
-Parent TOC 扫描至下一个同级或更高级标题 (`toc_end`)，H1(第1章) 的大纲可囊括所有 1.x 子章节。
-
-#### 🔴 v23: 微缩大纲降噪
-
-Child 切片 TOC 上限从 15 条缩减至 **5 条**，超出显示 "... (更多章节略)"。防止标题列表噪声诱发大模型模板化回答。
-
-#### Golden Section 继承机制
-
-当 `_sanitize_section_title()` 返回空字符串时：
-- `_v4_build_child_docs_v2` c_sdk 路径：回退到 `breadcrumb` 路径信息
-- `_emit_child` 非 SDK 路径：回退到 `_parent_title`（父级 H2 标题）
-- **预留**: `_v4_extract_sdk_toc()` 已实现 Golden TOC 映射引擎，待接入空值回退链路
-
-#### Micro-Chunk Auto-Merge 阈值
-
-```python
-_MIN_BLOCK_GAP = 20     # 边界邻近合并窗口（字符）
-# 合并后文本 ≥ 60 字符 或 包含代码特征词 → 提交为独立 API 块
-```
 
 ---
 
