@@ -14,7 +14,7 @@
       "description": "JAKA上电必须含电控柜/使能，严禁脑补按钮，严禁串入 C-SDK 轨代码"
     },
     {
-      "id": "GT-3", "category": "SDK函数·GT", "query": "OpenC3 机械臂在 SDK 中走直线的函数名是什么",
+      "id": "GT-3", "category": "SDK函数·GT", "query": "OpenC3机械臂怎么设置直线运动",
       "product_id": "OpenC3", "must_contain": ["robot_movl"],
       "must_not_contain": ["move_linear", "robot_movc"],
       "description": "OpenC3走直线API必须是robot_movl，严禁伪API或输出movc当直线"
@@ -224,6 +224,33 @@
       "must_contain": ["前言", "软件功能", "运行环境"],
       "must_not_contain": ["上电", "使能", "ctypes", "上述代码假设存在"],
       "description": "宏观路由提权测试 — 必须召回包含微缩大纲的父切片，绝不允许强行凑步骤"
+    },
+    {
+      "id": "E27", 
+      "category": "微观防泛化", 
+      "query": "JAKA 运动指令框怎么用？",
+      "product_id": "JAKA", 
+      "must_contain": ["关节运动", "直线运动", "速度", "1.", "2."],
+      "must_not_contain": ["本章主要包含以下功能", "具体内容如下", "以上是关于", "如图"],
+      "description": "微观操作查询 — 必须直接输出带序号的具体步骤，绝对禁止被 '章节大纲' 模板挟持，禁止图注和总结废话"
+    },
+    {
+      "id": "E28", 
+      "category": "短文本召回", 
+      "query": "运动路点",
+      "product_id": "JAKA", 
+      "must_contain": ["设置终点", "路点变量管理"],
+      "must_not_contain": ["未包含此功能", "未找到", "联系技术支持"],
+      "description": "极短文本查询(4个字) — 测试 L2 kw_score 噪声过滤豁免机制是否生效，确保不被误杀"
+    },
+    {
+      "id": "E29", 
+      "category": "特殊符号召回", 
+      "query": "Ethernet/IP IO",
+      "product_id": "JAKA", 
+      "must_contain": ["通讯协议", "适配器", "数字输入", "64"],
+      "must_not_contain": ["未包含此功能", "参考文档中未包含"],
+      "description": "带斜杠的专有名词查询 — 测试底层分词与实体锚点提权是否生效，确保精准命中长切片"
     }
   ]
 }

@@ -52,15 +52,17 @@
 
 | 能力 | 实现 | 说明 |
 |------|------|------|
-| 标题识别 | `_v4_extract_headings()` 5 类模式 | 数字编号/中文章节/Markdown #/中文序号/装饰符 |
+| 标题识别 | `_v4_extract_headings()` 5 类模式 + 🔴 v23: `{1,5}` 支持 6 级深度 | 数字编号/中文章节/Markdown #/中文序号/装饰符; v23: `doc_type` 动态双轨拦截, GUI 禁止单数字编号提权 |
 | 代码注释拦截 | ±120 字符窗口 + 8 特征词校验 | 防止 `# 时间等待3秒` 提权为 Heading |
 | 伪标题黑名单 | `_PSEUDO_SECTION_BLACKLIST` frozenset 10 项 | 触发后自动继承父级 H2 标题 |
 | API 原子块 | `_v4_parse_sdk_state_machine()` 状态机 | 仅 `数字标题` + `函数名称/函数说明` 两类可验证边界 |
 | 微碎片缝合 | Micro-Chunk Auto-Merge (≥60ch 或含代码 → 提交) | API 排他锁：不同函数名不合并 |
 | 骨架过滤 | `_is_skeleton_chunk()` | <150ch + 无代码 + 无实质参数 → 丢弃 |
-| Parent-Child | H2 章节级 Parent(1000ch) + H3/H4 函数级 Child(400ch) | 标题树驱动，零厂商硬正则 |
+| Parent-Child | H2 章节级 Parent(1000ch) + H3/H4 函数级 Child(400ch) | 🔴 v23: GUI 轨动态扩容 Child=1500/Parent=2000 |
 | Title Fallback | 4 级链 | L1 状态机标题 → L2 面包屑 → L3 父级 H2 → L4 硬兜底 |
 | PDF 清洗 | 7 步 `_clean_pdf_text()` | Unicode 连字/括号空格/下划线归一化/I/O 修复/边界错位/表格竖线/JAKA 版式 |
+| 🔴 v23: 跨级大纲扫描 | Parent TOC 延伸到下一个同级/更高级标题 | H1 章节完整囊括子章节; 前导文字自动保护 |
+| 🔴 v23: 微缩大纲降噪 | Child TOC 上限 5 条 + `[章节大纲参考]:` 标签统一 | 消除标题噪声诱发的 LLM 模板化回答 |
 
 ### L2 — 检索与重排层 (rag_chain.py + vector_store.py)
 
@@ -70,24 +72,28 @@
 |------|------|------|
 | 向量检索 | ChromaDB cosine (bge-small-zh-v1.5, 512维) | 候选池放大 fetch_factor=5×, SDK 查询 8× |
 | BM25 检索 | jieba + 标识符保护 + jieba 自定义词典 | snake_case 函数名不被切碎 |
-| RRF 融合 | K=60, BM25 weight=1.2× | 四大提权引擎同时生效 |
+| RRF 融合 | K=60, BM25 weight=1.2× | 🔴 v23: 六大提权引擎 (新增 Title Exact Match +5.0 / Chapter Isolation +20.0/-10.0) |
 | 实体锚点提权 | Entity Anchor Boost (+0.05) | Query 中的数字/协议名/动作词精确匹配 |
 | 函数名提权 | Function Names Boost (+0.08) | metadata function_names 与 query 代码实体模糊匹配 |
 | 文本平衡 | Text-Chunk Rebalance (+0.03) | 纯文本切片在 RRF 中不被代码切片完全压制 |
+| 🔴 标题强匹配 (v23) | Title Exact Match Boost (+5.0) | 查询词完整包含于 section_title → 登顶提权 |
+| 🔴 章节隔离 (v23) | Chapter Isolation (+20.0 目标 / -10.0 非目标) | "第X章"查询 → 目标章节碾压级加分, 其他章节降权 |
 | 代码实体三倍写入 | `[CODE:xxx]` → BM25 tokens ×3 | 等效 Boost=3.0，对抗 Dense Vector 盲区 |
 | Autocut | `_autocut_knee()` 断崖检测 | 找 RRF 分数相邻差值最大点 (Knee Point); SDK 场景 min_k=10 防误杀 |
 | 复合查询拆解 | `_decompose_compound_query()` 顺序连接词 | `_MIN_SUB_QUERY_LEN=2` 保留两字核心动词 |
 | 保底召回 | 三层防护 | 阈值 0→原始 Top-3 / 噪声全杀→kept_docs 恢复 / 最终空→BM25 第二机会 |
 | 产品隔离 | ChromaDB `where={"product_id":"xxx"}` | 入库打标 + 检索物理隔离 + 未指定时 Search-First 软路由 |
 | 跨产品检索 | `cross_product_retrieval_node` 全库并行 | 多产品拆分 + 交错合并 |
-| HyDE 防毒化 | 3 条 skip 条件 | 短 Query/非技术符号/精确 API 签名 → 禁用 |
+| HyDE 防毒化 | 3 条 skip 条件 + 🔴 v23: JAKA 全线封杀 | SDK 轨 + GUI 轨全面禁用; 短 Query/非技术符号/精确 API 签名 → 禁用 |
+| 🔴 GUI 噪声豁免 (v23) | `_is_gui` 判定 → 跳过 kw_score 拦截 | JAKA 短文本查询不被 BM25 低分误杀 |
 | LLM 意图重写 | `_rewrite_query_with_llm()` ADR-19 | 代词消解 + 产品名补全 + 口语剥离 (t=0.0, max_tokens=50) |
+| 🔴 宏观提权 v2 (v23) | 多关键词广谱判定 + chunk_type 双重检测 | "内容/总结/介绍/大意/结构" + parent chunk → +5.0 登顶 |
 
 ### L3 — 上下文组装与指令层 (rag_chain.py `_build_messages` + `RAG_SYSTEM_PROMPT`)
 
 | 能力 | 实现 | 说明 |
 |------|------|------|
-| 双轨制 Prompt | c_sdk (API 即答案) / gui_app (步骤列表,禁止代码) | `_resolve_doc_type()` 根据 product_id 自动分轨 |
+| 双轨制 Prompt | c_sdk (API 即答案+两段式铁律) / gui_app (🔴 v23: 六条铁律——宏观总结/结构清晰/历史隔离/视觉屏蔽/禁止脑补/禁止代码) | `_resolve_doc_type()` 根据 product_id 自动分轨 |
 | 首句 Python 锚定 | `_dual_track_prefix` f-string 提取真实 source+section | 消除 LLM 编造章节引用 |
 | 动态术语对齐 | `_term_alignment_prefix` 按需注入 | OpenR6 "使能"→`set_robot_arm_init` 防捏造，零全局 Token 损耗 |
 | 反跨产品泄露 | `_anti_bleed_prefix` metadata + 正文双重确认 | 仅目标产品缺失 API 且非目标产品泄露时注入 |
@@ -105,10 +111,11 @@
 | 四层容灾金字塔 | L1 本地 vLLM → L2 智谱 API → L3 纯检索直出 → L4 硬拒答 | 每层独立 try/except + NEVER-EMPTY 保证 |
 | SDK 两段式排版铁律 | `_dual_track_prefix` 强制首句出处 + 唯一整合代码块 | 根除复读现象与排版坍塌，动态 DLL 名推断 |
 | 静默斩尾 | `_strip_hedging_tail()` 8 模式 | "上述代码假设存在"/"参考文档未包含详细步骤"等 |
+| 🔴 L4 物理清洗 (v23) | 5 道正则后处理 — 图片引用/图表行/截断提示/系统废话/空行整理 | 纯 Python 确定性清洗，零 LLM 开销，与 L3 Prompt 规则 3/4 双重保障 |
 | 属性词硬改写 | `extract_align_node` 50+ 领域词库 | 数值前后 12+8 字符窗口 + Context 原词强制覆盖 |
 | SDK 自纠错 | `sdk_verify_node` → `llm_generation` 回环 | set_前缀/CDLL/argtypes 检测 + 硬熔断 retry≤2 |
 | 代码块闭合 | `_fix_and_close_sdk_code()` | Markdown ``` 自动闭合 + CDLL 智能补全 |
-| SemanticDedup | trigram overlap > 0.55 截断 | 消除 1.5B 小模型段落重复 |
+| SemanticDedup | trigram overlap > 0.55 截断 | 🔴 v23: JAKA GUI 轨完整保留重复句（操作步骤重复是正常特征） |
 | 流式输出 | SSE async/await + bounded queue(256) | 线程池隔离 + 客户端断开取消保护 |
 | Temperature | 非流式 0.2 / 流式 0.01 | 代码生成近确定性输出 |
 
@@ -139,8 +146,8 @@
 | `_MAX_CONTEXT_CHARS` | 4000 / 8000 (SDK) | Context 字符 Cap |
 | `max_tokens` | 1024 | LLM 最大输出 |
 | `MAX_HISTORY_TURNS` | 2 | 滑动窗口轮数 |
-| `CHILD_CHUNK_SIZE` | 400 | 子层切片 |
-| `PARENT_CHUNK_SIZE` | 1000 | 父层切片 |
+| `CHILD_CHUNK_SIZE` | 400 / 1500 (GUI) | 🔴 v23: 子层切片; GUI 轨扩容防止长步骤断裂 |
+| `PARENT_CHUNK_SIZE` | 1000 / 2000 (GUI) | 🔴 v23: 父层切片; GUI 轨同步扩容 |
 
 **🔴 核心锁定依赖（严禁升级）**：
 - `torch==2.6.0+cu124` / `torchvision==0.21.0+cu124` / `torchaudio==2.6.0+cu124`
@@ -232,15 +239,15 @@ python audit_chunks.py
 
 ## 🧪 自动化测试
 
-**统一评测入口**: `python tests/run_eval.py --verbose`（30 用例，8 硬断言）
+**统一评测入口**: `python tests/run_eval.py --verbose`（33 用例，8 硬断言）
 
 | 脚本 | 覆盖范围 | 命令 |
 |------|---------|------|
-| `tests/run_eval.py` | 30 用例 (GT + SDK 函数 + 安全注入 + 多轮指代 + 错别字容错) | `python tests/run_eval.py --verbose` |
+| `tests/run_eval.py` | 33 用例 (GT + SDK 函数 + 安全注入 + 多轮指代 + 错别字容错 + v23: 微观防泛化/短文本召回/特殊符号) | `python tests/run_eval.py --verbose` |
 | `test_stability.py` | 多轮对话 + 并发保护 + 7 种异常降级 | `python test_stability.py` |
 | `audit_chunks.py` | 切片 8 维健康度审计 (骨架/粘连/标题/OCR/碎片/面包屑/SDK/倒挂) | `python audit_chunks.py` |
 
-📊 **最新评测** (v21, 7B-AWQ, 496 chunks): 切片健康度 **近满分** (8 项指标 7 项零缺陷, 仅 1 骨架块) · Multi-API Sticky 0 · Corrupted Title 0 · OCR Artifacts 0 · SDK 碎化 0 · AST Collapse 0
+📊 **最新评测** (v23, 7B-AWQ, 496 chunks): 切片健康度 **近满分** (8 项指标 7 项零缺陷, 仅 1 骨架块) · Multi-API Sticky 0 · Corrupted Title 0 · OCR Artifacts 0 · SDK 碎化 0 · AST Collapse 0
 
 ---
 
@@ -277,7 +284,7 @@ export ZHIPU_API_KEY="your-key-here"
 
 ## 📝 开发日志与架构审计
 
-- **[dev_log.md](./dev_log.md)**: 从 2026-07-20 至今共 25 章完整开发记录与架构决策
-- **[ARCHITECTURE_AUDIT.md](./ARCHITECTURE_AUDIT.md)**: v21 全盘四层架构审计报告 (10 项隐患 + 三阶段修复路线图)
+- **[dev_log.md](./dev_log.md)**: 从 2026-07-20 至今共 27 章完整开发记录与架构决策
+- **[ARCHITECTURE_AUDIT.md](./ARCHITECTURE_AUDIT.md)**: v23 全盘四层架构审计报告 (15 项隐患追踪 + 三阶段修复路线图)
 - **[CLAUDE.md](./CLAUDE.md)**: AI 协同开发规范 (含四层架构排雷法思想钢印)
 - **[tests/TEST_REPORT.md](./tests/TEST_REPORT.md)**: 评测报告归档

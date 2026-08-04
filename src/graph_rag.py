@@ -939,143 +939,14 @@ def sdk_verify_node(state: RAGState) -> dict:
 
 def render_node(state: RAGState) -> dict:
     """
-    解析 LLM 输出的 JSON 提取块，用确定性 Python 渲染器生成最终答案。
-
-    若 LLM 输出包含有效的【提取】...【提取结束】JSON 块:
-      → 解析 JSON → 确定性渲染代码/步骤/引用（零模型幻觉）
-    若 JSON 解析失败或不存在:
-      → 透传原始回答（优雅降级）
-
-    渲染规则:
-      ① 文档引用: 根据《{doc}》【{section}】的记载:
-      ② 函数代码: Python ctypes 模板 → DLL名/函数签名/参数全部来自 JSON
-      ③ 操作步骤: 编号列表 → 每步来自 JSON steps 数组原文
-      ④ 参数列表: 表格格式 → 参数名/值来自 JSON params 字典
-      ⑤ 硬件配置: 列表格式 → 来自 JSON hardware 字典
+    退化版 RenderNode: 放弃 JSON 解析，直接透传大模型的 Markdown 输出。
+    后处理交由 extract_align_node 和 rag_chain 中的正则防线兜底。
     """
-    import json as _json
     raw_answer = state.get("raw_llm_answer") or state.get("final_answer", "")
-
-    # ── 解析 JSON 提取块 ──
-    _extract_match = re.search(
-        r'【提取】\s*\n?(.*?)\n?\s*【提取结束】', raw_answer, re.DOTALL
-    )
-
-    if not _extract_match:
-        logger.info("🟠 [RenderNode] 无 JSON 提取块 → 透传原始回答")
-        return {"final_answer": raw_answer, "route_status": state.get("route_status", "complete")}
-
-    _json_str = _extract_match.group(1).strip()
-    try:
-        _data = _json.loads(_json_str)
-    except _json.JSONDecodeError as e:
-        # 🔴 Bug Fix 1: JSON 解析失败时，必须剥离【提取】...【提取结束】块再透传
-        # 否则前端流式输出会泄露 JSON 源码
-        logger.warning(f"🟠 [RenderNode] JSON 解析失败: {e} → 剥离提取块后透传")
-        _clean_answer = re.sub(
-            r'【提取】\s*\n?.*?\n?\s*【提取结束】', '', raw_answer, flags=re.DOTALL
-        ).strip()
-        if not _clean_answer:
-            _clean_answer = raw_answer.replace("【提取】", "").replace("【提取结束】", "").strip()
-        return {"final_answer": _clean_answer or raw_answer,
-                "route_status": state.get("route_status", "complete")}
-
-    # ── 确定性渲染 ──
-    _doc = _data.get("doc", "未知文档")
-    _section = _data.get("section", "")
-    _note = _data.get("note", "")
-
-    _parts = []
-
-    # ① 文档引用（强制执行 — 与模型输出无关）
-    if _doc:
-        _header = f"根据《{_doc}》"
-        if _section:
-            _header += f"【{_section}】"
-        _header += "的记载："
-        _parts.append(_header)
-
-    # Bug Fix 3: note 不为空时才追加，且必须是实质性内容
-    if _note and len(_note) >= 10 and not _note.startswith("确保"):
-        _parts.append(_note)
-        # 只有当没有其他结构化数据时才从 note 返回
-        if not _funcs and not _steps and not _params and not _hw:
-            return {
-                "final_answer": "\n\n".join(_parts),
-                "raw_llm_answer": raw_answer,
-                "route_status": "complete",
-            }
-        # 否则继续渲染其他结构化数据
-
-    # ② 函数代码渲染
-    _funcs = _data.get("functions", [])
-    if _funcs:
-        for _f in _funcs:
-            _fname = _f.get("name", "")
-            _fsig = _f.get("signature", "")
-            _fdll = _f.get("dll", "")
-            _parts.append(f"\n■ 函数: {_fname}({_fsig})" if _fsig else f"\n■ 函数: {_fname}")
-            if _fdll:
-                _parts.append(f"  动态库: {_fdll}")
-            _parts.append("")
-            if _fsig:
-                _parts.append("  Python ctypes 调用示例:")
-                _parts.append("  ```python")
-                _parts.append("  import ctypes")
-                _parts.append(f"  robot = ctypes.CDLL('{_fdll}')" if _fdll else "  robot = ctypes.CDLL('...')")
-                _parts.append(f"  # {_fname}({_fsig})")
-                _parts.append("  ```")
-            _parts.append("")
-
-    # ③ 操作步骤渲染
-    _steps = _data.get("steps", [])
-    if _steps:
-        _parts.append("\n📋 操作步骤:")
-        for _i, _s in enumerate(_steps, 1):
-            _parts.append(f"  {_i}. {_s}")
-        _parts.append("")
-
-    # ④ 参数列表渲染
-    _params = _data.get("params", {})
-    if _params:
-        _parts.append("\n📊 参数:")
-        for _k, _v in _params.items():
-            _parts.append(f"  • {_k}: {_v}")
-        _parts.append("")
-
-    # ⑤ 硬件配置渲染
-    _hw = _data.get("hardware", {})
-    if _hw:
-        _parts.append("\n🖥️ 硬件配置:")
-        for _k, _v in _hw.items():
-            _parts.append(f"  • {_k}: {_v}")
-        _parts.append("")
-
-    _rendered = "\n".join(_parts).strip()
-
-    # 🔴 Bug Fix 1: 从 raw_llm_answer 中剥离 JSON 提取块，防止后续 extract_align 复读
-    _clean_raw = re.sub(
-        r'【提取】\s*\n?.*?\n?\s*【提取结束】', '', raw_answer, flags=re.DOTALL
-    ).strip()
-
-    # 🔴 去重保护: 如果渲染结果与清理后的原始文本有≥80%重叠，只保留渲染版本
-    if _clean_raw and _rendered:
-        _clean_words = set(_clean_raw.replace("\n", " ").split())
-        _rendered_words = set(_rendered.replace("\n", " ").split())
-        if _clean_words and _rendered_words:
-            _overlap = len(_clean_words & _rendered_words) / max(len(_clean_words), len(_rendered_words))
-            if _overlap > 0.8:
-                _clean_raw = ""  # 高度重叠 → 丢弃原始文本，防止复读
-
-    logger.info(
-        f"🟢 [RenderNode] JSON 渲染: doc='{_doc}', section='{_section}', "
-        f"funcs={len(_funcs)}, steps={len(_steps)}, params={len(_params)}"
-    )
-
+    
     return {
-        "final_answer": _rendered,
-        "raw_llm_answer": _clean_raw,  # 已清理 JSON 块
-        "route_status": "complete",
+        "final_answer": raw_answer.strip(),
+        "route_status": state.get("route_status", "complete"),
     }
 
 
@@ -1200,6 +1071,7 @@ def extract_align_node(state: RAGState) -> dict:
         logger.info(f"  ↳ 共修正 {fixes_applied} 处属性词颠倒/篡改")
 
     # ── 🔴 v3.0 SemanticDedup: 后处理语义去重，消除1.5B小模型段落级重复生成 ──
+    # 取消 JAKA 的豁免权，全量开启去重防御复读机
     import re as _re_dedup
     _sentences = _re_dedup.split(r'(?<=[。！？\n])\s*', corrected)
     _sentences = [s.strip() for s in _sentences if len(s.strip()) >= 8]
@@ -1236,12 +1108,10 @@ def extract_align_node(state: RAGState) -> dict:
 
     # 🔴 v16: 剥离末尾自相矛盾的免责套话
     corrected = _strip_hedging_tail(corrected)
-
     return {
         "final_answer": corrected,
         "route_status": "complete",
     }
-
 
 # ============================================================
 # 条件路由函数（v2 扩展：后处理路由）
@@ -1918,7 +1788,7 @@ def run_graph_stream(
             for chunk in gen:
                 _yielded[0] = True
                 streaming_buffer.append(chunk)
-                yield chunk
+                yield chunk  # 🔴 核心：把它放回来！恢复流式输出极速体验！
 
         # Layer 1: 本地 vLLM
         vllm_healthy = _check_vllm_health()
@@ -1991,16 +1861,23 @@ def run_graph_stream(
         # ── 无 SDK 问题或重试耗尽 → 跳出循环，进入后处理 ──
         break
 
-    # ── v2: 属性对齐后处理（循环外） ──
+    # ========================================================
+    # 🔴 核心修改：只更新内部状态存入历史，绝不再次 yield 给前端！
+    # ========================================================
+    
+    # 1. 渲染退化（直接透传）
+    render_result = render_node(state)
+    state.update(render_result)
+
+    # 2. 属性对齐后处理（更新的是 final_answer 供历史记录使用，不再流式输出）
     align_result = extract_align_node(state)
-    corrected_answer = align_result.get("final_answer", "")
+    state.update(align_result)
 
-    if corrected_answer != state.get("final_answer", ""):
-        state["final_answer"] = corrected_answer
-        # 流式场景下原始 token 已发送，对齐差异仅记录日志
-        logger.info("📊 [Stream] 属性对齐完成（差异已记录，流式输出不做回溯修改）")
+    # 🔴 彻底删除这三行导致“双重输出”的代码：
+    # chunk_size = 15
+    # for i in range(0, len(final_rendered_answer), chunk_size):
+    #     yield final_rendered_answer[i:i + chunk_size]
 
-    # ── 确保生成器正常结束 ──
     return
 
 

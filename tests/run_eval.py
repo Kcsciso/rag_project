@@ -220,31 +220,53 @@ def run_single_case(case: dict, vs: Any, quick: bool = False) -> dict:
     result["answer"] = answer
     result["model"] = model
 
-    # ── 关键词必须包含/禁止包含 (修复空字串与正则兼容) ──
+    # ── 关键词必须包含 (修复拒答类题目的 OR 逻辑) ──
+    refusal_kws = {"未记载", "未包含", "未找到", "未提及", "没有直接提供", "联系技术支持"}
+    
+    # 检查当前用例是不是拒答题（只要 must_contain 里有任何一个拒答词就算）
+    is_refusal_case = any(kw in refusal_kws for kw in case.get("must_contain", []))
+    
+    # 如果是拒答题，只要回答中命中了任一拒答套话，就全算 Pass
+    hit_any_refusal = any(kw in answer for kw in refusal_kws)
+
     for kw in case.get("must_contain", []):
         if not kw.strip():
             continue
-        # 兼容所有形式的拒答模版
-        if kw in ["未记载", "未包含", "未找到", "没有直接提供"]:
-            refusal_patterns = [r'未记载', r'未包含', r'未找到', r'未提及', r'未在.*记载', r'没有直接提供', r'联系技术支持']
-            hit = any(re.search(p, answer) for p in refusal_patterns)
+            
+        if is_refusal_case and kw in refusal_kws:
+            result["checks"][f"含'{kw}'(OR)"] = hit_any_refusal
+            if hit_any_refusal:
+                result["kw_hits"] += 1
+            else:
+                # 为了防止重复报错，只在列表中没有这个报错时才加
+                err_msg = "缺少拒答关键词(需命中'未找到/未记载'等任一即可)"
+                if err_msg not in result["errors"]:
+                    result["errors"].append(err_msg)
         else:
+            # 普通题词汇，严格执行 AND 逻辑
             hit = kw.lower() in answer.lower()
+            result["checks"][f"含'{kw}'"] = hit
+            if hit:
+                result["kw_hits"] += 1
+            else:
+                result["errors"].append(f"缺少关键词'{kw}'")
 
-        result["checks"][f"含'{kw}'"] = hit
-        if hit:
-            result["kw_hits"] += 1
-        else:
-            result["errors"].append(f"缺少关键词'{kw}'")
-
+    # ── 关键词禁止包含 (引入 \b 单词边界，彻底解决 API 子串误杀) ──
     for kw in case.get("must_not_contain", []):
-        if not kw.strip():  # 🔴 过滤空字串陷阱
+        if not kw.strip():
             continue
+            
         if kw.isdigit():
-            # 数字类禁止词：使用前后非数字边界
+            # 数字类禁止词：使用前后非数字边界 (防止把 16502 误判为 6502)
             pattern = rf'(?<!\d){re.escape(kw)}(?!\d)'
             hit = bool(re.search(pattern, answer))
+        elif re.match(r'^[A-Za-z0-9_]+$', kw):
+            # 🔴 核心修复：英文单词/API名，强制使用 \b 单词边界！
+            # 这样 set_robot_power_on 就绝对不会触发 robot_Power_on 的警报！
+            pattern = rf'\b{re.escape(kw)}\b'
+            hit = bool(re.search(pattern, answer, re.IGNORECASE))
         else:
+            # 中文或混合字符（如 "如图", "由于后续内容被截断"），直接字符串匹配
             hit = kw.lower() in answer.lower()
 
         result["checks"][f"不含'{kw}'"] = not hit

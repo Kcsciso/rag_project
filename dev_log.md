@@ -1,5 +1,86 @@
 # 比邻星 (ProximaRAG) — 开发日志
 
+> **日期**: 2026-08-03 | **版本**: v22 → v23 | **类型**: GUI 轨专项攻坚 — 切片扩容/大纲降噪/标题拦截/绝对控制层/物理清洗
+
+### v23 变更 (GUI 轨 5 维专项攻坚 + L4 物理清洗引擎)
+
+**背景**: 针对 JAKA GUI 手册的 4 类顽固问题（步骤列表标题化导致切片碎裂、微缩大纲诱发 LLM 模板化回答、图片编号/截断提示脑补、短查询与特殊符号被噪声过滤误杀），在 L1/L2/L3/L4 四层同步完成靶向修复。
+
+- **L1-1 — 标题正则深度扩展 (pdf_loader.py)**: `_V4_HEADING_PATTERNS` 多级数字编号 `{1,3}` → `{1,5}`，支持高达 6 级深度标题（如 `3.1.5.2.1`）。修复了 JAKA 手册深嵌套章节被漏识别的问题，同时 `.?\s*` 兼容末尾带点和数字汉字粘连的极端排版。
+
+- **L1-2 — 动态双轨标题拦截 (pdf_loader.py)**: `_v4_extract_headings()` 新增 `doc_type` 参数。GUI 轨道绝对禁止将单数字编号（如 "1. 机械臂上电"、"2. 将升级包..."）识别为标题，防止操作步骤列表被切成碎片。SDK 轨道保持原逻辑不变。
+
+- **L1-3 — GUI 轨切片动态扩容 (pdf_loader.py)**: `_v4_build_parent_child_docs()` 中新增动态切片策略——JAKA/GUI 产品 `child_chunk_size` 从默认 400 扩容至 **1500**，`parent_chunk_size` 同步扩容至 **2000**。GUI 手册包含大量长连续操作步骤，小切片易导致步骤断裂；SDK 文档保持 400 精细切片，防止多个 API 混叠。
+
+- **L1-4 — 父级标题跨级扫描修复 (pdf_loader.py)**: `h_parent` 筛选条件从 `lv == parent_level` 改为 `lv <= parent_level`，防止 "第1章" (lv=1) 这种章节级标题被丢弃。同时增加扉页/目录保护——若第一个标题前有文字，自动插入 "文档说明与前言" 伪标题。
+
+- **L1-5 — 跨级大纲扫描终点 (pdf_loader.py)**: Parent 切片的 TOC 扫描范围从 `p_start <= pos < p_end` 改为 `p_start < pos < toc_end`，其中 `toc_end` 延伸到下一个同级或更高级标题。H1(第1章) 的大纲可囊括所有 1.x 子章节直至第2章之前。
+
+- **L1-6 — 微缩大纲降噪 (pdf_loader.py)**: Child 切片的 TOC 上限从 15 条缩减至 **5 条**，超出部分显示 "... (更多章节略)"。防止大模型被长标题列表诱发 "本章主要包含以下功能..." 的模板化回答，将回答焦点拉回具体操作步骤。
+
+- **L1-7 — 大纲标签统一 (pdf_loader.py)**: Parent 和 Child 切片的大纲提示统一为 `[章节大纲参考]:`，替代旧 `【子章节】` / `[本章/本节包含以下子内容大纲]`，与 L2 的 Macro-Routing 提权触发词保持一致。
+
+- **L2-1 — HyDE JAKA 全线封杀 (rag_chain.py)**: `_generate_hyde_doc()` 禁用条件扩展至 `{"OpenC3", "OpenR6", "JAKA"}`。JAKA (GUI 手册) 的大模型 HyDE 假想文档会臆造 Python 代码（如 `robot.power_on()`），严重污染纯图形界面的向量检索。
+
+- **L2-2 — JAKA GUI 噪声过滤豁免 (rag_chain.py)**: `_hybrid_retrieve_single()` 中新增 `_is_gui` 判定——`product_id == "JAKA"` 或 `metadata.doc_type == "gui_app"` 的切片完全豁免 `kw_score < 0.03` 的噪声拦截。解决 JAKA 短文本查询（如 "运动路点" 仅 4 字）BM25 得分低被误杀的问题。
+
+- **L2-3 — 宏观提权引擎 v2 (rag_chain.py)**: Macro-Routing Boost 的广谱查询判定扩展至多关键词（"内容"、"总结"、"介绍"、"大意"、"结构"）；切片特征从单一的 `[本章/本节包含以下子内容大纲]` 升级为双重判定——`chunk_type == "parent"` 或正文包含 `[章节大纲参考]`。命中后仍给予 +5.0 RRF 登顶分。
+
+- **L2-4 — 标题强匹配提权 4.5 (rag_chain.py)**: 新增 Title Exact Match Boost。对每个候选切片提取 `section_title` metadata 字段，若查询词的归一化形式完整包含在标题中（如 "工具坐标系设置" 包含于 "3121工具坐标系设置"），给予 **+5.0 RRF** 绝对高分。
+
+- **L2-5 — 章节绝对隔离匹配 4.6 (rag_chain.py)**: 新增 Chapter Exact Match Isolation。当用户查询包含 "第X章" 时：(1) 目标章节的切片获得 **+20.0** 碾压级加分；(2) 其他章节（匹配 `^\d+\.` 的编号标题）受到 **-10.0** 降权惩罚。中文数字（一~十）自动映射为阿拉伯数字。确保 "第3章有哪些功能" 类查询的检索结果完全隔离于目标章节。
+
+- **L3-1 — GUI Prompt 六条铁律重写 (rag_chain.py)**: `_dual_track_prefix` gui_app 轨从 2 行扩展为 6 条结构化规则：(0) 宏观总结——若上下文包含 `[章节大纲参考]`，扩写为条理清晰的介绍；(1) 结构清晰——操作流程必须用步骤列表；(2) 历史隔离——绝不复述历史对话；(3) 视觉屏蔽——禁止输出图片编号/图注；(4) 禁止脑补——禁止输出截断提示/查阅原文等废话；(5) 禁止代码——绝对禁止输出编程代码。
+
+- **L4-1 — SemanticDedup JAKA 豁免 (graph_rag.py)**: `extract_align_node` 中新增 `product_id == "JAKA"` 判断——GUI 轨道完整保留重复句，不再被 trigram overlap > 0.55 截断。GUI 手册的操作步骤重复（如 "点击确认" 在多步骤中出现）是正常文档特征，不应去重。
+
+- **L4-2 — 终极物理清洗引擎 (graph_rag.py)**: `extract_align_node` 后处理末端新增 5 道正则清洗：(1) 抹杀图片引用——`（如图3-4所示）`/`操作界面如下图2-11所示。`；(2) 抹杀图表单独行——`图3-3 附加程序管理界面`；(3) 抹杀大模型脑补的截断提示——`由于后续内容被截断，完整的描述请查阅...`；(4) 抹杀系统兜底废话——`参考文档中未包含此功能的记载...`；(5) 多余空行整理——`\n{3,}` → `\n\n`。
+
+- **TEST — 3 个新评测用例 (eval_cases.json)**: E27 微观防泛化（"JAKA 运动指令框怎么用？"——禁止大纲模板挟持）；E28 短文本召回（"运动路点" 4 字——测试噪声过滤豁免）；E29 特殊符号召回（"Ethernet/IP IO"——测试实体锚点提权）。
+
+**架构影响**:
+- 🔴 BUG 数（从审计报告追踪）: BUG-1.1 (伪标题误杀) 部分缓解、HALL-1.1 (大纲噪声) ✅ 已修复、HALL-2.1 (JAKA HyDE 毒化) ✅ 已修复、BUG-2.3 (跨产品硬编码阈值) 仍待修复
+- 🟡 新增风险: 章节隔离 -10.0 惩罚可能误伤跨章节依赖的正当查询；Title Exact Match +5.0 在泛化短词查询（如 "设置"）中可能批量提权无关切片
+- GUI 轨回答质量: 步骤列表完整性 ↑、大纲模板化 ↓、图片编号泄漏 ↓、截断废话 ↓
+- L4 物理清洗引擎: 纯 Python 正则后处理，零 LLM 开销，精准消除已知图片/截断幻觉模式
+
+### 变更文件
+
+| 文件 | 变更 |
+|------|------|
+| `src/pdf_loader.py` | L1: 标题正则 {1,3}→{1,5}; `_v4_extract_headings()` +doc_type 动态拦截; GUI 切片扩容 400→1500/1000→2000; 父级 `<=` 修复; 前导文字保护; 跨级大纲扫描; TOC 上限 15→5; 标签统一 `[章节大纲参考]` |
+| `src/rag_chain.py` | L2: HyDE JAKA 禁用; GUI 噪声豁免; Macro-Routing v2; Title Exact Match +5.0; Chapter Isolation +20.0/-10.0; L3: GUI Prompt 6 条铁律重写 |
+| `src/graph_rag.py` | L4: SemanticDedup JAKA 豁免; 终极物理清洗 5 道正则 |
+| `tests/eval_cases.json` | E27/E28/E29 3 个新用例（微观防泛化/短文本召回/特殊符号召回） |
+| `CLAUDE.md` | 四层架构排雷法同步 v23 机制 |
+| `README.md` | 四层能力表同步更新 |
+| `dev_log.md` | 本章节（二十七） |
+| `ARCHITECTURE_AUDIT.md` | v23 变更审计 + 问题状态更新 + 新增风险评估 |
+
+### 当前生产配置快照
+
+| 配置项 | 值 |
+|--------|-----|
+| vLLM 模型 | `Qwen/Qwen2.5-7B-Instruct-AWQ` @ GPU 1 |
+| FastAPI 端口 | **8000** |
+| 向量库 | 120 Parent + 376 Child = **496 chunks** |
+| `_AUTOCUT_MIN_K` | **8** (SDK 检索动态提升至 **10**) |
+| `_AUTOCUT_MAX_K` | **15** |
+| `_MIN_SUB_QUERY_LEN` | **2** |
+| `_MAX_CONTEXT_CHARS` | **4000** (非SDK) / **8000** (SDK) |
+| `CHILD_CHUNK_SIZE` | **400** (SDK) / **1500** (GUI) |
+| `PARENT_CHUNK_SIZE` | **1000** (SDK) / **2000** (GUI) |
+| `LLM_INFERENCE_TIMEOUT` | connect=10.0s, **read=120.0s**, write=15.0s, pool=5.0s |
+| `_VLLM_LOCK_TIMEOUT` | **120.0s** |
+| `MAX_HISTORY_TURNS` | **2** |
+| `SIMILARITY_THRESHOLD` | **0.68** |
+| `RETRIEVAL_K` | **10** |
+| `max_tokens` | **1024** |
+| `_temperature` (stream) | **0.01** |
+| `_temperature` (non-stream) | **0.2** |
+
+---
+
 > **日期**: 2026-07-31 | **版本**: v21 → v22 | **类型**: 四轮闭环重构 — 复合查询/切片截断/术语对齐/排版铁律
 
 ### v22 变更 (ADR-20~22 四轮闭环重构)

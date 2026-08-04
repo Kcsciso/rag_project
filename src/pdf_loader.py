@@ -389,7 +389,9 @@ _V4_HEADING_PATTERNS = [
     (re.compile(r'^(第[一二三四五六七八九十\d]+[章节])\s*(.{1,80}?)(?:\r?\n|$)', re.MULTILINE), 1),
     
     # 层级 2: 多级数字编号 (H2/H3/H4) -> 3.1.5 通讯设置 / 3.1设置 (兼容无空格，点号收尾)
-    (re.compile(r'^(\d+(?:\.\d+){1,3})\.?\s*(.{1,80}?)(?:\r?\n|$)', re.MULTILINE), 2), 
+    # 🔴 [终极修复 2] 多级数字编号：将 {1,3} 放宽至 {1,5}，支持高达 6 级深度的标题 (如 3.1.5.2.1)
+    # \.?\s* 确保完美兼容末尾带点和数字汉字粘连（无空格）的极端排版
+    (re.compile(r'^(\d+(?:\.\d+){1,5})\.?\s*(.{1,80}?)(?:\r?\n|$)', re.MULTILINE), 2),
     
     # 🔴 [终极修复 1] 层级 2: 纯数字+点 (H2) -> 1. 标题 (移除 、 和 ） 防止将 1、列表项误判为大纲导致父块碎裂)
     (re.compile(r'^(\d{1,2})\.\s*(.{1,80}?)(?:\r?\n|$)', re.MULTILINE), 2),
@@ -642,11 +644,13 @@ def _v4_extract_sdk_toc(full_text: str) -> dict:
     return toc_map
 
 
-def _v4_extract_headings(text: str) -> List[Tuple[int, str, int]]:
+# 🔴 [新增 1/2] 函数签名增加 doc_type 参数，默认为 gui_app
+def _v4_extract_headings(text: str, doc_type: str = "gui_app") -> List[Tuple[int, str, int]]:
     """
     从文本中提取所有标题及其层级。
 
     兼容数字编号（3.1.5）、Markdown（##）、中文序号（一、）等多种格式。
+    支持 doc_type 动态双轨策略，防止 GUI 步骤列表被误判为大纲。
 
     Returns:
         [(position, title_text, level), ...]
@@ -657,6 +661,14 @@ def _v4_extract_headings(text: str) -> List[Tuple[int, str, int]]:
 
     for pattern, base_level in _V4_HEADING_PATTERNS:
         for m in pattern.finditer(text):
+            # 👇 -------------------- 🔴 [新增 2/2] 动态双轨标题拦截 -------------------- 👇
+            # 检查当前正则是否为单数字编号模式（例如匹配了 "4. 机械臂上电" 或 "1. 将升级包..."）
+            _is_single_digit_pattern = pattern.pattern.startswith(r'^(\d{1,2})\.')
+            if _is_single_digit_pattern and doc_type == "gui_app":
+                # GUI 轨道：绝对禁止将单数字识别为标题，保护操作步骤 (1. 2. 3.) 不被切碎！
+                continue
+            # 👆 ------------------------------------------------------------------------- 👆
+
             pos = m.start()
             if pos in seen_positions:
                 continue
@@ -677,7 +689,7 @@ def _v4_extract_headings(text: str) -> List[Tuple[int, str, int]]:
                 _CODE_KEYWORDS = ['restype', 'argtypes', 'CDLL', 'ctypes', 'robot.', 'c_int', 'c_float', 'import ']
                 if any(kw in line_context for kw in _CODE_KEYWORDS):
                     continue
-# -----------------------------------------------------------------------------
+            # -----------------------------------------------------------------------------
 
             # 🔴 SDK 表头黑名单过滤：禁止将 SDK 手册表格表头识别为 Heading
             # 剥离数字编号前缀后检查（如 "3. 函数名称" → "函数名称"）
@@ -844,7 +856,7 @@ def _v4_get_ocr_engine():
 _PAGE_DENSITY_THRESHOLD = 30
 
 
-def _v4_extract_text_universal(pdf_path: str) -> Tuple[str, int, int]:
+def _v4_extract_text_universal(pdf_path: str, doc_type: str = "general") -> Tuple[str, int, int]:
     """
     通用 PDF 文本提取器 — 逐页字符密度检测 + OCR 归位融合 + 章节上下文继承。
 
@@ -934,13 +946,16 @@ def _v4_extract_text_universal(pdf_path: str) -> Tuple[str, int, int]:
 
     for page_idx in range(total_pages):
         page = doc[page_idx]
+        
         # -------------------- 🔴 [终极修复 1] Y 坐标物理排序 --------------------
-        # 彻底解决 PDF 表格与示例代码在底层物理分离的错位问题
         blocks = page.get_text("blocks")
         if blocks:
-            # block[6] == 0 代表文本块。按 Y 坐标(容差10px)和 X 坐标进行物理视觉排序
             text_blocks = [b for b in blocks if b[6] == 0]
-            text_blocks.sort(key=lambda b: (round(b[1] / 10) * 10, b[0]))
+            # 👇 修改点 1：针对 GUI 手册放宽 Y 坐标容差（15px），防止多列表格错位
+            if doc_type == "gui_app":
+                text_blocks.sort(key=lambda b: (round(b[1] / 15) * 15, b[0]))
+            else:
+                text_blocks.sort(key=lambda b: (round(b[1] / 10) * 10, b[0]))
             page_text = "\n\n".join([b[4].strip() for b in text_blocks if b[4].strip()])
         else:
             page_text = ""
@@ -950,13 +965,18 @@ def _v4_extract_text_universal(pdf_path: str) -> Tuple[str, int, int]:
         effective_chars = len(re.sub(r'\s', '', page_text))
         needs_ocr = effective_chars < _PAGE_DENSITY_THRESHOLD
 
+        # 👇 修改点 2：定义强制 OCR 标识，赋予 JAKA (gui_app) 专属特权
+        force_image_ocr = (doc_type == "gui_app")
+
         # ── Step 2: 更新标题追踪器（正常密度页）──
         if not needs_ocr and effective_chars >= _PAGE_DENSITY_THRESHOLD:
             _try_update_header(page_text, page_idx)
 
-        # ── Step 3: OCR 补漏（仅低密度页触发）──
+        # ── Step 3: OCR 补漏（低密度页 或 🔴 强制图片OCR）──
         ocr_lines = []
-        if needs_ocr and ocr is not None:
+        
+        # 👇 修改点 3：条件放宽，即使文本很密，只要是 GUI 手册也强制扫图
+        if (needs_ocr or force_image_ocr) and ocr is not None:
             image_list = page.get_images(full=True)
             for img_info in (image_list or []):
                 xref = img_info[0]
@@ -974,12 +994,14 @@ def _v4_extract_text_universal(pdf_path: str) -> Tuple[str, int, int]:
                         continue
 
                     np_img = np.array(pil_img)
-                    result = ocr(np_img)
-                    if result is None:
+                    # 🔴 核心修复：正确解包 RapidOCR 的返回值 (result_list, elapse_time)
+                    ocr_res = ocr(np_img)
+                    if not ocr_res or ocr_res[0] is None:
                         continue
 
                     lines = []
-                    for item in result:
+                    for item in ocr_res[0]:
+                        # item 的结构是: [box坐标, 识别文本, 置信度得分]
                         text = str(item[1]).strip()
                         if text and len(text) >= 2:
                             lines.append(text)
@@ -1007,8 +1029,9 @@ def _v4_extract_text_universal(pdf_path: str) -> Tuple[str, int, int]:
                     f"\n[章节: {last_header['title']}]"
                 )
 
+            # 👇 修改点 4：在标记中注明可能是强制触发的 OCR
             ocr_header = (
-                f"[OCR补漏: page={page_idx + 1}, chars={effective_chars}<{_PAGE_DENSITY_THRESHOLD}]"
+                f"[OCR补漏: page={page_idx + 1}, chars={effective_chars}, forced={force_image_ocr}]"
                 f"{section_header}"
             )
             page_parts.append(ocr_header + "\n" + "\n".join(ocr_lines))
@@ -1162,11 +1185,29 @@ def _v4_build_parent_child_docs(
     Returns:
         (parent_docs, child_docs)
     """
-    headings = _v4_extract_headings(full_text)
-    protected = _v4_find_protected_ranges(full_text)
-
-    # ── 🔴 SDK 全局代码头提取（c_sdk 文档专用）──
+    # 👇 ================= 🔴 新增：调整顺序，先获取 doc_type ================= 👇
+    # ── 1. 提前解析 doc_type ──
     doc_type = _resolve_doc_type(product_id)
+    
+    # ── 2. 将 doc_type 喂给提取引擎，实现动态拦截 ──
+    headings = _v4_extract_headings(full_text, doc_type=doc_type)
+    protected = _v4_find_protected_ranges(full_text)
+    # 👆 ========================================================================= 👆
+
+    # ── 🔴 SDK 全局代码头提取与动态切片大小分配 ──
+    
+    # 👇 ================= v22: 动态切片策略 ================= 👇
+    if doc_type == "gui_app" or product_id == "JAKA":
+        # GUI 手册 (JAKA) 包含大量长连续步骤，切片扩容防断裂
+        child_chunk_size = 1500  
+        parent_chunk_size = max(parent_chunk_size, 2000) # 父块同步扩容
+        logger.info(f"  📐 GUI 轨触发: 切片容量扩容至 Child={child_chunk_size}, Parent={parent_chunk_size}")
+    else:
+        # SDK 文档保持原有精细切片，防止多个 API 混叠
+        # 使用传入的 default 值 (通常为 400 左右)
+        pass 
+    # 👆 ======================================================= 👆
+
     sdk_header = _extract_sdk_header(full_text) if doc_type == "c_sdk" else ""
     if sdk_header:
         logger.info(f"  📦 SDK 代码头已提取: {len(sdk_header)} 字符 → 自动挂载至所有 API Child")
@@ -1179,7 +1220,13 @@ def _v4_build_parent_child_docs(
     elif 2 not in all_levels:
         parent_level = min(all_levels)
 
-    h_parent = [(pos, title, lv) for pos, title, lv in headings if lv == parent_level]
+    # 🔴 核心修复：必须使用 <=，否则“第1章”(lv=1) 会被直接跳过丢弃！
+    h_parent = [(pos, title, lv) for pos, title, lv in headings if lv <= parent_level]
+
+    # 🔴 架构级补全：如果第一章标题上方还有前导文字（扉页、目录），将其保护起来
+    parent_boundaries = [p_start for p_start, _, _ in h_parent] + [len(full_text)]
+    if parent_boundaries and parent_boundaries[0] > 0:
+        h_parent.insert(0, (0, "文档说明与前言", parent_level))
 
     # Fallback: 无任何标题 → 全文作为 1 个 Parent
     if not h_parent:
@@ -1222,14 +1269,26 @@ def _v4_build_parent_child_docs(
             )
             parent_text = parent_text[:cutoff].strip()
 
+        # 👇 ================= 🔴 核心修复：跨级大纲扫描 ================= 👇
+        # 寻找下一个同级或更高级别的标题位置，作为大纲的扫描终点
+        # 这样 H1(第1章) 的大纲就能一直扫描到下一个 H1(第2章) 之前，把所有 1.x 都囊括进来！
+        toc_end = len(full_text)
+        for j in range(i + 1, len(h_parent)):
+            if h_parent[j][2] <= p_lv:
+                toc_end = h_parent[j][0]
+                break
+
         # 子章节 TOC
         child_titles = [
             title for pos, title, lv in headings
-            if p_start <= pos < p_end and lv > parent_level
+            if p_start < pos < toc_end and lv > p_lv
         ]
-        toc = "\n".join(f"- {t}" for t in child_titles[:15])
+        toc = "\n".join(f"- {t}" for t in child_titles[:25])  # 扩容大纲条数到 25
+        
+        # 🔴 注意这里改成了 [章节大纲参考]: ，为了配合我们在 rag_chain.py 里的提权触发词！
         if toc:
-            parent_text = f"{parent_text}\n\n【子章节】\n{toc}"
+            parent_text = f"{parent_text}\n\n[章节大纲参考]:\n{toc}"
+        # 👆 ============================================================= 👆
 
         parent_breadcrumb = _v4_build_breadcrumb(headings, p_start, p_end) or p_title
         parent_id = f"parent_{product_id}_{i}"
@@ -1560,9 +1619,16 @@ def _v4_build_child_docs_v2(
             if lv <= current_lv + 2: # 收集往下两级的标题
                 _local_subs.append(title.strip())
 
+        # 👇 ================= v22 修复 HALL-1.1 ================= 👇
         if _local_subs:
-            # 限制最多追加 15 个，防止大纲过长喧宾夺主
-            toc_text = "\n\n[本章/本节包含以下子内容大纲]:\n- " + "\n- ".join(_local_subs[:15])
+            # 限制微缩大纲上限严格为 5 条，避免"标题噪声"引发大模型幻觉
+            _MAX_TOC_ITEMS = 5
+            toc_lines = _local_subs[:_MAX_TOC_ITEMS]
+            if len(_local_subs) > _MAX_TOC_ITEMS:
+                toc_lines.append("... (更多章节略)")
+            
+            toc_text = "\n\n[章节大纲参考]:\n- " + "\n- ".join(toc_lines)
+        # 👆 ===================================================== 👆
 
     sub_headings = [
         (pos, title, lv) for pos, title, lv in headings
@@ -1573,7 +1639,7 @@ def _v4_build_child_docs_v2(
         # 🔴 H2 导言区：无 H3 子标题 → text 是 Parent 标题后的导言段落
         text = full_text[section_start:section_end].strip()
         
-        # 🟢 注入点 2：如果该块只有大标题和几句话，强制把大纲拼在后面
+        # 🟢 注入点 2：如果该块只有大标题和几句话，强制把大纲拼在后面（作为纯背景提供）
         if toc_text:
             text += toc_text
             
@@ -1909,8 +1975,13 @@ def load_pdfs_v4_dual(
     for pdf_file in pdf_files:
         file_path = os.path.join(data_dir, pdf_file)
         try:
-            # ── v4 通用提取: 字符密度检测 + OCR 归位融合 ──
-            text, total_pages, ocr_pages = _v4_extract_text_universal(file_path)
+            # 👇 修改点 5：把产品 ID 和文档类型的解析提前
+            product_id = _resolve_product_id_from_filename(pdf_file)
+            doc_type = _resolve_doc_type(product_id)
+            
+            # ── 🔴 v4 增强提取: 将 doc_type 传给底层，JAKA 开启全量图像 OCR ──
+            text, total_pages, ocr_pages = _v4_extract_text_universal(file_path, doc_type=doc_type)
+            
             if not text.strip():
                 logger.warning(f"  ⚠️  {pdf_file}: 无有效文本")
                 continue

@@ -15,6 +15,8 @@
 | 核心特性 | 严禁破坏 |
 |----------|---------|
 | `_v4_extract_headings()` 代码注释拦截 | 8 特征词 ±120 字符上下文校验 |
+| 🔴 `_v4_extract_headings()` doc_type 动态双轨拦截 (v23) | gui_app 轨绝对禁止单数字编号(1. 2.)提权为标题，防操作步骤碎裂 |
+| 🔴 `_V4_HEADING_PATTERNS` 多级数字编号 (v23) | `{1,5}` 支持最高 6 级深度标题 (3.1.5.2.1)，末尾带点兼容 |
 | `_sanitize_section_title()` 伪标题黑名单 | frozenset 10 项 + 触发父级 H2 继承 |
 | `_SDK_BLOCK_BOUNDARY_RE` 两类可验证边界 | 数字标题 + 函数名称/函数说明 |
 | `_is_skeleton_chunk()` 骨架过滤 | 150 字符 + 代码特征词 + 实质参数三重判定 |
@@ -22,24 +24,32 @@
 | Micro-Chunk Auto-Merge API 排他锁 | `_extract_primary_api_name()` 提取后不同 API 不合并 |
 | 4 级 Title Fallback 链 | L1 状态机标题 → L2 面包屑 → L3 父级 H2 → L4 硬兜底 |
 | 受保护区域 | 代码块 (```) + Markdown 表格 绝不拦腰切断 |
+| 🔴 动态切片容量分配 (v23) | GUI/JAKA: Child=1500, Parent=2000; SDK: Child=400, Parent=1000 |
+| 🔴 父级标题跨级扫描 (v23) | `lv <= parent_level` 防止章节级标题(H1)被丢弃；前导文字自动保护 |
+| 🔴 跨级大纲扫描终点 (v23) | TOC 扫描至下一个同级/更高级标题，H1 章节完整囊括子章节 |
+| 🔴 微缩大纲上限 (v23) | Child TOC 上限 **5 条** (v22: 15)，超出显示 "... (更多章节略)" |
+| 🔴 大纲标签统一 (v23) | 全部使用 `[章节大纲参考]:`，禁止旧 `【子章节】` / `[本章/本节包含以下子内容大纲]` |
 
 ### L2 — 检索与重排层 (vector_store.py + rag_chain.py `_hybrid_retrieve`)
 | 核心特性 | 严禁破坏 |
 |----------|---------|
 | RRF 四大提权引擎 | Entity Anchor (+0.05) / Function Names (+0.08) / Text Rebalance (+0.03) / CODE BM25 三倍写入 |
+| 🔴 RRF 第五/六提权引擎 (v23) | Title Exact Match (+5.0) subtitle 包含匹配 / Chapter Isolation (+20.0/-10.0) 章节绝对隔离 |
 | 三层保底召回 | 阈值空 → 原始 Top-3 → kept_docs 恢复 |
 | Autocut 断崖检测 | `_autocut_knee()` — RRF 分数相邻差值 Knee Point; `_AUTOCUT_MIN_K=8` (SDK=10), `_AUTOCUT_MAX_K=15` |
 | 复合查询拆解 | `_decompose_compound_query()` + `_MIN_SUB_QUERY_LEN=2` — 两字核心动词不丢弃 |
 | LLM 意图重写 (ADR-19) | `_rewrite_query_with_llm()` 代词消解+产品补全 — 禁止回退正则缝合 |
 | BM25 标识符保护 | `_IDENTIFIER_RE` 正则预提取 → jieba 不拆蛇形函数名 |
-| HyDE 防毒化 | SDK 轨 (OpenC3/OpenR6) + 短 Query (<6ch) + 精确 API 签名 → 全部禁用 |
+| HyDE 防毒化 | SDK 轨 (OpenC3/OpenR6) + 🔴 JAKA (v23) + 短 Query (<6ch) + 精确 API 签名 → 全部禁用 |
+| 🔴 GUI 噪声过滤豁免 (v23) | `_is_gui` (product_id==JAKA 或 doc_type==gui_app) → 完全豁免 kw_score<0.03 拦截 |
+| 🔴 宏观提权 v2 (v23) | 广谱关键词扩展 ("内容/总结/介绍/大意/结构") + 双重判定 (chunk_type=="parent" 或正文含 `[章节大纲参考]`) |
 | `[CODE:xxx]` 标签 | BM25 tokenizer 三倍写入实现 Boost=3.0 |
 | 跨产品检索阈值一致性 | 禁止在 `cross_product_retrieval_node` 中硬编码不同于全局 `SIMILARITY_THRESHOLD` 的值 |
 
 ### L3 — 上下文组装与指令层 (rag_chain.py `_build_messages` + `RAG_SYSTEM_PROMPT`)
 | 核心特性 | 严禁破坏 |
 |----------|---------|
-| 双轨制 Prompt | gui_app: 首句强制红线 + 绝对禁止代码 / c_sdk: SDK 两段式排版铁律 (首句出处+唯一代码块) |
+| 双轨制 Prompt | gui_app: 🔴 六条铁律 (v23: 宏观总结/结构清晰/历史隔离/视觉屏蔽/禁止脑补/禁止代码) / c_sdk: SDK 两段式排版铁律 (首句出处+唯一代码块) |
 | `_term_alignment_prefix` 动态术语对齐 | 仅在命中特定产品+同义词对时按需注入 (如 OpenR6 "使能"→`set_robot_arm_init`)，零全局 Token 损耗 |
 | `_anti_bleed_prefix` 反跨产品泄露 | metadata function_names + 正文双重确认 → 仅目标缺失 + 非目标有 API 时注入 |
 | Context Cap 整块剔除 | 从末尾 Parent 优先丢弃，不切割任何 Chunk 内部正文 |
@@ -53,8 +63,10 @@
 |----------|---------|
 | SDK 两段式排版铁律 (ADR-22) | `_dual_track_prefix` 强制 "首句出处说明 + 唯一整合代码块"，`_dll_name` 基于 product_id 精确推断 |
 | 静默斩尾 `_strip_hedging_tail()` | 8 模式 regex — "上述代码假设存在"/"参考文档未包含详细步骤" 等 |
+| 🔴 L4 终极物理清洗引擎 (v23) | 5 道正则: 图片引用/图表单独行/截断提示/系统废话/多余空行 → 纯 Python 后处理，零 LLM 开销 |
 | `_fix_and_close_sdk_code()` | Markdown 反引号闭合 + CDLL 智能补全（需 product_id 精确判定 DLL） |
 | `extract_align_node` 属性词硬改写 | 50+ 领域属性词库 + 数值前后 12+8 字符窗口 |
+| 🔴 SemanticDedup JAKA 豁免 (v23) | `product_id == "JAKA"` → 完整保留重复句，GUI 操作步骤的重复是正常文档特征 |
 | SDK 自纠错硬熔断 | `retry_count >= 2 → skip`（入口检测 + 循环检测 双保险） |
 | `_stream_guardrail()` 伪流式 | 已知问题：全量缓冲导致 TTFB 退化，待修复为增量检查 |
 | NEVER-EMPTY 保证 | 所有 4 层 + 流式/非流式双路径均覆盖终极兜底 |
@@ -103,7 +115,8 @@ Conda `rag_agent` (Python 3.10)。**严禁 `pip install --upgrade`**：
 | v18 | v18 | 🔴 代码注释污染治理: Heading上下文拦截/伪标题黑名单/状态机净化/Golden TOC预留 | `_v4_extract_headings()` 代码注释拦截, `_sanitize_section_title()` 伪标题黑名单, `_v4_extract_sdk_toc()` |
 | v19 | v19 | LLM Query Rewriting 意图重写引擎 (ADR-19) | `_rewrite_query_with_llm()`, `REWRITE_SYSTEM_PROMPT`, 废弃 `_fuse_short_query`/`_resolve_clarification_followup`/`_has_business_intent` |
 | v20-22 | v20-22 | 四轮闭环重构 (ADR-20/21/22): 复合查询子任务阈值 4→2 / Autocut SDK 防误杀 / 动态术语对齐 / SDK 两段式排版铁律 | `_MIN_SUB_QUERY_LEN=2`, `_AUTOCUT_MIN_K=8`(SDK=10), `_AUTOCUT_MAX_K=15`, `_term_alignment_prefix`, `_dual_track_prefix` 两段式 |
-| **当前** | **v22** | max_tokens=1024, MAX_HISTORY_TURNS=2, _MAX_CONTEXT_CHARS=4000(SDK=8000), _AUTOCUT_MIN_K=8(SDK=10), _AUTOCUT_MAX_K=15, _MIN_SUB_QUERY_LEN=2 | — |
+| v23 | v23 | 🔴 GUI 轨专项攻坚: 双轨标题拦截 / 动态切片扩容 / 大纲降噪 / 章节隔离+标题强匹配提权 / GUI Prompt 六铁律 / L4 物理清洗引擎 / SemanticDedup 豁免 / HyDE JAKA 封杀 / GUI 噪声豁免 | `_v4_extract_headings()` +doc_type, `CHILD_CHUNK_SIZE=1500`(GUI), Chapter Isolation +20.0/-10.0, Title Exact Match +5.0, GUI Prompt 六条铁律, L4 5 道物理清洗正则 |
+| **当前** | **v23** | max_tokens=1024, MAX_HISTORY_TURNS=2, _MAX_CONTEXT_CHARS=4000(SDK=8000), _AUTOCUT_MIN_K=8(SDK=10), _AUTOCUT_MAX_K=15, _MIN_SUB_QUERY_LEN=2, CHILD_CHUNK_SIZE=400(GUI=1500) | — |
 
 ### 当前关键配置
 
@@ -114,8 +127,8 @@ Conda `rag_agent` (Python 3.10)。**严禁 `pip install --upgrade`**：
 | _AUTOCUT_MAX_K | 15 | v22: 上限15，承载多参数/多步骤 SDK 切片 |
 | _MIN_SUB_QUERY_LEN | 2 | v22: 复合查询最小子句长度，两字动词不丢弃 |
 | _MAX_CONTEXT_CHARS | 4000 / 8000(SDK) | v20: 非SDK 4000 / SDK 8000，配合 Autocut 满载 |
-| CHILD_CHUNK_SIZE | 400 | H3/H4 函数级子层 |
-| PARENT_CHUNK_SIZE | 1000 | H2 章节级父层 |
+| CHILD_CHUNK_SIZE | 400 / 1500(GUI) | 🔴 v23: H3/H4 函数级子层; GUI 轨扩容至 1500 防止长步骤断裂 |
+| PARENT_CHUNK_SIZE | 1000 / 2000(GUI) | 🔴 v23: H2 章节级父层; GUI 轨同步扩容 |
 | CHUNK_MODE | v4_dual | Parent+Child 双层索引 |
 | SIMILARITY_THRESHOLD | 0.68 | 向量检索阈值 |
 | RETRIEVAL_K | 10 | 单次检索召回数 |
@@ -171,19 +184,21 @@ python app.py   # → http://localhost:8000 (比邻星 ProximaRAG) · API: /docs
 | 函数 | 位置 | 用途 |
 |------|------|------|
 | `_v4_parse_sdk_state_machine()` | pdf_loader.py | SDK 轨状态机 API 块解析器（`数字标题` + `函数名称/函数说明` 两类边界） |
-| `_v4_extract_headings()` | pdf_loader.py | 标题提取 + 🔴 代码注释拦截（8 特征词上下文校验） |
+| `_v4_extract_headings()` | pdf_loader.py | 标题提取 + 🔴 代码注释拦截（8 特征词上下文校验）+ 🔴 v23: doc_type 动态双轨拦截（GUI 禁止单数字编号） |
 | `_sanitize_section_title()` | pdf_loader.py | 标题清洗器 + 🔴 伪标题黑名单（10 项 frozenset） |
 | `_v4_extract_sdk_toc()` | pdf_loader.py | 🔴 Golden TOC 目录树预解析（预留回退基础设施） |
 | `_is_skeleton_chunk()` | pdf_loader.py | 离线骨架过滤 |
 | `_clean_pdf_text()` | pdf_loader.py | 7 步通用文本清洗 + 🔴 Step 6 SDK 代码换行修复 |
-| `_hybrid_retrieve()` | rag_chain.py | BM25+向量 RRF 混合检索 |
+| `_v4_build_parent_child_docs()` | pdf_loader.py | 🔴 v23: 父级跨级扫描 + 动态切片容量分配 (GUI=1500/2000) + 前导文字保护 + 跨级大纲扫描 |
+| `_v4_build_child_docs_v2()` | pdf_loader.py | 🔴 v23: 微缩大纲上限 5 条 + 标签统一 `[章节大纲参考]` |
+| `_hybrid_retrieve()` | rag_chain.py | BM25+向量 RRF 混合检索 + 🔴 v23: 六大提权引擎 (含 Title Exact Match +5.0 / Chapter Isolation +20.0/-10.0) |
 | `_decompose_compound_query()` | rag_chain.py | 复合查询拆解 (顺序连接词) |
-| `_build_messages()` | rag_chain.py | Prompt 组装 + 双轨控制 + 反泄露门控 + 🔴 SDK Context Cap 4000 |
+| `_build_messages()` | rag_chain.py | Prompt 组装 + 双轨控制 + 反泄露门控 + 🔴 v23: GUI Prompt 六条铁律 |
 | `sanitize_chat_history()` | rag_chain.py | 历史沉渣净化中间件 |
 | `_fix_and_close_sdk_code()` | rag_chain.py | 🔴 代码块自动闭合 + CDLL 补全（替代已删除的 `_ensure_code_blocks_closed`） |
 | `_call_llm()` / `_stream_llm()` | rag_chain.py | LLM 调用 + 400 拦截 + Context 裁切 |
 
-### 🔴 PDF 切片规则 (v18)
+### 🔴 PDF 切片规则 (v23)
 
 #### SDK 状态机边界触发条件 (`_SDK_BLOCK_BOUNDARY_RE`)
 
@@ -194,6 +209,14 @@ python app.py   # → http://localhost:8000 (比邻星 ProximaRAG) · API: /docs
 ```
 
 **严格禁止**匹配的模式：`^#{1,4}\s+`（Python 注释 `# 时间等待3秒` 与 Markdown 标题无法区分，已从边界正则中永久移除）。
+
+#### 🔴 v23: 标题正则深度扩展
+
+多级数字编号 `{1,5}` 支持最高 6 级深度标题（如 `3.1.5.2.1`），兼容末尾带点和数字汉字粘连的极端排版。
+
+#### 🔴 v23: 动态双轨标题拦截 (`_v4_extract_headings`)
+
+`_v4_extract_headings(text, doc_type="gui_app")` — GUI 轨道绝对禁止将单数字编号（"1. 步骤A"、"2. 步骤B"）识别为标题，防止操作步骤列表被切成碎片。SDK 轨道保持原逻辑不变。
 
 #### Heading 代码注释拦截 (`_v4_extract_headings`)
 
@@ -210,6 +233,18 @@ frozenset({"时间等待", "命令发送", "示例代码", "代码示例", "调�
            "参数说明", "返回值", "功能描述", "函数说明", "注意事项", "备注"})
 ```
 标题清洗后长度 < 15 字符 且 包含黑名单关键词 → 返回 `""` → 调用方自动继承父级 H2 标题。
+
+#### 🔴 v23: 父级标题跨级扫描修复
+
+`h_parent` 筛选条件 `lv <= parent_level`（v22: `lv == parent_level`）。防止章节级标题被错误丢弃。前导文字（第一个标题前的扉页/目录）自动保护为 "文档说明与前言"。
+
+#### 🔴 v23: 跨级大纲扫描终点
+
+Parent TOC 扫描至下一个同级或更高级标题 (`toc_end`)，H1(第1章) 的大纲可囊括所有 1.x 子章节。
+
+#### 🔴 v23: 微缩大纲降噪
+
+Child 切片 TOC 上限从 15 条缩减至 **5 条**，超出显示 "... (更多章节略)"。防止标题列表噪声诱发大模型模板化回答。
 
 #### Golden Section 继承机制
 
@@ -242,7 +277,7 @@ LLM_INFERENCE_TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=15.0, pool
 CHUNK_SIZE=300 / CHUNK_OVERLAP=50 / RETRIEVAL_K=10 / SIMILARITY_THRESHOLD=0.68
 _AUTOCUT_MIN_K=8 / _AUTOCUT_MAX_K=15  # SDK 检索时 MIN_K 动态提升至 10
 _MIN_SUB_QUERY_LEN=2  # v22: 复合查询最小子句长度，两字动词不丢弃
-CHUNK_MODE = "v4_dual"  # Parent(1000) + Child(400)
+CHUNK_MODE = "v4_dual"  # Parent(1000) + Child(400), GUI: Parent(2000) + Child(1500)
 _MAX_CONTEXT_CHARS = 4000  # SDK 检索时动态提升至 8000
 
 # 嵌入

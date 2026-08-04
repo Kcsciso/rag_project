@@ -1301,37 +1301,13 @@ def _direct_retrieval_response_stream(
 # Prompt 模板 — RAG 的核心"咒语" (瘦身重构版)
 # ============================================================
 
-RAG_SYSTEM_PROMPT = """你是由湖南比邻星科技开发的"比邻星(ProximaRAG)"官方文档智能助手。
-请基于【参考资料】准确回答关于公司产品、API、开发与使用指南的问题。
+RAG_SYSTEM_PROMPT = """你是由湖南比邻星科技开发的官方文档智能助手。
+你的唯一任务是阅读【参考资料】，解答用户问题。
 
 🔴【最高铁律·绝不捏造】
-- 若【参考资料】中未包含用户询问的功能、步骤、数值（如密码/IP/端口）或库：
-  你必须直接止步，仅回复：“参考文档中未包含此功能的记载，建议联系技术支持或查阅最新文档。”
-- 绝对严禁：自行编造代码、提供替代方案、解释为什么没有、或使用常识捏造默认值（如 admin/502/192.168.1.1）。
-
-🔴【SDK 与代码规范】
-1. 标识符字面锚定：所有 API 函数名、结构体、DLL名必须与资料**逐字符100%一致**。
-2. ctypes 强制约束：代码示例必须使用 Python `ctypes` 库。包含：CDLL加载(准确对应产品dll) → argtypes/restype声明 → 函数调用。
-3. 禁用库：严禁导入/使用 numpy, matplotlib, socket, opencv 等未记载的第三方库。
-4. 产品隔离：严禁将 OpenR6/OpenC3/JAKA 的专属 DLL、IP 或函数张冠李戴。若资料缺失当前产品的特定函数，直接硬拒答。
-
-🔴【内容复述与排版规范】
-1. 步骤原文复述：操作步骤、状态变化、GUI 界面文字必须与原文逐字一致，严禁脑补推测未提及的时间/状态/位置。
-2. 数值与协议：严格区分不同通信协议（如 TCP vs RTU）。若存在同一属性的多个数值/端口，必须按功能完整列出，绝不可漏报。
-3. 纯 Markdown 格式：代码用 ```python，步骤用有序列表，独立公式用 $$..$$，禁用任何 JSON 输出。
-4. 出处溯源：回答首句强制固定格式：
-   根据《完整文档名》【章节标题】（第X页）的记载：
-5. 执行纪律：代码块 ``` 闭合后，立即结束回答，绝对禁止陷入死循环重复输出相似代码！
-
-🔴【SDK 与代码规范】
-1. 标识符字面锚定：所有 API 函数名、结构体、DLL名必须与资料**逐字符100%一致**。
-   【🚨 绝对禁止前缀缩写】：在 ctypes 中，若实例名为 robot，调用 robot_movl 必须写为 robot.robot_movl()！
-   ❌ 错误写法（严禁）：robot.movl()、robot.power_on()、robot.socket_start()
-   ✅ 正确写法（必须）：robot.robot_movl()、robot.robot_Power_on()、robot.Robot_socket_start()
-2. ctypes 强制约束：代码示例必须使用 Python `ctypes` 库。包含：CDLL加载(准确对应产品dll) → argtypes/restype声明 → 函数调用。
-3. 禁用库：严禁导入/使用 numpy, matplotlib, socket, opencv 等未记载的第三方库。
-4. 产品隔离：严禁将 OpenR6/OpenC3/JAKA 的专属 DLL、IP 或函数张冠李戴。若资料缺失当前产品的特定函数，直接硬拒答。
-"""
+1. 提取的 API 函数名必须逐字 100% 对应原文，严禁缩写或编造（必须是 robot_movl，不能是 movl）。
+2. 严禁导入未经记载的第三方库。如果需要加载 DLL，必须准确使用原文的库名称。
+3. 若文档中未记载该功能，必须直接回复：“参考文档中未包含此功能的详细记载，建议联系技术支持。”"""
 
 # ============================================================
 # 切片噪声过滤 — 防止庞大结构体定义挤占有效 Context
@@ -1585,11 +1561,11 @@ def _build_messages(
     # ── 🔴 v18: 动态 Context 上限控制 (修复跨产品大截断) ──
     # 不再盲目扩容到 12000 字符，因为大模型的 Context Window (输入窗口) 是有限的。
     # 我们通过限制物理切片数量，把筛选压力交给前面完美的 RRF 排名，防止切片过多导致末尾被连根裁掉。
-    _MAX_CONTEXT_CHARS = 4500 
+    _MAX_CONTEXT_CHARS = 8000 
     
     # 🔴 物理锁死：最多只喂给大模型前 6 个最强相关的切片！
     # 这样既能保证包含双文档（比如 3 个 OpenC3 + 3 个 OpenR6），又绝不会触发总长度溢出截断。
-    _safe_docs = context_docs[:6]
+    _safe_docs = context_docs[:12]
 
     child_parts = []   # 【精确定位小节】
     parent_parts = []  # 【章节背景】
@@ -1864,43 +1840,36 @@ def _build_messages(
                 if _doc.metadata.get("doc_type", "") == "c_sdk" or _pid in ["OpenR6", "OpenC3"]:
                     _is_sdk = True
                     
-    # 将多个章节合并（最多显示3个，避免太长）
-    _doc_section_str = "、".join(_sections[:3])
-    if len(_sections) > 3:
-        _doc_section_str += " 等"
+    # 🔴 核心修复：拒绝大杂烩！只取相关性最高（排名第一）的章节名作为来源标引
+    _doc_section_str = _sections[0] if _sections else "相关章节"
 
     # 🔴 动态决断 DLL 文件名，直接塞进模板
     _dll_name = "py_dll.dll" if _pid == "OpenR6" else "collrob_sdk.dll"
 
-    # 🟢 针对不同轨道，套用不同的强制模板
+    # 🟢 针对不同轨道，套用强制的 Markdown 填空模板
     if not _is_sdk:
-        if _doc_section_str:
-            _dual_track_prefix = (
-                "【首句强制红线】你的回答第一句必须完全按照以下内容开头，字面严禁改变：\n"
-                f"根据《{_doc_name}》涉及的【{_doc_section_str}】等章节记载：\n\n"
-                "【🔴 APP 手册模式】若涉及操作流程用步骤列表；若涉及概念/大纲请直接输出自然段摘要。\n"
-                "🚫 绝对禁止输出代码！绝对禁止在结尾补充任何免责声明！问什么答什么，就此止步。\n\n"
-            )
-        else:
-            _dual_track_prefix = (
-                "【🔴 APP 手册模式】若涉及操作流程用步骤列表；若涉及概念/大纲请直接摘要。\n"
-                "🚫 绝对禁止输出代码！绝对禁止在结尾补充任何免责声明。\n\n"
-            )
+        _dual_track_prefix = (
+            "【🔴 APP 手册排版铁律 - 必须严格遵守以下输出格式】\n"
+            "你的回答必须以出处声明开头，然后直接列出步骤。绝对禁止输出废话！\n\n"
+            "【你的回答必须严格原样复制以下格式作为开头】：\n"
+            f"根据《{_doc_name}》【{_doc_section_str}】的记载：\n\n"
+            "1. [填写操作步骤1]\n"
+            "2. [填写操作步骤2]"
+        )
     else:
-        if _doc_section_str:
-            _dual_track_prefix = (
-                "【🔴 SDK 回复排版铁律】\n"
-                "你的回答必须严格遵循以下两段式结构，严禁颠倒或省略：\n"
-                "1. **第一段（文字说明）**：必须以原话开头：\n"
-                f"   根据《{_doc_name}》涉及的【{_doc_section_str}】章节记载，相关操作步骤与函数实现如下：\n"
-                "2. **第二段（唯一代码块）**：紧跟在文字说明下方，输出一个完整的 ```python 代码块，使用 ctypes 加载 '{_dll_name}' 并整合所有步骤。\n\n"
-                "【最高纪律】：绝对禁止在代码块外面再套多余的解释！代码块闭合后立刻结束回答！\n\n"
-            )
-        else:
-            _dual_track_prefix = (
-                "【🔴 SDK 极简排版铁律】\n"
-                "请先用一句话说明出处和函数功能，再紧跟唯一的 ```python 代码块（使用正确的 dll），写完立刻结束。\n\n"
-            )
+        _dual_track_prefix = (
+            "【🔴 SDK 代码排版铁律 - 必须严格遵守以下输出格式】\n"
+            "绝不能在代码块外部写多余的废话！你的回答必须以出处声明开头，然后直接跟代码块！\n\n"
+            "【你的回答必须严格原样复制以下格式作为开头】：\n"
+            f"根据《{_doc_name}》【{_doc_section_str}】的记载：\n\n"
+            "💻 Python ctypes 调用示例:\n"
+            "```python\n"
+            "import ctypes\n"
+            f"robot = ctypes.CDLL('{_dll_name}')\n\n"
+            "# 1. [基于原文说明步骤作用]\n"
+            "robot.[准确函数名]([参数])\n"
+            "```"
+        )
 
     # 👇 ================= 新增：动态术语对齐 ================= 👇
     _term_alignment_prefix = ""
@@ -1912,14 +1881,16 @@ def _build_messages(
     # 👆 ======================================================= 👆
 
     # ---- 构建当前轮次的用户消息（含明确边界标记） ----
-    current_user_message = f"""{_anti_bleed_prefix}{_term_alignment_prefix}{_dual_track_prefix}{_cond_constraint}【参考资料】
+    # 🔴 修改点：把 _dual_track_prefix 从上方移走
+    current_user_message = f"""{_anti_bleed_prefix}{_term_alignment_prefix}{_cond_constraint}【参考资料】
 {context_text}
 
 ---
 【用户问题】
 {query}
 
-请基于以上参考资料回答问题。如果参考资料不足以回答，请明确说明。"""
+{_dual_track_prefix}
+🔴 请基于以上参考资料，严格套用上述模板回答问题。如果参考资料不足以回答，请明确说明。"""
 
     # ---- 组装完整消息列表 ----
     _system_content = RAG_SYSTEM_PROMPT
@@ -2059,24 +2030,11 @@ def _hard_refusal_stream() -> Generator[str, None, None]:
 
 def _stream_guardrail(gen: Generator[str, None, None]) -> Generator[str, None, None]:
     """
-    对流式 LLM 输出做代码块自动闭合后处理。
-
-    缓冲全部 token 后应用 _fix_and_close_sdk_code，再按 ~15 字符/块
-    重新 yield，保持前端打字机效果。
+    【重构版】直接穿透，废除全部缓冲逻辑，恢复极限流式速度。
+    格式控制已经交由 Prompt 的 Markdown 模板保证。
     """
-    buffer = []
     for chunk in gen:
-        buffer.append(chunk)
-    full_text = "".join(buffer)
-    fixed = _fix_and_close_sdk_code(full_text)
-    # 如果 fix 没有改变文本，直接重新 yield 原始 chunks（零开销）
-    if fixed == full_text:
-        yield from buffer
-        return
-    # fix 追加了 ``` → 按块重新 yield
-    chunk_size = 15
-    for i in range(0, len(fixed), chunk_size):
-        yield fixed[i:i + chunk_size]
+        yield chunk
 
 
 def _is_chitchat(query: str) -> bool:
@@ -2211,12 +2169,12 @@ def _generate_hyde_doc(query: str, product_id: Optional[str] = None) -> str:
     if not query or not query.strip():
         return ""
 
-    # 🔴 Step1: SDK 产品级 HyDE 硬禁用
-    #   OpenC3/OpenR6 的 HyDE 假想文档会生成硬件描述（"电源按钮"、"控制柜"等），
-    #   毒化向量检索，将真正的 SDK API 切片挤出 Autocut 截断线
-    if (product_id and product_id in {"OpenC3", "OpenR6"}) or _is_sdk_code_query(query):
+    # 🔴 Step1: 强行禁用 HyDE (SDK 与 GUI 轨道全线封杀)
+    #   - OpenC3/OpenR6: 假想文档会生成硬件描述，毒化 SDK API 检索
+    #   - JAKA (GUI手册): 大模型会臆造 Python 代码，严重污染纯图形界面的检索
+    if (product_id and product_id in {"OpenC3", "OpenR6", "JAKA"}) or _is_sdk_code_query(query):
         logger.info(
-            f"🛡️  SDK 查询(product_id={product_id}) → 强行禁用 HyDE，"
+            f"🛡️  命中硬禁用规则(product_id={product_id}) → 强行禁用 HyDE，"
             f"回归纯净向量/BM25 检索"
         )
         return ""
@@ -2544,7 +2502,10 @@ def _hybrid_retrieve_single(
             _has_fn_meta = bool(
                 hasattr(doc, 'metadata') and doc.metadata.get("function_names", "")
             )
-            if kw_score < 0.03 and not _has_fn_meta:
+            # 👇 🔴 终极豁免：只要是 JAKA，绝对不拦截！不再依赖不稳定的 doc_type
+            _is_gui = (product_id == "JAKA") or (hasattr(doc, 'metadata') and doc.metadata.get("doc_type", "") == "gui_app")
+            
+            if kw_score < 0.03 and not _has_fn_meta and not _is_gui:
                 _txt = doc.page_content.lower()
                 _has_code = any(
                     kw in _txt for kw in ('robot_', 'set_', 'get_', 'ctypes', 'cdll',
@@ -2610,7 +2571,7 @@ def _hybrid_retrieve_single(
                 _query_anchors.add(_m.group(0).lower())
 
             if _query_anchors:
-                _anchor_boost = 0.05
+                _anchor_boost = 5.0
                 _boosted_count = 0
                 for _doc_id, _score in fused:
                     _doc_content = doc_map.get(_doc_id, None)
@@ -2656,23 +2617,81 @@ def _hybrid_retrieve_single(
                 logger.info(f"  📄 Text-Chunk Rebalance: {_text_boosted} 纯文本切片 +{_text_boost} RRF")
             fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
 
-            # ── 4. 章节与大纲精确提权 (Macro-Routing Boost) ──
+            # ── 4. 宏观与大章节精确提权 (Macro-Routing Boost) ──
             _chap_match = re.search(r'(第\d+章|第\d+节)', _query_normalized)
-            _is_broad_query = len(_query_normalized) < 15 and not _query_code_entities
+            # 增加对“内容、总结、介绍”等宏观意图关键词的探测
+            _is_broad_query = any(kw in _query_normalized for kw in ["内容", "总结", "介绍", "大意", "结构", "有哪些", "大纲"])
             
             _macro_boosted = False
             for _doc_id, _score in fused:
                 _doc = doc_map.get(_doc_id)
                 if _doc:
-                    if "[本章/本节包含以下子内容大纲]" in _doc.page_content:
+                    _meta = _doc.metadata if hasattr(_doc, 'metadata') else {}
+                    _content = _doc.page_content if hasattr(_doc, 'page_content') else str(_doc)
+                    
+                    # 🔴 双重判定：Metadata 是 parent 切片，或者包含了我们新改的章节大纲提示
+                    _is_parent = _meta.get("chunk_type") == "parent"
+                    _has_toc = "[章节大纲参考]" in _content
+                    
+                    if _is_parent or _has_toc:
                         if _chap_match or _is_broad_query:
-                            rrf_scores[_doc_id] += 5.0  # 🔴 直接登顶
+                            rrf_scores[_doc_id] += 5.0  # 🔴 给予+5.0的绝对高分，直接登顶
                             _macro_boosted = True
             
             if _macro_boosted:
                 fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
-                logger.info(f"🚀 Macro-Routing: 命中微缩大纲特征，已将父切片推至 Top-1")
+                logger.info(f"🚀 Macro-Routing: 命中宏观提问意图，已将 Parent/大纲切片强行推至 Top-1")
 
+            # 👇 ================= 新增：4.5 和 4.6 绝对控制层 ================= 👇
+
+            # ── 🔴 4.5 标题强匹配提权 (Title Exact Match Boost) ──
+            _title_boosted = False
+            # 去除标点符号，仅保留汉字和字母数字用于严格比对
+            _q_clean = re.sub(r'[^\w\u4e00-\u9fa5]', '', query).lower()
+            if len(_q_clean) >= 2:
+                for _doc_id, _score in fused:
+                    _doc = doc_map.get(_doc_id)
+                    if _doc:
+                        _title = _doc.metadata.get("section_title", "") if hasattr(_doc, 'metadata') else ""
+                        _title_clean = re.sub(r'[^\w\u4e00-\u9fa5]', '', _title).lower()
+                        # 若查询词完整包含在标题中（如"工具坐标系设置" 包含于 "3121工具坐标系设置"）
+                        if _q_clean in _title_clean and _q_clean:
+                            rrf_scores[_doc_id] += 5.0  # 给予+5.0绝对高分
+                            _title_boosted = True
+                
+                if _title_boosted:
+                    fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+                    logger.info(f"🎯 Title Exact Match: 命中标题强匹配，已将相关切片推至 Top-1")
+
+            # ── 🔴 4.6 章节绝对隔离匹配 (Chapter Exact Match Isolation) ──
+            _chap_specific_match = re.search(r'第([一二三四五六七八九十\d]+)章', query)
+            if _chap_specific_match:
+                _chap_num_str = _chap_specific_match.group(1)
+                # 将中文数字映射为阿拉伯数字，以便和标题里的 "3.1" 这种格式对比
+                _chap_digit_map = {'一':'1', '二':'2', '三':'3', '四':'4', '五':'5', '六':'6', '七':'7', '八':'8', '九':'9', '十':'10'}
+                _target_digit = _chap_digit_map.get(_chap_num_str, _chap_num_str)
+                
+                _chap_boosted = False
+                for _doc_id, _score in fused:
+                    _doc = doc_map.get(_doc_id)
+                    if _doc:
+                        _title = _doc.metadata.get("section_title", "") or _doc.metadata.get("section", "")
+                        
+                        # 如果该切片的标题确实以目标数字开头（例如 "3.1.1.4" 匹配 "3"）
+                        if re.match(rf'^{_target_digit}\.', _title) or f"第{_chap_num_str}章" in _title or f"第{_target_digit}章" in _title:
+                            rrf_scores[_doc_id] += 20.0  # 给予碾压级别的加分
+                            _chap_boosted = True
+                        # 惩罚其他章节（例如 2.x.x），防止其干扰 LLM
+                        elif re.match(r'^\d+\.', _title):
+                            rrf_scores[_doc_id] -= 10.0  
+                
+                if _chap_boosted:
+                    fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+                    logger.info(f"🎯 Chapter Isolation: 命中明确章节意图【第{_target_digit}章】，已强行降权其他章节")
+
+            # 👆 ================================================================= 👆
+
+            # 最后统一结算最终得分列表，用于后续的 Autocut 截断
             rrf_score_list = [score for _, score in fused]
             
             # ── 5. 动态 Autocut 截断 ──
@@ -3153,30 +3172,8 @@ def shutdown_clients():
 def _fix_and_close_sdk_code(answer: str, doc_type: str = "") -> str:
     if not answer: return answer
 
-    # 1. 物理静默斩尾
     import re
-    answer = re.sub(r'注意[：:].*?(?:假设|没有明确|未包含|仅供参考).*', '', answer, flags=re.DOTALL|re.IGNORECASE)
-    answer = re.sub(r'(?:上述|以上)代码(?:假设|仅为).*', '', answer, flags=re.DOTALL|re.IGNORECASE)
-    answer = answer.strip()
-
-    # 2. 如果包含 robot. 但没有反引号，强行套壳
-    if "```" not in answer and any(kw in answer for kw in ["robot.", "ctypes", "CDLL"]):
-        parts = answer.split("的记载：")
-        if len(parts) > 1:
-            header = parts[0] + "的记载：\n"
-            code_body = parts[1].strip()
-            answer = f"{header}\n```python\n{code_body}\n```\n"
-        else:
-            answer = f"```python\n{answer}\n```"
-
-    # 3. 🔴 暴力闭合：如果结尾不是 ```，且前面有 ```python，强行补上
-    if "```python" in answer and not answer.rstrip().endswith("```"):
-        answer = answer.rstrip() + "\n```"
-
-    # ==========================================================
     # 4. 🔴 终极硬防线：暴力镇压 7B 模型的 ctypes 缩写幻觉
-    # ==========================================================
-    # 修复 OpenC3 经常被吃掉的 robot_ 前缀和大小写篡改
     _OC3_CORRECTIONS = {
         r'\brobot\.movl\b': 'robot.robot_movl',
         r'\brobot\.movj\b': 'robot.robot_movj',
@@ -3186,20 +3183,23 @@ def _fix_and_close_sdk_code(answer: str, doc_type: str = "") -> str:
         r'\brobot\.socket_close\b': 'robot.Robot_socket_close',
         r'\brobot\.enable\b': 'robot.robot_enable',
         r'\brobot\.disable\b': 'robot.robot_disable',
+        r'\brobot\.brkopen\b': 'robot.robot_brkopen',
+        r'\brobot\.get_pose\b': 'robot.get_robot_pose',
     }
     for wrong, right in _OC3_CORRECTIONS.items():
         answer = re.sub(wrong, right, answer, flags=re.IGNORECASE)
 
-    # 修复 OpenR6 容易被大模型捏造的英文翻译函数
     _OR6_CORRECTIONS = {
         r'\brobot\.send_linear_motion\b': 'robot.set_move_line',
         r'\brobot\.linear_motion\b': 'robot.set_move_line',
+        r'\brobot\.move_line\b': 'robot.set_move_line',
         r'\bopenr6_dll\.dll\b': 'py_dll.dll',
+        r'\brobot\.get_joint_angle_all\b': 'robot.get_robot_joint_angle_all',
     }
     for wrong, right in _OR6_CORRECTIONS.items():
         answer = re.sub(wrong, right, answer, flags=re.IGNORECASE)
 
-    return answer
+    return answer.strip()
 
 
 # ============================================================
