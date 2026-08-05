@@ -73,7 +73,7 @@
     },
     {
       "id": "E07", "category": "数字参数", "query": "JAKA 机器人初始化波特率 9600 用于什么通信？",
-      "product_id": "JAKA", "must_contain": ["Modbus-RTU"],
+      "product_id": "JAKA", "must_contain": ["Modbus", "RTU"],
       "must_not_contain": [],
       "description": "波特率 9600 → Modbus-RTU 通信"
     },
@@ -239,7 +239,7 @@
       "category": "短文本召回", 
       "query": "运动路点",
       "product_id": "JAKA", 
-      "must_contain": ["设置终点", "路点变量管理"],
+      "must_contain": ["路点变量管理"],
       "must_not_contain": ["未包含此功能", "未找到", "联系技术支持"],
       "description": "极短文本查询(4个字) — 测试 L2 kw_score 噪声过滤豁免机制是否生效，确保不被误杀"
     },

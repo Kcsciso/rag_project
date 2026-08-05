@@ -804,6 +804,13 @@ def _extract_query_code_entities(query: str) -> List[str]:
             if e not in seen:
                 seen.add(e)
                 entities.append(e)
+    # 🔴 v26: 复合词锚点 —— Ethernet/IP、Modbus-RTU 等斜杠/连字符专有名词
+    # 由 _COMPOUND_RE 通用提取（doc 正文字面命中 → _boost_api_chunks Dense 侧强拉升）
+    for _m in _COMPOUND_RE.finditer(query):
+        _e = _m.group(0).lower().strip('-_')
+        if len(_e) >= 3 and _e not in seen:
+            seen.add(_e)
+            entities.append(_e)
     return entities
 
 def _boost_api_chunks(query: str, docs: List[Document]) -> List[Document]:
@@ -828,7 +835,8 @@ def _boost_api_chunks(query: str, docs: List[Document]) -> List[Document]:
 
         # 2. 若元数据未写全，后置扫描正文中的 [Functions: ...] 标头或代码实体
         if not is_hit:
-            content_lower = doc.page_content.lower()
+            # 🔴 v26: 与 tokenizer 同构的空格归一化，保证 "Ethernet / IP" 也能字面命中
+            content_lower = _SPACE_SEP_RE.sub(r'\1\2\3', doc.page_content.lower())
             for ent in entities:
                 if len(ent) >= 3 and ent.lower() in content_lower:
                     is_hit = True
@@ -1365,6 +1373,15 @@ jieba.add_word("collrob_sdk", freq=999, tag='eng')
 # ── 正则预分器：保留下划线连接的标识符作为原子 token ──
 _IDENTIFIER_RE = re.compile(r'[a-zA-Z_][a-zA-Z0-9_]*')
 
+# 🔴 v26: 复合词原子化 —— 斜杠/连字符连接的专有名词（Ethernet/IP、Modbus-RTU、TCP-IP）
+# 整体作为原子 token 追加（绝不从原文删除，子段 token 保留 → 纯增量，零回归面）。
+# 排除 '.' 分隔符：防止 robot.set_move_line 被吞成 robot.set + move_line（snake_case 保护立身之本）
+_COMPOUND_RE = re.compile(r'[A-Za-z][A-Za-z0-9]*(?:[/\-][A-Za-z0-9]+)+')
+
+# 🔴 v26: 分隔符空格归一化（doc/query 双侧对称，共用 _tokenize_for_bm25）
+# 仅含 / 与 -，排除 '.'（同上回归理由）；两侧均须为字母，避免误伤自然写法
+_SPACE_SEP_RE = re.compile(r'([A-Za-z])\s*([/\-])\s*([A-Za-z])')
+
 # ── 已自动注册的术语集合（防重复注册）──
 _auto_registered_terms: set = set()
 
@@ -1470,6 +1487,9 @@ def _tokenize_for_bm25(text: str) -> List[str]:
     """
     tokens = []
 
+    # 🔴 v26: 分隔符空格归一化（先于一切处理）—— "Ethernet / IP" → "Ethernet/IP"
+    text = _SPACE_SEP_RE.sub(r'\1\2\3', text)
+
     # 🔴 v3 Step 0: 提取 [CODE:...] 强保护标签 — 三倍写入实现 Boost=3.0 效果
     code_entities = re.findall(r'\[CODE:([a-zA-Z_][a-zA-Z0-9_]*)\]', text)
     for entity in code_entities:
@@ -1489,6 +1509,13 @@ def _tokenize_for_bm25(text: str) -> List[str]:
                     tokens.append(short_name)  # 额外 boost 短名匹配
     # 移除 [CODE:...] 标签避免污染后续分词
     text_clean = re.sub(r'\[CODE:[a-zA-Z_][a-zA-Z0-9_]*\]', ' ', text)
+
+    # 🔴 v26 Step 0.5: 复合词原子化（只追加不删除）—— Ethernet/IP → "ethernet/ip"
+    # 子段（ethernet、ip）由 Step 1 保留 → token 全集 = 原全集 ∪ 复合集，零删除零回归
+    for _m in _COMPOUND_RE.finditer(text_clean):
+        _comp = _m.group(0).lower().strip('-_')
+        if len(_comp) >= 3 and re.match(r'^[a-z0-9]+(?:[/\-][a-z0-9]+)+$', _comp):
+            tokens.append(_comp)
 
     # 🔴 Step 1: 提取英文标识符作为不可分割的整词
     identifiers = _IDENTIFIER_RE.findall(text_clean)

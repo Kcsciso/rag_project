@@ -385,8 +385,8 @@ _SDK_TABLE_HEADER_BLACKLIST = frozenset({
 # ── 标题识别模式（兼容 Markdown 和非 Markdown 格式）──
 # ── 🔴 标题识别模式（兼容无空格、极短标题及明确层级）──
 _V4_HEADING_PATTERNS = [
-    # 层级 1: 中文章节 (H1) -> 第1章 前言 / 第一章前言 (兼容无空格)
-    (re.compile(r'^(第[一二三四五六七八九十\d]+[章节])\s*(.{1,80}?)(?:\r?\n|$)', re.MULTILINE), 1),
+    # 层级 1: 中文章节 (H1) -> 第1章 前言 / 第一章前言 / 第1 章 前言 (v28 容忍章号与"章"间空格)
+    (re.compile(r'^(第[一二三四五六七八九十\d]+\s*[章节])\s*(.{1,80}?)(?:\r?\n|$)', re.MULTILINE), 1),
     
     # 层级 2: 多级数字编号 (H2/H3/H4) -> 3.1.5 通讯设置 / 3.1设置 (兼容无空格，点号收尾)
     # 🔴 [终极修复 2] 多级数字编号：将 {1,3} 放宽至 {1,5}，支持高达 6 级深度的标题 (如 3.1.5.2.1)
@@ -503,7 +503,7 @@ _FUNC_PAREN_SPACE_RE = re.compile(
     r')',
 )
 
-def _clean_pdf_text(text: str) -> str:
+def _clean_pdf_text(text: str, doc_type: str = "general", product_id: str = "") -> str:
     """
     对 PDF 提取文本做通用规范化清洗（Universal Sanitizer）。
 
@@ -611,7 +611,13 @@ def _clean_pdf_text(text: str) -> str:
     # 1. 剔除全屏乱飞的页眉、页脚、版本号
     cleaned = re.sub(r'(?:JAKA\s*节卡|节卡机器人|APP\s*使用手册|JAKA\s*ZU(?:®)?\s*APP|Zu\s*APP|APP版本号.*|www\.jaka\.com)', '', cleaned, flags=re.IGNORECASE)
     # 2. 剔除独立存在的页码数字 (例如孤立的一行 '10' 或 '12')
-    cleaned = re.sub(r'^\s*\d+\s*$', '', cleaned, flags=re.MULTILINE)
+    # 🔴 v25: JAKA/gui_app 专属强化 —— 仅删除 1-2 位孤立数字（页码），保护 ≥3 位数字
+    #（端口/波特率/节点地址等表格参数值，如 6502/9600），防止参数单元格被误删
+    # 其余轨（C-SDK 等）保持原逻辑 ^\s*\d+\s*$ 完全不变
+    if doc_type == "gui_app" or product_id == "JAKA":
+        cleaned = re.sub(r'^\s*\d{1,2}\s*$', '', cleaned, flags=re.MULTILINE)
+    else:
+        cleaned = re.sub(r'^\s*\d+\s*$', '', cleaned, flags=re.MULTILINE)
 
     # ------------------ ---------------------------------------
     
@@ -659,6 +665,11 @@ def _v4_extract_headings(text: str, doc_type: str = "gui_app") -> List[Tuple[int
     headings = []
     seen_positions = set()
 
+    # 🔴 v28: 区域状态机 —— 标题提取感知受保护区域（代码块/表格/OCR 补充块）。
+    # 此前标题提取与区域保护完全解耦：假标题（OCR 坐标行/表格单元格）照样进标题树、
+    # 决定 parent/child 边界与面包屑（实测 309 个污染路径）
+    _protected_ranges = _v4_find_protected_ranges(text)
+
     for pattern, base_level in _V4_HEADING_PATTERNS:
         for m in pattern.finditer(text):
             # 👇 -------------------- 🔴 [新增 2/2] 动态双轨标题拦截 -------------------- 👇
@@ -672,9 +683,16 @@ def _v4_extract_headings(text: str, doc_type: str = "gui_app") -> List[Tuple[int
             pos = m.start()
             if pos in seen_positions:
                 continue
+            # 🔴 v28: 保护区内的匹配直接跳过（与 _safe_boundary 开区间语义一致）
+            if any(p_start < pos < p_end for p_start, p_end, _ in _protected_ranges):
+                continue
             seen_positions.add(pos)
             full = m.group(0).strip()
             if not full or len(full) < 3 or len(full) > 85:
+                continue
+            # 🔴 v28: 数字编号标题形态校验（负向判定）—— 标题文字首字符为 '|' 或
+            # 整段仅数字/点/竖线/空白 → 拒绝（OCR 坐标行 "0.000 | 0.000 | 0.000" 等假标题）
+            if re.match(r'^[\d.\s|]+$', full) or full.lstrip().startswith('|'):
                 continue
 
             # -------------------- 🔴 [修改 1/3] 拦截 Python 代码注释行 --------------------
@@ -856,6 +874,48 @@ def _v4_get_ocr_engine():
 _PAGE_DENSITY_THRESHOLD = 30
 
 
+def _ocr_kv_normalize_row(cells: List[str]) -> str:
+    """
+    🔴 v29: OCR 行键值归一化 —— "端口： | 6502" → "端口：6502"。
+    将 `|` 离散分隔转为 Dense 友好的键值语义（标签与数值处于同一局部窗口）。
+    标签形态：≤12 字且以 ：/: 结尾；其后紧随的非标签项合并为值。
+    """
+    out = []
+    _i = 0
+    while _i < len(cells):
+        _c = cells[_i].strip()
+        if re.match(r'^.{1,12}[：:]$', _c) and _i + 1 < len(cells):
+            _v = cells[_i + 1].strip()
+            if not re.match(r'^.{1,12}[：:]$', _v):
+                out.append(f"{_c}{_v}")
+                _i += 2
+                continue
+        out.append(_c)
+        _i += 1
+    return "，".join(out)
+
+
+def _ocr_merge_cross_line(lines: List[str], page_num: int) -> List[str]:
+    """
+    🔴 v29: OCR 跨行键值合并 —— "从站节点号：" + 下一行纯数值 → "从站节点号：1"。
+    防误伤：排除与当前页码 ±1 相等的纯数字（页脚页码）；下一行仍是标签（以 ：结尾）则不合并。
+    """
+    merged = []
+    for _ln in lines:
+        _ln = _ln.strip()
+        if not _ln:
+            continue
+        _prev = merged[-1] if merged else ""
+        _is_label = bool(re.match(r'^.{1,12}[：:]$', _prev))
+        _is_value = bool(re.match(r'^\d{1,6}$', _ln) or re.match(r'^[\d.~/]{1,12}$', _ln))
+        _is_page = _ln in (str(page_num), str(page_num - 1), str(page_num + 1))
+        if _is_label and _is_value and not _is_page:
+            merged[-1] = merged[-1] + _ln
+        else:
+            merged.append(_ln)
+    return merged
+
+
 def _v4_extract_text_universal(pdf_path: str, doc_type: str = "general") -> Tuple[str, int, int]:
     """
     通用 PDF 文本提取器 — 逐页字符密度检测 + OCR 归位融合 + 章节上下文继承。
@@ -903,6 +963,17 @@ def _v4_extract_text_universal(pdf_path: str, doc_type: str = "general") -> Tupl
     ocr_pages = 0
     total_ocr_chars = 0
 
+    # 🔴 v29: xref 放置次数预扫描 + 全局 OCR 去重
+    # 页眉 logo 类（xref 253 实测放置 137 页）在任何尺寸阈值下都漏网——放置 >20 页的 xref 跳过
+    _xref_page_count = {}
+    try:
+        for _pi in range(total_pages):
+            for _img in (doc[_pi].get_images(full=True) or []):
+                _xref_page_count[_img[0]] = _xref_page_count.get(_img[0], 0) + 1
+    except Exception:
+        pass
+    _ocr_done_xrefs = set()
+
     # ── Last Known Header 追踪器 ──
     # 格式: {"number": "3.1.5", "title": "3.1.5 Modbus 通讯设置",
     #        "path": "JAKA Zu APP > 硬件与通讯 > Modbus 通讯设置", "level": 3}
@@ -912,7 +983,7 @@ def _v4_extract_text_universal(pdf_path: str, doc_type: str = "general") -> Tupl
     _HEADER_TRACK_RE = re.compile(
         r'(?:^|\n)\s*('
         r'\d+(?:\.\d+){1,3}\s+.+?'          # 数字编号: 3.1.5 标题
-        r'|第[一二三四五六七八九十\d]+[章节]\s*.+?'  # 中文编号: 第一章
+        r'|第[一二三四五六七八九十\d]+\s*[章节]\s*.+?'  # 中文编号: 第一章 / 第1 章 (v28 容忍空格)
         r'|[（(]?[一二三四五六七八九十]+[）)]?\s*[、,，\s].+?'  # 中文序号
         r'|#{1,4}\s+.+?'                     # Markdown H
         r'|\d{1,2}[\.\)）]\s+.+?'             # 纯数字+点号
@@ -921,44 +992,112 @@ def _v4_extract_text_universal(pdf_path: str, doc_type: str = "general") -> Tupl
     )
 
     def _try_update_header(page_text: str, page_idx: int):
-        """从页面文本中提取标题，更新 Last Known Header。"""
-        matches = list(_HEADER_TRACK_RE.finditer(page_text))
-        if matches:
-            # 取本页最后一个标题作为当前章节锚点
-            last_match = matches[-1]
-            raw_title = last_match.group(1).strip()
-            if 4 <= len(raw_title) <= 85:
-                # 构建面包屑路径
-                path_parts = [raw_title]
-                if last_header["number"]:
-                    # 简单层级推断：数字编号深度 + 中文章/节判定
-                    num_match = re.match(r'^(\d+(?:\.\d+)*)', raw_title)
-                    if num_match:
-                        num_dots = num_match.group(1).count('.')
-                        # 继承上级路径中层级较低的项
-                        if last_header.get("_prev_path"):
-                            deeper = last_header["_prev_path"][:num_dots]
-                            path_parts = deeper + [raw_title]
-                last_header["_prev_path"] = path_parts.copy()
-                last_header["title"] = raw_title
-                last_header["path"] = " > ".join(path_parts)
-                last_header["level"] = 1 + (raw_title.count('.') if '.' in raw_title else 0)
+        """
+        🔴 v28: 数字编号标题层级栈 —— 仅接受数字编号/章节编号标题；
+        弹栈规则 = 栈顶 level >= 新 level 或 新编号不以栈顶编号为前缀。
+        修复跨章叠加（旧实现 `_prev_path[:num_dots]` 用新标题点号数截旧路径头部，
+        产生 "关闭恒力柔顺控制 > 3.1.5.5" 式污染）与 OCR 行污染（配合保护区跳过 + 形态校验）。
+        """
+        # 保护区跳过：OCR 补充块内的行不参与标题追踪
+        _page_protected = _v4_find_protected_ranges(page_text)
+        _candidates = []
+        for _m in _HEADER_TRACK_RE.finditer(page_text):
+            if any(p_start < _m.start() < p_end for p_start, p_end, _ in _page_protected):
+                continue
+            _raw = _m.group(1).strip()
+            if 4 <= len(_raw) <= 85:
+                _candidates.append(_raw)
+        if not _candidates:
+            return
+        raw_title = _candidates[-1]  # 取本页最后一个有效标题作为章节锚点
+
+        # 🔴 v28: 数字编号标题形态校验（负向判定）—— OCR 坐标行 "0.000 | 0.000" 拒绝
+        if re.match(r'^[\d.\s|]+$', raw_title) or raw_title.lstrip().startswith('|'):
+            return
+
+        _num_match = re.match(r'^(\d+(?:\.\d+)*)', raw_title)
+        if _num_match:
+            number = _num_match.group(1)
+            level = min(number.count('.') + 1, 4)   # 与标题树 L713 统一封顶
+        elif re.match(r'^第[一二三四五六七八九十\d]+\s*[章节]', raw_title):
+            number = ""
+            level = 1 if '章' in raw_title[:3] else 2
+        else:
+            # 裸字/中文序号标题无可靠层级语义 → 仅更新锚点 title，不入栈
+            last_header["title"] = raw_title
+            return
+
+        stack = last_header.setdefault("stack", [])
+        # 弹栈：层级不降 或 编号前缀不匹配（3.1.5.5 的祖先只可能是 3/3.1/3.1.5）
+        while stack and (
+                stack[-1][0] >= level
+                or (stack[-1][1] and number and not number.startswith(stack[-1][1]))):
+            stack.pop()
+        stack.append((level, number, raw_title))
+        last_header["number"] = number
+        last_header["title"] = raw_title
+        last_header["path"] = " > ".join(t for _, _, t in stack)
+        last_header["level"] = level
 
     for page_idx in range(total_pages):
         page = doc[page_idx]
         
         # -------------------- 🔴 [终极修复 1] Y 坐标物理排序 --------------------
-        blocks = page.get_text("blocks")
-        if blocks:
-            text_blocks = [b for b in blocks if b[6] == 0]
-            # 👇 修改点 1：针对 GUI 手册放宽 Y 坐标容差（15px），防止多列表格错位
-            if doc_type == "gui_app":
-                text_blocks.sort(key=lambda b: (round(b[1] / 15) * 15, b[0]))
-            else:
-                text_blocks.sort(key=lambda b: (round(b[1] / 10) * 10, b[0]))
-            page_text = "\n\n".join([b[4].strip() for b in text_blocks if b[4].strip()])
+        # 🔴 v28: gui_app 轨升级为 line 级几何重建 —— PyMuPDF block 会把表格整行
+        # 单元格合并为单 block（内部 \n 分隔），block 级排序无法重建表格行。
+        # line 级按 y 中心聚类 + x 排序；仅 ≥2 项且单元格短的带包装为 Markdown
+        # 表格行（自动受 _PROTECTED_BLOCK_RE 保护 + 单元格不再裸行被 H3 兜底提权）
+        if doc_type == "gui_app":
+            try:
+                _dict_data = page.get_text("dict")
+                _lines_all = []
+                for _blk in _dict_data.get("blocks", []):
+                    if _blk.get("type") != 0:
+                        continue
+                    for _ln in _blk.get("lines", []):
+                        _txt = "".join(_sp.get("text", "") for _sp in _ln.get("spans", [])).strip()
+                        if not _txt:
+                            continue
+                        _bbox = _ln.get("bbox") or (0, 0, 0, 0)
+                        _lines_all.append(
+                            (round((_bbox[1] + _bbox[3]) / 2 / 12) * 12, _bbox[0], _txt))
+                _lines_all.sort(key=lambda t: (t[0], t[1]))
+                _merged = []
+                _cur_row = None
+                _cur_items = []
+                for _yb, _xb, _txt in _lines_all:
+                    if _cur_row is None:
+                        _cur_row = _yb
+                    if _yb == _cur_row:
+                        _cur_items.append((_xb, _txt))
+                    else:
+                        _merged.append((_cur_row, _cur_items))
+                        _cur_row = _yb
+                        _cur_items = [(_xb, _txt)]
+                if _cur_items:
+                    _merged.append((_cur_row, _cur_items))
+                _row_texts = []
+                for _yb, _items in _merged:
+                    _items.sort(key=lambda t: t[0])
+                    _cells = [t for _, t in _items]
+                    if len(_cells) >= 2 and all(len(c) <= 40 for c in _cells):
+                        # 表格行：包装为 Markdown 形态 → 受保护 + 不被标题提取
+                        _row_texts.append("| " + " | ".join(_cells) + " |")
+                    else:
+                        # 单 item 带 / 长文本行：原样输出（保住标题/图注/散文）
+                        _row_texts.append(_cells[0] if _cells else "")
+                page_text = "\n".join(_row_texts)
+            except Exception:
+                page_text = ""
         else:
-            page_text = ""
+            # C-SDK 轨保持原 block 级逻辑（严禁触碰 OpenC3/OpenR6）
+            blocks = page.get_text("blocks")
+            if blocks:
+                text_blocks = [b for b in blocks if b[6] == 0]
+                text_blocks.sort(key=lambda b: (round(b[1] / 10) * 10, b[0]))
+                page_text = "\n\n".join([b[4].strip() for b in text_blocks if b[4].strip()])
+            else:
+                page_text = ""
         # ---------------------------------------------------------------------------
 
         # ── Step 1: 字符密度检测 ──
@@ -974,12 +1113,21 @@ def _v4_extract_text_universal(pdf_path: str, doc_type: str = "general") -> Tupl
 
         # ── Step 3: OCR 补漏（低密度页 或 🔴 强制图片OCR）──
         ocr_lines = []
-        
+
         # 👇 修改点 3：条件放宽，即使文本很密，只要是 GUI 手册也强制扫图
         if (needs_ocr or force_image_ocr) and ocr is not None:
             image_list = page.get_images(full=True)
+            _img_seq = 0   # 🔴 v29: 本页图片序号（按图子块化）
             for img_info in (image_list or []):
                 xref = img_info[0]
+                # 🔴 v26 保留: 该图在页面上的放置矩形（供 gui_app 面积比过滤）
+                _img_rect = None
+                try:
+                    _rects = page.get_image_rects(xref)
+                    if _rects:
+                        _img_rect = max(_rects, key=lambda r: r.width * r.height)
+                except Exception:
+                    pass
                 try:
                     base_image = doc.extract_image(xref)
                     if base_image is None:
@@ -990,7 +1138,24 @@ def _v4_extract_text_universal(pdf_path: str, doc_type: str = "general") -> Tupl
 
                     pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
                     h, w = pil_img.size[1], pil_img.size[0]
-                    if h < 100 or w < 100:
+                    if force_image_ocr:
+                        # 🔴 v29: 过滤重构 —— 废除 1.5% 面积比（实测拦截了 230 个
+                        # 0.5%~1.5% 带的目标小参数图）；保留数据支撑的绝对下限
+                        #（面积 ≥0.5% 且边长 ≥40px，仅拦图标级）
+                        if _img_rect is None:
+                            continue
+                        _page_area = page.rect.width * page.rect.height
+                        _area_ratio = (_img_rect.width * _img_rect.height) / max(1.0, _page_area)
+                        if _area_ratio < 0.005 or _img_rect.width < 40 or _img_rect.height < 40:
+                            continue
+                        # 页眉/页脚 logo 类：放置 >20 页的 xref 跳过（任何尺寸阈值都拦不住）
+                        if _xref_page_count.get(xref, 0) > 20:
+                            continue
+                        # 同一 xref 全局只 OCR 一次（页眉 logo 曾被 OCR 137 次纯浪费）
+                        if xref in _ocr_done_xrefs:
+                            continue
+                        _ocr_done_xrefs.add(xref)
+                    elif h < 100 or w < 100:
                         continue
 
                     np_img = np.array(pil_img)
@@ -999,39 +1164,91 @@ def _v4_extract_text_universal(pdf_path: str, doc_type: str = "general") -> Tupl
                     if not ocr_res or ocr_res[0] is None:
                         continue
 
-                    lines = []
-                    for item in ocr_res[0]:
-                        # item 的结构是: [box坐标, 识别文本, 置信度得分]
-                        text = str(item[1]).strip()
-                        if text and len(text) >= 2:
-                            lines.append(text)
+                    if doc_type == "gui_app":
+                        # 🔴 v25: JAKA/gui_app 专属 OCR 表格行对齐 —— 按 Y 坐标聚类成行、
+                        # X 坐标排序，保证"标签 | 值"同行输出（6502/9600 与属性词不分离）
+                        # 🔴 v27: 回退 CTM Y 归位（v26 因 PDF 坐标系不一致插错位置污染切片）
+                        # 🔴 v29: 键值法语义 —— 行内"标签：| 值"归一为"标签：值"、
+                        # 图内跨行"标签：/数值"配对、按图子块化（[图表内容包含：] 前缀，
+                        # 治 Dense 块级稀释 —— 多图拼一页尾块会稀释参数上下文）
+                        _img_ocr_lines = []   # 每图独立收集（按图子块化）
+                        _ocr_items = []
+                        for _item in ocr_res[0]:
+                            _box = _item[0] if _item[0] else None
+                            _text = str(_item[1]).strip()
+                            if len(_text) < 2:
+                                continue
+                            if _box:
+                                _y_c = sum(_p[1] for _p in _box) / len(_box)
+                                _x_l = min(_p[0] for _p in _box)
+                            else:
+                                _y_c, _x_l = 0.0, 0.0
+                            _ocr_items.append((_y_c, _x_l, _text))
+                        _ocr_items.sort(key=lambda t: (round(t[0] / 12), t[1]))
+                        _row_lines = []
+                        _cur_row = None
+                        for _y_c, _x_l, _text in _ocr_items:
+                            _row_key = round(_y_c / 12)
+                            if _cur_row is None:
+                                _cur_row = _row_key
+                            if _row_key == _cur_row:
+                                _row_lines.append(_text)
+                            else:
+                                _img_ocr_lines.append(_ocr_kv_normalize_row(_row_lines))
+                                total_ocr_chars += sum(len(l) for l in _row_lines)
+                                _row_lines = [_text]
+                                _cur_row = _row_key
+                        if _row_lines:
+                            _img_ocr_lines.append(_ocr_kv_normalize_row(_row_lines))
+                            total_ocr_chars += sum(len(l) for l in _row_lines)
+                        # 图内跨行键值合并 + 按图子块追加
+                        if _img_ocr_lines:
+                            _img_ocr_lines = _ocr_merge_cross_line(_img_ocr_lines, page_idx + 1)
+                            _img_seq += 1
+                            ocr_lines.append(f"[图表内容包含：本页第{_img_seq}张截图]")
+                            ocr_lines.extend(_img_ocr_lines)
+                    else:
+                        # C-SDK 轨保持原逻辑（严禁触碰 OpenC3/OpenR6 切片）
+                        lines = []
+                        for item in ocr_res[0]:
+                            # item 的结构是: [box坐标, 识别文本, 置信度得分]
+                            text = str(item[1]).strip()
+                            if text and len(text) >= 2:
+                                lines.append(text)
 
-                    if lines:
-                        ocr_lines.append(" | ".join(lines))
-                        total_ocr_chars += sum(len(l) for l in lines)
+                        if lines:
+                            ocr_lines.append(" | ".join(lines))
+                            total_ocr_chars += sum(len(l) for l in lines)
                 except Exception:
                     continue
 
             if ocr_lines:
                 ocr_pages += 1
 
-        # ── Step 4: 页面内容组装 — OCR 归位 + 章节上下文继承 ──
+        # ── Step 4: 页面内容组装 — OCR 页尾追加 + 章节上下文继承 ──
         page_parts = []
         if page_text.strip():
             page_parts.append(page_text.strip())
 
         if ocr_lines:
-            # 🔴 章节上下文继承：OCR 文字继承 Last Known Header
+            # 🔴 v27: 低密度页（OCR 触发页）把 OCR 文本也喂给标题追踪器，
+            # 避免 OCR 内容继承上一节的章节归属（低成本改进）
+            if needs_ocr:
+                try:
+                    _try_update_header("\n".join(ocr_lines), page_idx)
+                except Exception:
+                    pass
+            # 章节上下文继承：OCR 文字继承 Last Known Header
             section_header = ""
             if last_header.get("title"):
                 section_header = (
                     f"\n[路径: {last_header['path']}]"
                     f"\n[章节: {last_header['title']}]"
                 )
-
-            # 👇 修改点 4：在标记中注明可能是强制触发的 OCR
+            # 🔴 v27: 安全追加在该页最后一个 Header 层级之下（回退 v26 CTM Y 归位）
+            # 🔴 v29: 块级前缀简化（子块级 [图表内容包含：] 已带语义）
             ocr_header = (
-                f"[OCR补漏: page={page_idx + 1}, chars={effective_chars}, forced={force_image_ocr}]"
+                f"[本页图片解析参数: page={page_idx + 1}]"
                 f"{section_header}"
             )
             page_parts.append(ocr_header + "\n" + "\n".join(ocr_lines))
@@ -1056,23 +1273,33 @@ def _v4_extract_text_universal(pdf_path: str, doc_type: str = "general") -> Tupl
     return full_text, total_pages, ocr_pages
 
 
-# ── 受保护区域正则: 代码块 ```...``` 与 Markdown 表格 |...| ──
+# ── 受保护区域正则: 代码块 ```...```、Markdown 表格 |...|、OCR 补充块 ──
+# 🔴 v28: 第三分支 OCR 补充块 —— 标记行起，锚定 \n\n 页分隔止。
+# 必须锚定页分隔而非"下一个标记"（否则会吞掉下一页全部正文，标题树塌陷）
+# 🔴 v29: 标记同步 —— 块级 [本页图片解析参数: page=N] 与子块级 [图表内容包含：] 均入保护区
 _PROTECTED_BLOCK_RE = re.compile(
     r'(```[\s\S]*?```)'                              # 代码块
     r'|'                                              # 或
-    r'((?:^\|.+\|[\s\S]*?)(?=\n\n|\n(?:[^|]|\Z)|\Z))',  # Markdown 表格
+    r'((?:^\|.+\|[\s\S]*?)(?=\n\n|\n(?:[^|]|\Z)|\Z))'  # Markdown 表格
+    r'|'                                              # 或
+    r'(^\[(?:本页图片解析参数|图表内容包含)：[^\]]*\][\s\S]*?(?=\n\n|\Z))',  # OCR 补充块
     re.MULTILINE,
 )
 
 
 def _v4_find_protected_ranges(text: str) -> List[Tuple[int, int, str]]:
     """
-    扫描全文，标记不可切分的受保护区域（代码块 + 表格）。
+    扫描全文，标记不可切分的受保护区域（代码块 + 表格 + OCR 补充块）。
     Returns: [(start, end, type), ...]  例如 [(100, 300, "code"), (500, 700, "table")]
     """
     ranges = []
     for m in _PROTECTED_BLOCK_RE.finditer(text):
-        rtype = "code" if m.group(1) else "table"
+        if m.group(1):
+            rtype = "code"
+        elif m.group(2):
+            rtype = "table"
+        else:
+            rtype = "ocr"   # 🔴 v28: OCR 补充块（页尾图片解析文本，不得参与标题提取）
         ranges.append((m.start(), m.end(), rtype))
     return ranges
 
@@ -1133,8 +1360,10 @@ def _extract_sdk_header(full_text: str) -> str:
     header_parts = []
 
     # 1. 提取 CDLL 加载行
+    # 🔴 v27: 兼容文档原文 `robot = CDLL(...)`（`from ctypes import *` 后省略 `ctypes.` 前缀）
+    # 实测两份 SDK 文档均为此写法——此前正则只匹配 ctypes.CDLL，导致 sdk_header 丢失 CDLL 行
     cdll_match = re.search(
-        r'(?:robot\s*=\s*)?ctypes\.CDLL\s*\(\s*["\']([^"\']+)["\']\s*\)',
+        r'(?:robot\s*=\s*)?(?:ctypes\.)?CDLL\s*\(\s*(?:[rR])?["\']([^"\']+)["\']\s*\)',
         full_text, re.IGNORECASE,
     )
     if cdll_match:
@@ -1142,10 +1371,10 @@ def _extract_sdk_header(full_text: str) -> str:
         header_parts.append(f"import ctypes")
         header_parts.append(f"robot = ctypes.CDLL(\"{dll_name}\")")
     else:
-        # Fallback: 搜索任何 ctypes import + CDLL 的模式
+        # Fallback: 搜索任何 ctypes import + CDLL 的模式（含 from ctypes import * 与裸 CDLL）
         cdll_block = re.search(
             r'(?:import\s+ctypes|from\s+ctypes\s+import\s+\*).*?'
-            r'ctypes\.CDLL\s*\(["\'][^"\']+["\']\)',
+            r'(?:ctypes\.)?CDLL\s*\(\s*(?:[rR])?["\'][^"\']+["\']\)',
             full_text, re.IGNORECASE | re.DOTALL,
         )
         if cdll_block:
@@ -1408,6 +1637,15 @@ def _is_skeleton_chunk(content: str) -> bool:
     # 纯数字标题序列（目录骨架）
     lines = [l.strip() for l in content.split('\n') if l.strip()]
     if len(lines) <= 2 and all(re.match(r'^\d{1,2}[\.\、\s]', l) for l in lines):
+        return True
+
+    # 🔴 v28: TOC 目录行特征 —— 点线目录格式（"3.2.5 Ethernet/IP IO ...... 31"）
+    # 目录页 chunk 无正文参数，被召回会触发误拒答（E29 根因之一）；通用形态判定非业务词
+    _toc_lines = 0
+    for l in lines:
+        if re.match(r'^\d+(?:\.\d+){1,3}\s+.*?\.{2,}\s*\d+\s*$', l):
+            _toc_lines += 1
+    if _toc_lines >= max(2, len(lines) // 2):
         return True
 
     return False
@@ -1987,7 +2225,8 @@ def load_pdfs_v4_dual(
                 continue
 
             # ── 🔴 PDF 文本清洗: 控制字符 + 连字替换 + 括号空格规范化 ──
-            text = _clean_pdf_text(text)
+            # 🔴 v25: 传入 doc_type/product_id，JAKA/gui_app 启用数字保护特判
+            text = _clean_pdf_text(text, doc_type=doc_type, product_id=product_id)
 
             product_id = _resolve_product_id_from_filename(pdf_file)
             parents, children = _v4_build_parent_child_docs(

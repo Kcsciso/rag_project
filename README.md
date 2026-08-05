@@ -4,6 +4,16 @@
 
 > **🔴 v24 架构升级 (2026-08-04)**: 全面转向 **Markdown 模板强约束 (Template Masking) + 极速流式穿透** 架构。废弃了此前的 JSON 提取+正则清洗后处理管线，System Prompt 从 210 行压缩至 ~15 行（Token 节省 83%），TTFB 从 60-90s 降至 <2s。
 
+> **🔴 v25 回归攻坚 (2026-08-05)**: 代码围栏闭合状态机（`_stream_guardrail` 透传+奇偶计数自动补 ```` ``` ````）+ 双轨模板【逃生舱条款】（拒答交由 LLM 自主判定，零业务正则）+ JAKA/gui_app 数字保护特判（≥3 位参数保全）+ KV 属性注入放宽（E05/E07 确定性数值）+ SemanticDedup 无条件精确段落去重。
+
+> **🔴 v26 最后一公里 (2026-08-05)**: OCR 面积比过滤 + CTM 矩阵 Y 归位（截图参数插回对应章节，切片结构不变）+ BM25 复合词原子化与空格归一化（`Ethernet/IP` 整体 token，排除 `.` 防吞 snake_case）+ 重写器 always-on 与纠错/补全 Few-Shot（E18 错别字、E28 纯名词）+ 逃生舱 `> [!WARNING]` 视觉加固与尾部对冲行删除（纯 Prompt，零 L4 拦截）。
+
+> **🔴 v27 回归反转 (2026-08-05)**: 产品路由责任切分（原始 query 优先 + 单轮澄清守卫 + 历史扫描，E01 确定性澄清）+ OCR 回退页尾追加（`[本页图片解析参数补充]` 标识，回退 CTM Y 归位防切片污染）+ SDK 模板物理隔离（删除 `import ctypes` 字面样例，`_extract_sdk_header` 修复裸 `CDLL` 提取）+ L3 模板选择守卫（函数级/产品级/超纲级三条件 → 拒答模板，E09/E21/E25）+ 去重规范化 + 动态 BM25 权重（短文本/复合词 3.0，E28/E29）。
+
+> **🔴 v28 切片状态机化 (2026-08-05)**: 标题提取区域状态机（`_v4_extract_headings` 感知受保护区域 + OCR 补充块入保护区，根治 309 个污染路径）+ gui_app 轨 line 级几何表格重建（表 1-1 变 Markdown 表格行，单元格不裸行不被 H3 提权）+ last_header 数字编号层级栈（前缀祖先校验修复跨章叠加）+ 数字编号形态负向校验（`0.000 | 0.000` 类 OCR 假标题拒绝）+ TOC 点线目录特征过滤（E29 误拒答根因之一）+ 守卫命中 context 代码脱敏（无代码可抄）+ 重写规则 3 实体指代泛化（E17 动作指代）。
+
+> **🔴 v29 数据语义化 + 确定性拒答 (2026-08-05)**: OCR 键值法语义（`端口： | 6502` → `端口：6502`，`|` 离散转 Dense 友好键值；跨行键值配对；按图子块化）+ 图片过滤重构（0.5%/40px 数据支撑下限 + xref 全局去重 + 放置次数启发式，230 个小参数图入库）+ 数字守卫复合词豁免（Ethernet/IP 的 IP 不再误杀）+ **Fast-Path 确定性拒答**（`_build_messages` 返回侧信道，守卫命中跳过 LLM 直出固定话术——物理根除拒答记忆中毒）+ 重写引擎协议主题中立性（规则 2 限制 + Few-Shot + 确定性兜底，单发 "Ethernet/IP" 不再被强加 OpenC3）。
+
 ---
 
 ## 🏛️ RAG 四层系统架构
@@ -70,6 +80,15 @@
 | Parent-Child 双层 | H2 章节级 Parent(1000ch) + H3/H4 函数级 Child(400ch); v23: GUI 轨动态扩容 Child=1500/Parent=2000 |
 | Title Fallback | 4 级链: L1 状态机标题 → L2 面包屑 → L3 父级 H2 → L4 硬兜底 |
 | PDF 清洗 | 7 步 `_clean_pdf_text()` — Unicode 连字/括号空格/下划线归一化/I/O 修复/边界错位/表格竖线/JAKA 版式 |
+| v25: 数字保护特判 | `gui_app`/JAKA 轨仅删除 1-2 位孤立数字（页码），保护 ≥3 位参数值 (6502/9600)；C-SDK 轨原逻辑不变 |
+| v25: OCR 行对齐 | gui_app 轨 OCR 结果按 Y 聚类成行 + X 排序 — 表格"标签\|值"同行输出 |
+| v26: OCR 面积过滤 | gui_app 轨废除 `<100px` 硬过滤，改用放置矩形面积比（<1.5% 或边长 <18pt）— 小截图/参数表不丢 |
+| v27: OCR 页尾追加 | 回退 CTM Y 归位（PDF 坐标系不一致污染切片）；OCR 块 `[本页图片解析参数补充]` + last_header 继承，安全追加页尾；低密度页 OCR 文本同步更新标题追踪器 |
+| v28: 标题区域状态机 | `_v4_extract_headings` 感知受保护区域（代码块/表格/OCR 补充块）→ 假标题不进标题树；OCR 补充块锚定 `\n\n` 页分隔入保护区 |
+| v28: line 级表格重建 | gui_app 轨 `get_text("dict")` line bbox 按 y 聚类 + x 排序，≥2 项短单元格带包装为 Markdown 表格行——单元格不裸行、Windows/Android 同 chunk |
+| v28: last_header 层级栈 | 数字编号标题层级栈（弹栈 = 层级不降或编号前缀不匹配）；数字编号形态负向校验（`0.000 \| 0.000` 拒绝） |
+| v29: OCR 键值法 | `_ocr_kv_normalize_row` 行内键值归一（`端口：\| 6502` → `端口：6502`）+ `_ocr_merge_cross_line` 跨行配对 + 按图子块化（`[图表内容包含：]`） |
+| v29: 图片过滤重构 | 0.5%/40px 数据支撑下限（废除 1.5% 面积比）+ xref 全局去重 + 放置 >20 页跳过（页眉 logo） |
 | v23: 跨级大纲扫描 | Parent TOC 延伸到下一个同级/更高级标题 — H1 章节完整囊括子章节 |
 | v23: 微缩大纲降噪 | Child TOC 上限 5 条 + `[章节大纲参考]:` 标签统一 |
 
@@ -80,14 +99,14 @@
 | 能力 | 说明 |
 |------|------|
 | 向量检索 | ChromaDB cosine (bge-small-zh-v1.5, 512维) — 候选池放大 fetch_factor=5×, SDK 查询 8× |
-| BM25 检索 | jieba + 标识符保护 — snake_case 函数名不被切碎 |
+| BM25 检索 | jieba + 标识符保护 — snake_case 函数名不被切碎; v26: 复合词原子化（`Ethernet/IP`→整体 token，排除 `.`）+ 分隔符空格归一化（双侧对称）; v27: 短文本(≤8字)/复合词查询 BM25 权重动态 3.0 |
 | RRF 六大提权引擎 | Entity Anchor (+5.0) / Function Names (+0.08) / Text Rebalance (+0.03) / CODE BM25 三倍写入 / Title Exact Match (+5.0) / Chapter Isolation (+20.0/-10.0) |
 | Autocut 动态截断 | `_autocut_knee()` 断崖检测 — 找 RRF 分数相邻差值最大点; SDK 场景 min_k=10 |
 | 复合查询拆解 | `_decompose_compound_query()` 顺序连接词 — `_MIN_SUB_QUERY_LEN=2` 保留两字核心动词 |
 | 保底召回 | 三层防护: 阈值 0→原始 Top-3 / 噪声全杀→kept_docs 恢复 / 最终空→BM25 第二机会 |
 | 产品隔离 | ChromaDB `where={"product_id":"xxx"}` + 未指定时 Search-First 软路由 |
 | HyDE 防毒化 | SDK 轨 + JAKA 全线封杀; 短 Query/非技术符号/精确 API 签名 → 禁用 |
-| LLM 意图重写 | `_rewrite_query_with_llm()` ADR-19 — 代词消解 + 产品名补全 (t=0.0, max_tokens=50) |
+| LLM 意图重写 | `_rewrite_query_with_llm()` ADR-19 — 代词消解 + 产品名补全 (t=0.0, max_tokens=50)；v26: always-on 执行 + 同音纠错/名词补全规则与 Few-Shot + max_tokens=128；v27: 规则 9 产品名缺失保持缺失（严禁脑补）+ 路由责任切分（原始 query 优先判定）；v28: 规则 3 实体指代泛化（产品/函数/动作类型）+ 逐字来源限定；v29: 规则 2 协议主题中立性限制 + `_PROTOCOL_TERMS_RE` 确定性兜底（单发 "Ethernet/IP" 不拼接产品名） |
 | GUI 噪声豁免 (v23) | `_is_gui` 判定 → 跳过 kw_score 拦截 |
 | 宏观提权 v2 (v23) | 多关键词广谱判定 + chunk_type 双重检测 → +5.0 登顶 |
 
@@ -102,6 +121,12 @@
 | 🔴 模板底端锚定 | 模板置于 User Message 末尾，利用 Recency Bias 实现注意力锚定 |
 | 🔴 Top-1 来源 | `_doc_section_str` 仅取排名第一的章节 — 单一锚点降低小模型认知负担 |
 | 双轨制 Prompt | c_sdk (两段式铁律) / gui_app (六条铁律: 宏观总结/结构清晰/历史隔离/视觉屏蔽/禁止脑补/禁止代码) |
+| 🔴 v25: 逃生舱条款 | 双轨模板末尾追加 — 上下文无对应函数/硬件/超纲内容或触发隔离警告时，LLM 彻底无视排版模板，仅输出一句拒答 (零业务正则) |
+| 🔴 v26: 逃生舱视觉加固 | `> [!WARNING] ⛔🔴 绝密拦截` GitHub Alert 引用块语法 + 删除尾部对冲行（"请明确说明"软出口）— 模板即消息尾部，极致 Recency Bias |
+| 🔴 v27: 模板选择守卫 | L3 层三条件（query 点名函数不在 Context / 非 SDK 产品+SDK 问法 / coverage 提问+技术强词零命中）→ 双轨模板整体替换为拒答模板 + 回删 SDK Header；Plan 代理逐例评审 35 用例误伤面为零 |
+| 🔴 v28: 守卫 context 脱敏 | 守卫命中 → `_strip_code_from_context()` 剥离 ``` 代码块与 DLL 加载行（`[代码内容省略]`）——模型无代码可抄；误伤面为零 |
+| 🔴 v29: Fast-Path 确定性拒答 | `_build_messages` 返回 `(messages, refusal_flag)` 侧信道；守卫命中 → 四调用方跳过 LLM 直出 `_HARD_REFUSAL`（物理根除拒答记忆中毒；检查点在生成金字塔之前封堵 Layer 3 泄漏） |
+| 🔴 v29: 数字守卫豁免 | `_SPACE_SEP_RE` 归一化 + `_COMPOUND_RE` 剥离（Ethernet/IP、TCP-IP 整体）后跑 `_NUMERIC_QUERY_RE` 与关键词判定——协议名词不再被裸 "IP" 误杀 |
 | 动态术语对齐 | `_term_alignment_prefix` 按需注入 — OpenR6 "使能"→`set_robot_arm_init`，零全局 Token 损耗 |
 | 反跨产品泄露 | `_anti_bleed_prefix` metadata + 正文双重确认 |
 | Context Cap | 非SDK 4000 / SDK 8000 字符整块剔除 — Parent 背景优先丢弃 |
@@ -115,13 +140,14 @@
 | 能力 | 说明 |
 |------|------|
 | 🔴 极速流式穿透 | `_stream_guardrail` 零缓冲逐 chunk 透传 — TTFB <2s (v23: 60-90s) |
+| 🔴 v25: 围栏闭合状态机 | `_stream_guardrail` 透传中统计 ```` ``` ```` 奇偶性，流结束奇数时自动补发闭合行 — 零缓冲代价 |
 | 🔴 render_node 退化 | 从 JSON 解析+结构化渲染退化为纯文本透传 — 格式正确性由 L3 模板保证 |
 | 四层容灾金字塔 | L1 本地 vLLM → L2 智谱 API → L3 纯检索直出 → L4 硬拒答 — NEVER-EMPTY 保证 |
 | 静默斩尾 | `_strip_hedging_tail()` 8 模式 — "上述代码假设存在"/"参考文档未包含详细步骤"等 |
 | 属性词硬改写 | `extract_align_node` 50+ 领域词库 — 数值前后 12+8 字符窗口 + Context 原词强制覆盖 |
 | SDK 自纠错 | `sdk_verify_node` → `llm_generation` 回环 — set_前缀/CDLL/argtypes 检测 + 硬熔断 retry≤2 |
-| 代码块闭合 | `_fix_and_close_sdk_code()` 过渡期兜底 — Markdown ``` 自动闭合 + CDLL 补全 + 函数名修正表 |
-| SemanticDedup | trigram overlap > 0.55 截断 — v23: JAKA GUI 轨完整保留重复句 |
+| 代码块闭合 | `_fix_and_close_sdk_code()` 过渡期兜底 — Markdown ``` 自动闭合 + CDLL 补全 + 函数名修正表; v25: 接入 extract_align_node 覆盖 Graph 全路径 |
+| SemanticDedup | trigram overlap > 0.55 截断 — v25: 无条件精确段落去重 (连续相同 ≥80ch) + 代码块跳过模糊去重 |
 | Temperature | 非流式 0.2 / 流式 0.01 — 代码生成近确定性输出 |
 
 ---
@@ -272,7 +298,7 @@ python audit_chunks.py                # 切片健康度审计
 
 ## 📝 开发日志与架构审计
 
-- **[dev_log.md](./dev_log.md)**: 从 2026-07-20 至今共 28 章完整开发记录与架构决策（最新: v24 模板约束+流式穿透重构）
+- **[dev_log.md](./dev_log.md)**: 从 2026-07-20 至今共 33 章完整开发记录与架构决策（最新: v29 数据语义化 + 确定性拒答 — OCR 键值法 + Fast-Path 短路）
 - **[ARCHITECTURE_AUDIT.md](./ARCHITECTURE_AUDIT.md)**: v24 全盘四层架构审计报告（含模板约束理论分析/代码结构体检/拆分方案/未来升级推演）
-- **[CLAUDE.md](./CLAUDE.md)**: AI 协同开发规范（含 v24 四层架构排雷法思想钢印：System Prompt 极简/模板底端锚定/流式零缓冲/render_node 纯透传/L4 正则最小化）
+- **[CLAUDE.md](./CLAUDE.md)**: AI 协同开发规范（含 v24 四层架构排雷法思想钢印：System Prompt 极简/模板底端锚定/流式零缓冲/render_node 纯透传/L4 正则最小化；v25: 逃生舱条款/围栏闭合状态机/JAKA 数字保护特判；v26: OCR Y 归位/复合词原子化/重写器 always-on；v27: 路由责任切分/模板选择守卫/OCR 回退；v28: 区域状态机标题提取/line 级表格重建/last_header 层级栈；v29: OCR 键值法/Fast-Path 确定性拒答/数字守卫豁免/重写中立性）
 - **[tests/TEST_REPORT.md](./tests/TEST_REPORT.md)**: 评测报告归档

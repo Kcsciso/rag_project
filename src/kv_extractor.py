@@ -65,7 +65,7 @@ _RE_KV_PAIR = re.compile(
     r'('
     r'(?:端口号?|波特率|IP地址|速率|频率|超时|周期|间隔|'
     r'默认密码|管理员密码|操作员|技术员|密码|用户名|账号|'
-    r'数据位|停止位|校验位|从站地址|站号|通道)'
+    r'数据位|停止位|校验位|从站地址|从站节点号|节点号|站号|通道)'
     r')[\s：:]*'
     r'([^\s，。,.\n]{1,80})',
     re.IGNORECASE,
@@ -343,13 +343,15 @@ def lookup_attribute(
                     break
 
             if score > 0:
-                matches.append((pid, key, value, score))
+                matches.append((pid, key, value, score, matched_tokens))
 
     if not matches:
         return None
 
-    matches.sort(key=lambda x: x[3], reverse=True)
-    best_pid, best_key, best_value, best_score = matches[0]
+    # 🔴 v25: 同分时按 query 关键词命中数决胜
+    #（"波特率 9600" 类查询优先 "Modbus RTU 默认波特率" 而非 "RS485 默认波特率"）
+    matches.sort(key=lambda x: (x[3], x[4]), reverse=True)
+    best_pid, best_key, best_value, _, _ = matches[0]
 
     # 构建返回结果 — 包含 product context
     return f"[KV属性] {best_pid}: {best_key} = {best_value}"

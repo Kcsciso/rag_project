@@ -276,6 +276,8 @@ from .rag_chain import (
     _chitchat_response,
     _chitchat_response_stream,
     _hard_refusal_stream,
+    _stream_guardrail,          # 🔴 v25: 流式代码围栏闭合兜底
+    _fix_and_close_sdk_code,    # 🔴 v25: 非流式代码闭合兜底
     _build_clarification_response,
     _build_clarification_response_stream,
     _rewrite_query_with_llm,  # 🟢 引入大模型重写引擎
@@ -341,6 +343,7 @@ def query_fusion_node(state: RAGState) -> dict:
     return {
         "fused_query": cleaned,
         "query": rewritten_query,  # 🔴 状态图中的 query 更新为补全后的完美意图
+        "raw_query": query,        # 🔴 v27: 保留原始输入（重写前）—— 产品路由责任切分需要
     }
 
 # ============================================================
@@ -443,6 +446,9 @@ def product_routing_node(state: RAGState) -> dict:
     """
     query = state.get("fused_query") or state.get("query", "")
     product_id = state.get("product_id")
+    # 🔴 v27: 原始输入（重写前）与历史 —— 产品路由责任切分的数据源
+    _orig_raw = state.get("raw_query") or state.get("query", "") or query
+    _history = state.get("chat_history") or []
 
     logger.info(f"🟡 [Node 2] ProductRouting: query='{query[:60]}', product_id='{product_id}'")
 
@@ -460,9 +466,9 @@ def product_routing_node(state: RAGState) -> dict:
         return {"route_status": "refuse", "final_answer": resp["answer"],
                 "sources": [], "model": "hard-refusal"}
 
-    # ── v3.0 意图 2.5: 多产品对比检测 ──
+    # ── v3.0 意图 2.5: 多产品对比检测（🔴 v27: 用原始 query 判定，防重写脑补产品名）──
     if not product_id:
-        all_products = _detect_all_products(query)
+        all_products = _detect_all_products(_orig_raw)
         if len(all_products) >= 2:
             logger.info(f"  ↳ route_status='multi_product': {all_products}")
             return {
@@ -472,11 +478,33 @@ def product_routing_node(state: RAGState) -> dict:
         elif len(all_products) == 1:
             product_id = all_products[0]
 
-    # ── 意图 3: 产品未识别 → Search-First 预检索 → 反问澄清 ──
+    # ── 意图 3: 产品未识别 → 责任切分 → Search-First 预检索 → 反问澄清 ──
     if not product_id:
         from .rag_chain import _resolve_product_from_query as _resolve
-        product_id = _resolve(query)
+        from .rag_chain import _COVERAGE_QUERY_RE as _coverage_re
+        from .rag_chain import _resolve_product_from_history as _resolve_hist
+
+        # 🔴 v27: 单轮 + 原始 query 无产品名 + 非覆盖性提问 → 直接澄清
+        # （重写器不得越权补产品；同时跳过 Search-First 软路由）
+        if (not _history and not _resolve(_orig_raw)
+                and not _coverage_re.search(_orig_raw)):
+            registered = get_registered_products()
+            resp = build_product_clarification_response()
+            logger.info("  ↳ route_status='clarify' (v27: 单轮无产品名直接澄清)")
+            return {"route_status": "clarify", "final_answer": resp["answer"],
+                    "sources": [], "model": "product-clarification", "product_id": None}
+
+        product_id = _resolve(_orig_raw) or _resolve(query)
+        # 多轮第三兜底：历史文本扫描（重写器不服从时仍能锁定产品）
+        if not product_id and _history:
+            product_id = _resolve_hist(_history)
+
         if not product_id:
+            # 🔴 v27: coverage 例外 —— "有没有提到 X" 不得澄清，进跨产品检索由 L3 模板守卫拒答
+            if _coverage_re.search(_orig_raw):
+                logger.info("  ↳ coverage 提问例外：跳过澄清，进入跨产品检索（L3 拒答）")
+                return {"route_status": "generate", "product_id": None,
+                        "sources": [], "model": "coverage-router"}
             _orig_query = state.get("query", "") or query
             # 🔴 v17: Search-First 软路由 — 后台跨产品预检索，断层领先则自动锁定
             _auto_locked_pid = None
@@ -489,11 +517,6 @@ def product_routing_node(state: RAGState) -> dict:
             if _auto_locked_pid:
                 logger.info(f"  ↳ Search-First 自动锁定: product_id='{_auto_locked_pid}'")
                 return {"route_status": "generate", "product_id": _auto_locked_pid}
-            # 有业务意图 + 足够长度 → 跨产品搜索（不反问）
-            # if _has_business_intent(query) and len(_orig_query.strip()) >= 12:
-            #     logger.info("  ↳ route_status='generate' (cross-product, no dominant product)")
-            #     return {"route_status": "generate", "product_id": None,
-            #             "sources": [], "model": "cross-product-router"}
             # 短词 + 无显式产品 → 澄清反问
             registered = get_registered_products()
             resp = build_product_clarification_response()
@@ -722,7 +745,8 @@ def llm_generation_node(state: RAGState) -> dict:
             product_id=state.get("product_id"), max_siblings=2,
         )
     try:
-        messages = _build_messages(query, context_docs, chat_history)
+        # 🔴 v29: 返回侧信道 (messages, refusal_flag) —— Fast-Path 确定性拒答
+        messages, _refusal_flag = _build_messages(query, context_docs, chat_history)
     except Exception as e:
         logger.error(f"❌ Prompt 构建失败: {e}")
         try:
@@ -747,6 +771,21 @@ def llm_generation_node(state: RAGState) -> dict:
                 "retry_count": 0,
             }
 
+    # 🔴 v29: Fast-Path 确定性拒答 —— 模板守卫命中 → 跳过 LLM 直接返回固定话术
+    # 检查点在生成金字塔之前（含 Layer 3 —— 否则守卫命中 + LLM 全挂时
+    # _direct_retrieval_response 会直出非拒答内容绕过拒答模板）
+    if _refusal_flag:
+        logger.info("🚫 [Fast-Path] 模板守卫命中 → 确定性拒答（跳过 LLM 生成）")
+        return {
+            "final_answer": _HARD_REFUSAL,
+            "raw_llm_answer": _HARD_REFUSAL,
+            "sources": [],
+            "model": "refusal-fast-path",
+            "route_status": "complete",
+            "feedback": "",
+            "retry_count": 0,
+        }
+
     # ── v2: SDK 自纠错反馈注入 ──
     if feedback:
         correction_msg = (
@@ -757,8 +796,10 @@ def llm_generation_node(state: RAGState) -> dict:
         logger.info(f"  ↳ 已注入自纠错反馈到消息列表")
 
     # 🔴 数字请求无上下文硬防护 + KV 属性检索 (ADR-13)
+    # 🔴 v25: 数字意图查询即尝试 KV 属性注入（不依赖 Context 缺失守卫），
+    # 使 E05(端口6502)/GT-6(6502含义)/E07(波特率9600) 的正确答案确定性出现在 Prompt 中
     _numeric_guard = _rag_chain_mod._last_numeric_context_missing
-    if _numeric_guard:
+    if _numeric_guard or _rag_chain_mod._NUMERIC_QUERY_RE.search(query):
         # ── 第零机会: KV 属性存储检索 ──
         try:
             from .kv_extractor import lookup_attribute as _kv_lookup
@@ -1010,13 +1051,16 @@ def extract_align_node(state: RAGState) -> dict:
     """
     raw_answer = state.get("raw_llm_answer") or state.get("final_answer", "")
     kv_entities = state.get("extracted_entities", {})
+    # 🔴 v25: SDK 代码兜底（代码块闭合）——Graph 路径此前从未应用过，
+    # 非流式 ⑧ 代码截断的直接原因
+    raw_answer = _fix_and_close_sdk_code(raw_answer)
 
     logger.info(f"🟢 [Node 6] ExtractAlign: {len(kv_entities)} KV entities, "
                  f"answer_len={len(raw_answer)}")
 
-    # 若没有可对齐的实体，直接透传
-    if not kv_entities or not raw_answer:
-        logger.info("  ↳ 无 KV 实体或回答为空，透传原始回答")
+    # 回答为空 → 直接透传（去重/闭合需要非空文本）
+    if not raw_answer:
+        logger.info("  ↳ 回答为空，透传原始回答")
         return {
             "final_answer": raw_answer,
             "route_status": "complete",
@@ -1070,41 +1114,59 @@ def extract_align_node(state: RAGState) -> dict:
     if fixes_applied > 0:
         logger.info(f"  ↳ 共修正 {fixes_applied} 处属性词颠倒/篡改")
 
+    # ── 🔴 v25: 精确段落去重（无条件执行）—— 复读机整段复读兜底 ──
+    # 🔴 v27: 比较前规范化（忽略空白与尾标点差异）—— 换行/标点差异的重复段也能捕获
+    # 仅移除"连续两段基本相同"的段落（≥80 字符，与 eval ② 定义一致），对代码/步骤零误伤
+    def _norm_para(_p: str) -> str:
+        return re.sub(r'\s+', '', _p).rstrip('。！？；;，,：:.、…')
+    _paras = corrected.split("\n\n")
+    _paras_deduped = []
+    for _p in _paras:
+        _p = _p.strip()
+        if (_paras_deduped and _p and len(_p) >= 80
+                and _norm_para(_p) == _norm_para(_paras_deduped[-1])):
+            logger.info(f"  ✂️  段落去重: 移除连续重复段落 ({len(_p)} 字符)")
+            continue
+        _paras_deduped.append(_p)
+    corrected = "\n\n".join(_paras_deduped)
+
     # ── 🔴 v3.0 SemanticDedup: 后处理语义去重，消除1.5B小模型段落级重复生成 ──
     # 取消 JAKA 的豁免权，全量开启去重防御复读机
-    import re as _re_dedup
-    _sentences = _re_dedup.split(r'(?<=[。！？\n])\s*', corrected)
-    _sentences = [s.strip() for s in _sentences if len(s.strip()) >= 8]
+    # 🔴 v25: 含代码块的回答跳过模糊去重（避免 trigram 误伤代码行），仅做精确段落去重
+    if "```" not in corrected:
+        import re as _re_dedup
+        _sentences = _re_dedup.split(r'(?<=[。！？\n])\s*', corrected)
+        _sentences = [s.strip() for s in _sentences if len(s.strip()) >= 8]
 
-    if len(_sentences) >= 4:
-        _deduped = [_sentences[0]]  # 保留首句
-        _cut_at = len(_sentences)
-        for _i in range(1, len(_sentences)):
-            # 滑动窗口: 检查当前句是否与前面任一已保留句高度重复
-            _is_dup = False
-            _cur = _sentences[_i]
-            for _j in range(max(0, _i - 3), _i):
-                _prev = _sentences[_j]
-                # Jaccard-like trigram overlap
-                _cur_grams = set(_cur[i:i+3] for i in range(len(_cur) - 2))
-                _prev_grams = set(_prev[i:i+3] for i in range(len(_prev) - 2))
-                if _cur_grams and _prev_grams:
-                    _overlap = len(_cur_grams & _prev_grams) / min(len(_cur_grams), len(_prev_grams))
-                    if _overlap > 0.55:
-                        _is_dup = True
-                        break
-            if _is_dup:
-                _cut_at = _i
-                break
-            _deduped.append(_sentences[_i])
+        if len(_sentences) >= 4:
+            _deduped = [_sentences[0]]  # 保留首句
+            _cut_at = len(_sentences)
+            for _i in range(1, len(_sentences)):
+                # 滑动窗口: 检查当前句是否与前面任一已保留句高度重复
+                _is_dup = False
+                _cur = _sentences[_i]
+                for _j in range(max(0, _i - 3), _i):
+                    _prev = _sentences[_j]
+                    # Jaccard-like trigram overlap
+                    _cur_grams = set(_cur[i:i+3] for i in range(len(_cur) - 2))
+                    _prev_grams = set(_prev[i:i+3] for i in range(len(_prev) - 2))
+                    if _cur_grams and _prev_grams:
+                        _overlap = len(_cur_grams & _prev_grams) / min(len(_cur_grams), len(_prev_grams))
+                        if _overlap > 0.55:
+                            _is_dup = True
+                            break
+                if _is_dup:
+                    _cut_at = _i
+                    break
+                _deduped.append(_sentences[_i])
 
-        if _cut_at < len(_sentences):
-            _trimmed_count = len(_sentences) - _cut_at
-            logger.info(
-                f"  ✂️  SemanticDedup: 截断 {_trimmed_count} 个重复句 "
-                f"(trigram_overlap > 0.55 @ pos {_cut_at})"
-            )
-            corrected = "\n".join(_deduped)
+            if _cut_at < len(_sentences):
+                _trimmed_count = len(_sentences) - _cut_at
+                logger.info(
+                    f"  ✂️  SemanticDedup: 截断 {_trimmed_count} 个重复句 "
+                    f"(trigram_overlap > 0.55 @ pos {_cut_at})"
+                )
+                corrected = "\n".join(_deduped)
 
     # 🔴 v16: 剥离末尾自相矛盾的免责套话
     corrected = _strip_hedging_tail(corrected)
@@ -1741,13 +1803,21 @@ def run_graph_stream(
 
         # 构建消息（含自纠错反馈）
         try:
-            messages = _build_messages(fused_query, context_docs, chat_history)
+            # 🔴 v29: 返回侧信道 (messages, refusal_flag) —— Fast-Path 确定性拒答
+            messages, _refusal_flag_s = _build_messages(fused_query, context_docs, chat_history)
         except Exception:
             yield from _hard_refusal_stream()
             return
 
+        # 🔴 v29: Fast-Path 确定性拒答（流式）—— 模板守卫命中 → 跳过 LLM 直接输出固定话术
+        if _refusal_flag_s:
+            logger.info("🚫 [Fast-Path] 模板守卫命中 → 确定性拒答（跳过 LLM 生成）")
+            yield from _hard_refusal_stream()
+            return
+
         _numeric_guard_s = _rag_chain_mod._last_numeric_context_missing
-        if _numeric_guard_s:
+        # 🔴 v25: 数字意图查询即尝试 KV 属性注入（不依赖 Context 缺失守卫）
+        if _numeric_guard_s or _rag_chain_mod._NUMERIC_QUERY_RE.search(fused_query):
             # ── 第零机会: KV 属性存储检索 ──
             try:
                 from .kv_extractor import lookup_attribute as _kv_lookup_s
@@ -1797,7 +1867,7 @@ def run_graph_stream(
             try:
                 if lock_acquired:
                     yield from _track_and_collect(
-                        _stream_llm(_get_client(), _resolve_vllm_model(), messages)
+                        _stream_guardrail(_stream_llm(_get_client(), _resolve_vllm_model(), messages))
                     )
             except _FALLBACK_EXCEPTIONS:
                 pass
@@ -1813,7 +1883,7 @@ def run_graph_stream(
             try:
                 from .config import DEEPSEEK_MODEL
                 yield from _track_and_collect(
-                    _stream_llm(_get_deepseek_client(), DEEPSEEK_MODEL, messages)
+                    _stream_guardrail(_stream_llm(_get_deepseek_client(), DEEPSEEK_MODEL, messages))
                 )
             except _FALLBACK_EXCEPTIONS:
                 pass
