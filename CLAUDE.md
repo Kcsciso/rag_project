@@ -28,6 +28,15 @@
 | 🔴 last_header 层级栈 (v28) | last_header 仅接受数字编号/章节编号标题（裸字不入栈）；弹栈 = 层级不降或编号前缀不匹配；数字编号标题形态负向校验（首字符 `\|` 或仅数字/点/竖线 → 拒绝） |
 | 🔴 OCR 键值法 (v29) | gui_app OCR 输出必须键值归一（`端口：\| 6502` → `端口：6502`）+ 跨行配对（`从站节点号：` + 纯数值）+ 按图子块化（`[图表内容包含：]` 前缀）；`_PROTECTED_BLOCK_RE` 第三分支与标记同步 |
 | 🔴 图片过滤重构 (v29) | 过滤下限 = 面积 ≥0.5% 且边长 ≥40px（禁止恢复 1.5% 面积比）；必须 xref 全局去重 + 放置 >20 页跳过（页眉 logo） |
+| 🔴 跨页表头继承 (v30) | gui_app 轨暂存 `_table_header`（每页首个 `\|` 行）→ 下页首行若为 `\|` 则强制注入；C-SDK 轨零触碰 |
+| 🔴 OCR 标签化 (v30) | gui_app OCR 输出必须 `<OCR_BLOCK>...</OCR_BLOCK>` 包裹；`_PROTECTED_BLOCK_RE` 第二分支匹配；`_v4_find_protected_ranges` `group(2)` → `type="ocr"` |
+| 🔴 软装箱算法 (v30) | Parent 截断前按 `_PROTECTED_BLOCK_RE` 解析文本为 普通/受保护 交替序列；受保护块整体装入允许超标；普通文本 `\n\n` 安全切断；受保护块**禁止物理切断** |
+| 🔴 OCR 子块隔离 (v30) | gui_app child 切片中 `<OCR_BLOCK>` 强制 `_emit_ocr_child()` → `chunk_type="ocr_child"`；禁止混入普通 child |
+| 🔴 孤儿行合并 (v30.final) | `_row_texts` 构建：`len(_cells)==1` 且 `<10ch` → 追加到上一行表格末单元格；修复单元格内换行碎裂 |
+| 🔴 全景快照 OCR (v30.final) | gui_app 轨废弃 `get_images()` 逐图抠取 → `get_pixmap(Matrix(2,2))` 整页截图；矢量图盲区归零；逐图循环 `if doc_type=="gui_app": continue` 跳过 |
+| 🔴 OCR 智能去重 (v30.final) | OCR 文本去空格后 vs `page_text` 交叉比对 → 已存在则丢弃；仅保留 PyMuPDF 未提取的增量参数 |
+| 🔴 Y 轻量分组 (v30.final) | OCR 行 ≤12 行/组（`_GROUP_SIZE=12`），每组独立 `<OCR_BLOCK>`；防 giant block 撑爆向量窗口 |
+| 🔴 OCR 前置 (v30.final) | gui_app OCR 块插入 `page_text` 最前方（非页尾追加）；C-SDK 轨 OCR 追加逻辑严禁触碰 |
 | Micro-Chunk Auto-Merge API 排他锁 | `_extract_primary_api_name()` 提取后不同 API 不合并 |
 | 4 级 Title Fallback 链 | L1 状态机标题 → L2 面包屑 → L3 父级 H2 → L4 硬兜底 |
 | 受保护区域 | 代码块 (```) + Markdown 表格 绝不拦腰切断 |
@@ -147,6 +156,8 @@ Conda `rag_agent` (Python 3.10)。**严禁 `pip install --upgrade`**：
 | 🔴 **v27** | **v27** | **回归反转: 产品路由责任切分 (原始 query 优先 + 单轮澄清守卫 + `raw_query` State + 历史扫描第三兜底 + coverage 例外, E01) / OCR 回退页尾追加 (`[本页图片解析参数补充]` 标识, 回退 CTM Y 归位防切片污染) / SDK 模板物理隔离 (删除 `import ctypes` 字面样例, `_extract_sdk_header` 修复裸 CDLL 提取) / L3 模板选择守卫 (函数级/产品级/超纲级三条件 → 拒答模板, E09/E21/E25) / 去重规范化 (忽略空白与尾标点) / 动态 BM25 权重 (短文本/复合词 3.0, E28/E29)** | `_refusal_override` 守卫, `_COVERAGE_QUERY_RE`/`_TECH_STRONG_TERMS_RE`, `_resolve_product_from_history`, `_extract_sdk_header` 修复, `_BM25_WEIGHT` 动态化 |
 | 🔴 **v28** | **v28** | **切片状态机化: 标题提取区域状态机 (`_v4_extract_headings` consult 受保护区域, OCR 补充块锚定 `\n\n` 入保护区, 根治 309 污染路径) / gui_app line 级几何表格重建 (`get_text("dict")` y 聚类, ≥2 项短单元格带包装 Markdown 表格行) / last_header 数字编号层级栈 (前缀祖先校验修跨章叠加) / 数字编号形态负向校验 (`0.000 \| 0.000` 拒绝) / `第N 章` 空格兼容 / TOC 点线目录特征过滤 (E29) / 守卫命中 context 代码脱敏 (`_strip_code_from_context`) / 重写规则 3 实体指代泛化 (E17 动作指代)** | `_PROTECTED_BLOCK_RE` 第三分支, `_try_update_header` 层级栈, `_strip_code_from_context`, REWRITE 规则 3 |
 | 🔴 **v29** | **v29** | **数据语义化 + 确定性拒答: OCR 键值法 (`端口：\|6502`, 跨行配对, 按图子块化) / 图片过滤重构 (0.5%/40px 下限 + xref 去重 + 放置次数) / 数字守卫复合词豁免 (Ethernet/IP 的 IP 不误杀) / Fast-Path 确定性拒答 (`_build_messages` 返回侧信道, 守卫命中跳过 LLM 直出 `_HARD_REFUSAL`, 封堵 Layer 3 泄漏) / 重写协议主题中立性 (规则 2 限制 + Few-Shot + `_PROTOCOL_TERMS_RE` 确定性兜底)** | `_ocr_kv_normalize_row`/`_ocr_merge_cross_line`, `_guard_query` 剥离, `(messages, refusal_flag)` 侧信道, `_PROTOCOL_TERMS_RE` |
+| 🔴 **v30** | **v30** | **AST-Lite 软装箱: 跨页表格表头向下继承 (暂存 `_table_header` → 下页注入) / OCR 标签化防稀释 (`<OCR_BLOCK>` 包裹 + `_PROTECTED_BLOCK_RE` 第二分支 + `_v4_find_protected_ranges` `type="ocr"`) / Parent 软装箱算法 (受保护块不可分割 → 整体装入允许超标, 普通文本 `\n\n` 安全切断) / OCR 子块隔离 (`_emit_ocr_child` + `chunk_type="ocr_child"` 独立切片) / 过早封箱 Bug 修复 (`_packed_len >= parent_chunk_size` 条件封箱)** | `_table_header`, `<OCR_BLOCK>`, `_PROTECTED_BLOCK_RE` 第二分支, `_emit_ocr_child()`, `chunk_type="ocr_child"` |
+| 🔴 **v30.final** | **v30.final** | **全景快照 OCR + 孤儿行合并: 孤儿行合并 (短文本 <10ch 追加到上一行表格末单元格, 修复 `Windows7及以上\n上` 碎裂) / 全景快照 OCR (`get_pixmap(Matrix(2,2))` 整页截图 → 废弃 `get_images()` 逐图抠取, 矢量图盲区归零) / 智能去重 (OCR 文本去空格后 vs `page_text` 交叉比对, 仅保留增量) / Y 轻量分组 (≤12 行/组, 防 giant block) / OCR 前置 (`page_text` 最前方插入, 旧逻辑页尾追加撕裂跨页上下文) / C-SDK 逐图跳过 (`if doc_type=="gui_app": continue`)** | `_pix = page.get_pixmap()`, `_page_text_norm` 去重, `_GROUP_SIZE=12`, OCR prepend, 孤儿行合并 `elif len(_cells)==1` |
 
 ### 当前关键配置
 
@@ -233,6 +244,21 @@ Conda `rag_agent` (Python 3.10)。**严禁 `pip install --upgrade`**：
 | **Fast-Path 短路** | `_build_messages` 必须返回 `(messages, refusal_flag)`（禁止模块级标志——并发竞态）；守卫命中 → 四调用方在生成金字塔之前短路；每次重建 messages 后重读 flag |
 | **重写中立性** | 规则 2 必须含协议主题中立性限制（Ethernet/IP/TCP/IP/Modbus 等不拼接产品名）；`_PROTOCOL_TERMS_RE` 确定性兜底必须保留；"泛泛步骤问法"措辞禁止加入（与 E18 few-shot 矛盾） |
 
+### 🔴 v30 / v30.final 新增关键约束
+
+| 约束 | 说明 |
+|------|------|
+| **跨页表头继承 (v30)** | gui_app 轨每页结束后暂存第一个 `\|` 行至 `_table_header`；下页首行若为 `\|` 表续行 → `_row_texts.insert(0, _table_header)` 强制注入；C-SDK 轨逻辑严禁触碰 |
+| **OCR 标签化 (v30)** | gui_app OCR 输出必须用 `<OCR_BLOCK>...</OCR_BLOCK>` 包裹；`_PROTECTED_BLOCK_RE` 第二分支匹配 `<OCR_BLOCK>[\s\S]*?</OCR_BLOCK>`；`_v4_find_protected_ranges` `group(2)` → `type="ocr"` |
+| **软装箱 (v30)** | Parent 截断前必须按 `_PROTECTED_BLOCK_RE` 解析文本为 普通/受保护 交替序列；受保护块**整体装入允许超标**，普通文本 `\n\n` 安全切断；**禁止**任何受保护块从中间物理切断 |
+| **OCR 子块隔离 (v30)** | `_split_text_into_children` gui_app 路径必须扫描 `<OCR_BLOCK>` 标签 → 独立 `_emit_ocr_child()` → `chunk_type="ocr_child"`；OCR 块**禁止**混入普通 child 切片 |
+| **封箱条件 (v30.final)** | 受保护块装入后**仅当 `_packed_len >= parent_chunk_size` 才 `_sealed = True`**；未超标则箱子继续装后续段——禁止过早封箱致后续内容丢失 |
+| **孤儿行合并 (v30.final)** | `_row_texts` 构建：`len(_cells)==1` 且 `<10` 字符且前一行存在 → 追加到上一行表格末单元格；禁止将单元格内换行误判为独立行 |
+| **全景快照 OCR (v30.final)** | gui_app 轨**废弃 `page.get_images()` + `doc.extract_image()`** 逐图抠取 → `page.get_pixmap(matrix=fitz.Matrix(2, 2))` 整页 2× 高清截图；矢量图设置框零盲区 |
+| **智能去重 (v30.final)** | OCR 文本行去空格后若已存在于 `page_text`（PyMuPDF 提取）→ 直接丢弃；只保留 PyMuPDF 未提取的增量幽灵参数 |
+| **Y 轻量分组 (v30.final)** | OCR 行按 Y 坐标 ≤12 行合并为一组（`_GROUP_SIZE=12`），每组独立 `<OCR_BLOCK>`——防整页 giant block 撑爆 512 维向量窗口 |
+| **OCR 前置 (v30.final)** | gui_app OCR 块必须插入 `page_text`**最前方**（非页尾追加）；C-SDK 轨 OCR 追加逻辑严禁触碰；逐图循环入口 `if doc_type=="gui_app": continue` 跳过 |
+
 ---
 
 # 🚀 本地服务启动
@@ -300,6 +326,9 @@ python app.py   # → http://localhost:8000 (比邻星 ProximaRAG) · API: /docs
 | `_tokenize_for_bm25()` | vector_store.py | BM25 分词器 — jieba + 标识符保护 + CODE 标签三倍写入 + 🔴 v26: 复合词原子化（`_COMPOUND_RE` 排除 `.`）与空格归一化（`_SPACE_SEP_RE`） |
 | `_ocr_kv_normalize_row()` | pdf_loader.py | 🔴 v29: OCR 行内键值归一化 — `端口：\| 6502` → `端口：6502`（`\|` 离散分隔转 Dense 友好键值语义） |
 | `_ocr_merge_cross_line()` | pdf_loader.py | 🔴 v29: OCR 跨行键值配对 — `从站节点号：` + 纯数值 → `从站节点号：1`（防页码 ±1 误伤） |
+| `_emit_ocr_child()` | pdf_loader.py | 🔴 v30: OCR 子块独立 emit — `_split_text_into_children` gui_app 路径内定义，`chunk_type="ocr_child"`，不提取 function_names |
+| `_v4_extract_text_universal()` 全景 OCR | pdf_loader.py | 🔴 v30.final: gui_app 轨 `get_pixmap(Matrix(2,2))` 整页截图 + 智能去重（vs `page_text`）+ Y 轻量分组（`_GROUP_SIZE=12`）+ OCR 前置插入 |
+| `_v4_build_parent_child_docs()` 软装箱 | pdf_loader.py | 🔴 v30: AST-Lite 软装箱替代暴力腰斩 — `_PROTECTED_BLOCK_RE` 交替序列 + 受保护块整体装入 (允许超标) + 普通文本 `\n\n` 安全切断 + 🔴 v30.final: 条件封箱 (`_packed_len >= parent_chunk_size`) |
 | `_strip_code_from_context()` | rag_chain.py | 🔴 v28: 通用代码脱敏 — ``` 代码块 → `[代码内容省略]`、DLL 加载行 → `[DLL加载代码省略]`（仅守卫命中路径） |
 | `_resolve_product_from_history()` | rag_chain.py | 🔴 v27: 多轮产品解析第三兜底 — PRODUCT_ROUTER_RULES 扫最近 6 条历史锁定产品 |
 | `_extract_sdk_header()` | pdf_loader.py | SDK 全局代码头提取 — 🔴 v27: 兼容裸 `CDLL(r"...")`（`from ctypes import *` 前缀省略）与 raw 前缀 |

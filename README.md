@@ -14,6 +14,10 @@
 
 > **🔴 v29 数据语义化 + 确定性拒答 (2026-08-05)**: OCR 键值法语义（`端口： | 6502` → `端口：6502`，`|` 离散转 Dense 友好键值；跨行键值配对；按图子块化）+ 图片过滤重构（0.5%/40px 数据支撑下限 + xref 全局去重 + 放置次数启发式，230 个小参数图入库）+ 数字守卫复合词豁免（Ethernet/IP 的 IP 不再误杀）+ **Fast-Path 确定性拒答**（`_build_messages` 返回侧信道，守卫命中跳过 LLM 直出固定话术——物理根除拒答记忆中毒）+ 重写引擎协议主题中立性（规则 2 限制 + Few-Shot + 确定性兜底，单发 "Ethernet/IP" 不再被强加 OpenC3）。
 
+> **🔴 v30 AST-Lite 软装箱 (2026-08-07)**: 跨页表格表头向下继承（暂存 `_table_header` → 下页强制注入，字段语义不丢失）+ OCR 标签化防稀释（`<OCR_BLOCK>` 包裹 + `_PROTECTED_BLOCK_RE` 同步 + `type="ocr"` 保护区识别）+ **AST-Lite 软装箱算法**（Parent 截断替代暴力腰斩：文本解析为 普通/受保护 交替序列 → 受保护块整体装入允许超标、普通文本 `\n\n` 安全切断 → 表格/代码/OCR 零物理切断）+ OCR 子块隔离（`_emit_ocr_child` + `chunk_type="ocr_child"` 独立切片，OCR 参数不稀释 Dense 语义）+ **过早封箱 Bug 修复**（受保护块装入后仅超标才封箱，未满则继续装）。
+
+> **🔴 v30.final 全景快照 OCR + 孤儿行合并 (2026-08-07)**: 孤儿行合并（单元格内换行 `<10ch` → 追加到上一行表格末单元格，修复 `Windows7及以上\n上` Markdown 碎裂）+ **全景快照 OCR**（废弃 `get_images()` 逐图抠取 → `get_pixmap(Matrix(2,2))` 整页 2× 高清截图，矢量图设置框零盲区）+ 智能去重（OCR 文本 vs `page_text` 交叉比对，仅保留增量幽灵参数）+ Y 轻量分组（≤12 行/组，防 giant block）+ **OCR 前置**（插入 `page_text` 最前方，旧逻辑页尾追加撕裂跨页上下文已废弃）+ C-SDK 逐图跳过（`if doc_type=="gui_app": continue`，零触碰隔离）。
+
 ---
 
 ## 🏛️ RAG 四层系统架构
@@ -65,7 +69,7 @@
 └────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### L1 — 数据摄入与切片层 (pdf_loader.py, ~1938 行)
+### L1 — 数据摄入与切片层 (pdf_loader.py, ~2500 行)
 
 **处理流程**: `PDF 文件` → `_v4_extract_text_universal()` (PyMuPDF + OCR 归位) → `_clean_pdf_text()` (7 步清洗) → `_v4_build_parent_child_docs()` (标题树切分 + 双层索引)
 
@@ -89,6 +93,15 @@
 | v28: last_header 层级栈 | 数字编号标题层级栈（弹栈 = 层级不降或编号前缀不匹配）；数字编号形态负向校验（`0.000 \| 0.000` 拒绝） |
 | v29: OCR 键值法 | `_ocr_kv_normalize_row` 行内键值归一（`端口：\| 6502` → `端口：6502`）+ `_ocr_merge_cross_line` 跨行配对 + 按图子块化（`[图表内容包含：]`） |
 | v29: 图片过滤重构 | 0.5%/40px 数据支撑下限（废除 1.5% 面积比）+ xref 全局去重 + 放置 >20 页跳过（页眉 logo） |
+| v30: 跨页表头继承 | gui_app 轨暂存 `_table_header`（每页首个 `\|` 行）→ 下页表格续行强制注入；跨页表格不丢失字段语义 |
+| v30: OCR 标签化防稀释 | `<OCR_BLOCK>...</OCR_BLOCK>` 包裹 OCR 输出；`_PROTECTED_BLOCK_RE` 第二分支匹配；`_v4_find_protected_ranges` `type="ocr"` 保护区识别 |
+| v30: AST-Lite 软装箱 | Parent 截断替代暴力腰斩：文本按保护区解析为交替序列 → 受保护块整体装入允许超标、普通文本 `\n\n` 安全切断 → 表格/代码/OCR 零物理切断 |
+| v30: OCR 子块隔离 | `_emit_ocr_child()` → `chunk_type="ocr_child"` 独立切片；OCR 参数不稀释 Dense 语义 |
+| v30.final: 孤儿行合并 | `_row_texts` 构建：单单元格 <10ch → 追加到上一行表格末单元格；修复 `Windows7及以上\n上` Markdown 碎裂 |
+| v30.final: 全景快照 OCR | 废弃 `get_images()` 逐图抠取 → `get_pixmap(Matrix(2,2))` 整页 2× 高清截图；矢量图设置框零盲区；逐图循环 `if doc_type=="gui_app": continue` 跳过 |
+| v30.final: 智能去重 | OCR 文本去空格后 vs `page_text` 交叉比对 → 已存在则丢弃；仅保留 PyMuPDF 未提取的增量幽灵参数 |
+| v30.final: Y 轻量分组 | OCR 行 ≤12 行/组（`_GROUP_SIZE=12`），每组独立 `<OCR_BLOCK>` → 防整页 giant block 撑爆 512dim 向量窗口 |
+| v30.final: OCR 前置 | gui_app OCR 块插入 `page_text` 最前方（废弃页尾追加——撕裂跨页上下文）；C-SDK 轨 OCR 追加逻辑不变 |
 | v23: 跨级大纲扫描 | Parent TOC 延伸到下一个同级/更高级标题 — H1 章节完整囊括子章节 |
 | v23: 微缩大纲降噪 | Child TOC 上限 5 条 + `[章节大纲参考]:` 标签统一 |
 
