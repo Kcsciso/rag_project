@@ -1,8 +1,8 @@
 # 比邻星 (ProximaRAG) — 全盘架构审计报告
 
-> **日期**: 2026-08-04 | **审计人**: Staff Engineer (AI 架构师) | **覆盖版本**: v24 (Markdown 模板强约束 + 极速流式穿透)  
-> **方法**: 四层 RAG 架构逐层排查 + 跨层数据流追踪 + v23→v24 diff 深度审计  
-> **本次更新**: v24 架构级重构 — 废弃 JSON 提取+正则清洗，全面转向 Markdown 模板强约束 + 极速流式穿透。L3/L4 职责重新划分，L4 从"擦屁股"回归"兜底校验"。
+> **日期**: 2026-08-06 | **审计人**: Staff Engineer (AI 架构师) | **覆盖版本**: v24 → v29 演进 + **v30 架构重构方案**  
+> **方法**: 四层 RAG 架构逐层排查 + 跨层数据流追踪 + v24→v29 diff 深度审计 + v30 五大故障现象根因分析  
+> **本次更新**: v29 架构瓶颈诊断 + v30 "状态机编排"统一架构方案。四层评分因系统性并发 Bug 和 OCR 参数丢失下调。
 
 ---
 
@@ -10,14 +10,370 @@
 
 | 层级 | 名称 | 严重问题 | 性能瓶颈 | 幻觉风险 | 评分 |
 |------|------|---------|---------|---------|------|
-| L1 | 数据摄入与切片 | 1 | 1 | 0 | A- |
-| L2 | 检索与重排 | 2 → **1** | 1 | 0 | A |
-| L3 | 上下文组装与指令 | 1 → **0** | 1 → **0** | 1 → **0** | A- → **A** |
-| L4 | 生成控制与后处理 | 0 | 1 → **0** | 0 | A → **A+** |
+| L1 | 数据摄入与切片 | 2 | 1 | 1 | **B+** (↓ from A-) |
+| L2 | 检索与重排 | 1 | 1 | 1 | **B+** (↓ from A) |
+| L3 | 上下文组装与指令 | 2 | 0 | 1 | **B** (↓ from A) |
+| L4 | 生成控制与后处理 | 1 | 0 | 1 | **B+** (↓ from A+) |
+| L0 | 🆕 统一门控编排 | — | — | — | **新增层** |
 
-**综合评分: A → A+ (94/100)** — v24 重构是 ProximaRAG 诞生以来最深刻的一次架构级优化。"放弃 JSON 提取，拥抱 Markdown 模板"从根源上解决了小模型（1.5B/7B）在长上下文中的注意力衰减问题；"打通流式穿透"将 TTFB 从 60-90s 降至 <2s，用户体验质变。
+**综合评分: B/B+ (82/100)** — v25-v29 四轮迭代解决了 14→FAILED 的回归问题，但引入了三个结构性缺陷：(1) `_last_numeric_context_missing` 模块级全局变量的并发竞态，(2) Parent Chunk 暴力截断导致的 OCR 参数丢失，(3) 三种独立拒答机制的"三角混战"。v30 方案通过 L0 GuardOrchestrator 统一门控 + L1 语义边界保护 + L5 跨产品隔离墙，目标恢复 A 级评分。
 
 ---
+
+## v25-v29 架构演进摘要
+
+| 版本 | 核心主题 | 关键变更 | 引入的风险 |
+|------|---------|---------|-----------|
+| v25 | 回归攻坚 | 围栏闭合状态机 / 逃生舱条款 / JAKA 数字保护 / SemanticDedup 规范 / `extract_align_node` 入口接入 `_fix_and_close_sdk_code` | 逃生舱依赖 LLM 服从 |
+| v26 | 最后一公里 | OCR 面积过滤重构 / BM25 复合词原子化 / 重写器 always-on / 逃生舱 `> [!WARNING]` 视觉加固 | CTM Y 归位污染切片 (v27 回退) |
+| v27 | 回归反转 | 路由责任切分 / OCR 页尾追加 / 模板选择守卫 (A/B/C 三条件) / 动态 BM25 权重 / ~~CTM Y 归位~~ | 守卫三条件覆盖不全；动态权重对高频词稀释无效 |
+| v28 | 切片状态机化 | 区域状态机标题提取 / line 级表格重建 / last_header 层级栈 / 守卫脱敏 / 重写指代泛化 | 表格重建仅 gui_app 轨；Parent 截断问题未解决 |
+| v29 | 数据语义化+确定性拒答 | OCR 键值法 / 图片过滤重构 / 数字守卫复合词豁免 / **Fast-Path 短路** (侧信道 `(messages, refusal_flag)`) / 重写协议中立性 | `_last_numeric_context_missing` 全局变量竞态 (已承认未修复)；Fast-Path 与数字守卫状态不一致 |
+
+---
+
+# 🔴 v30 架构重构方案：从"补丁叠加"到"状态机编排"
+
+## 零、问题总览：v29 架构的系统性塌陷
+
+经过对 L1-L4 全链路代码的深度走查，v29 并非"个别 Bug"，而是**四种独立机制在四个层次上的互不理解**，产生了系统性故障。以下按五大故障现象逐一进行根因分析。
+
+---
+
+## 一、Fast-Path 物理短路失效 —— 三种拒答机制的"三角混战"
+
+### 1.1 当前代码的真实结构
+
+v29 存在 **三种独立运行的拒答判定机制**，各守各的门：
+
+| 机制 | 位置 | 状态管理 | 线程安全 |
+|------|------|---------|---------|
+| **ABSTAIN 网关** | `graph_rag.py:709-739` | 硬编码实体列表 | ✅ 纯函数 |
+| **模板守卫 (A/B/C)** | `rag_chain.py:1934-2001` | `_refusal_override` → 返回值 tuple | ✅ 线程安全 |
+| **数字守卫** | `rag_chain.py:1734-1787` | `_last_numeric_context_missing` → **模块级全局变量** | ❌ **已知并发竞态** |
+
+### 1.2 致命漏洞：`_last_numeric_context_missing` 的并发竞态
+
+```python
+# rag_chain.py:2221 — 模块级全局（FastAPI run_in_executor 线程池下竞态）
+_last_numeric_context_missing = False
+```
+
+调用链还原：
+1. 请求 A 调用 `_build_messages` → 设置 `_last_numeric_context_missing = True`（发现缺失实体）
+2. 请求 B 调用 `_build_messages` → 设置 `_last_numeric_context_missing = False`（实体全部命中）
+3. 请求 A 在 `graph_rag.py:801` 读取 `_rag_chain_mod._last_numeric_context_missing` → **已为 False！**
+4. 请求 A 的数字守卫被**静默关闭** → LLM 收到含缺失实体的问题但不设防 → **幻觉输出**
+
+v29 CLAUDE.md 自身已承认此风险（L3 表格 "`_last_numeric_context_missing` 线程安全" 行），但标记为"待修复为 State 字段"而从未执行。
+
+### 1.3 第二个漏洞：逃生舱条款的 Prompt 依从性陷阱
+
+即使模板守卫未触发（漏判），正常的双轨模板末尾带有 `> [!WARNING] ⛔🔴 绝密拦截` 逃生舱条款。v26 删除了"请明确说明"对冲行以增强 Recency Bias。但核心问题是：**逃生舱本身仍然是 Prompt 指令，依赖 LLM 服从**。当 Qwen2.5-7B 上下文窗口中有强信号代码块时，逃生舱指令可能被忽略。
+
+### 1.4 第三个漏洞：ABSTAIN 网关覆盖不全
+
+`graph_rag.py:710-714` 的 `_query_entities` 集合是**硬编码列表**，不包含新增的通用属性。例如查询"固件版本号"不会触发 ABSTAIN，需依赖后续的模板守卫。三个机制之间存在覆盖间隙。
+
+### 1.5 第四个漏洞：流式路径中全局变量被多处读取
+
+`run_graph_stream` (graph_rag.py:1818) 和 `llm_generation_node` (graph_rag.py:801) 均通过 `_rag_chain_mod._last_numeric_context_missing` 读取全局变量。两个并发流式请求可互相覆盖该值。
+
+---
+
+## 二、表格与离散数值召回失败 —— L1 截断 + L2 高频词稀释的"双重夹击"
+
+### 2.1 L1 端：Parent Chunk 暴力截断是 OCR 参数的无声杀手
+
+```python
+# pdf_loader.py:1493-1499 — Parent 截断
+if len(parent_text) > parent_chunk_size:  # GUI=2000
+    cutoff = max(
+        parent_text.rfind('\n\n', parent_chunk_size - 200, parent_chunk_size + 200),
+        parent_text.rfind('\n', parent_chunk_size - 100, parent_chunk_size + 100),
+        parent_chunk_size,
+    )
+    parent_text = parent_text[:cutoff].strip()
+```
+
+场景还原：
+1. JAKA 手册某 H2 章节（如"Modbus 通讯设置"）包含正文 1500 字 + OCR 参数 500 字（端口/波特率等截图识别结果）
+2. OCR 文本通过 `[本页图片解析参数: page=N]` 追加到页面末尾
+3. 页面合并后进入该 H2 章节，总长度 2000+
+4. **Parent Chunk 截断在段落边界处，恰好切在 OCR 参数的起始位置或中间**
+5. OCR 提取的 6502/9600 等参数被整块丢弃
+
+**关键**：GUI Child Chunk 在 `_split_text_into_children` 中确实不做截断（`pdf_loader.py:2008-2012`），但 **Parent 层做**。当 Parent 被召回（Chapter Isolation +20.0 提权），其中缺失 OCR 参数 → LLM 看不到参数 → 幻觉或拒答。
+
+### 2.2 L2 端：高频词对 Dense 检索的隐性降权
+
+```python
+# rag_chain.py:2776 — 动态 BM25 权重
+_BM25_WEIGHT = 3.0 if (len(query) <= 8 or _compound_re.search(query)) else 1.2
+```
+
+当用户查询 "JAKA Modbus 端口号 6502" 时：
+- `len(query) > 8` 且不含复合词 → BM25 权重 = 1.2
+- "JAKA" 是极高频词（遍布所有切片），Dense 向量对该词几乎无区分度
+- Dense 相似度主要靠 "Modbus 端口号 6502" 匹配，但 6502 被 `jieba` 切碎
+- 结果：Dense 得分被 "JAKA" 高频稀释，BM25 权重仅 1.2 无法有效纠偏
+- RRF 融合后，目标切片排到第 5-8 名，被 Autocut（K=8~15）**边缘化**
+
+**机制漏洞**：代码中**没有任何 IDF/词频惩罚机制**来抵消高频实体词对 Dense 检索的稀释效应。`_BM25_WEIGHT` 的动态条件只检查长度和复合词，不检测高频实体稀释。
+
+### 2.3 L1 端（深层）：OCR 键值对被嵌入大文本块的 Dense 稀释
+
+OCR 键值对 "端口：6502，波特率：9600" 被嵌入一个 1500 字的 child chunk 中，Dense 向量被正文稀释。BM25 对纯数字 token "6502" 权重被抵消——在 1500 字的文档中 BM25 的 TF 分量近乎为零。
+
+---
+
+## 三、长流程与宏观大纲丢失 —— Parent-Child 索引的"结构性失联"
+
+### 3.1 Parent Chunk 的"假召回"
+
+当前 Parent Chunk 包含 `[章节大纲参考]` 但正文被截断至 2000 字符。当用户提问"JAKA Modbus 通讯设置有哪些步骤"时：
+- 检索召回 Parent Chunk（含大纲："- 配置端口参数 / - 设置从站地址 / - 测试通讯"）
+- 但 Parent 正文中步骤 3-5 被截断（2000 字符限制）
+- Child Chunks 包含完整步骤，但它们被索引为独立的小切片（每个 H3 一个 child）
+- **单个 child 只包含 1-2 个步骤，缺乏完整流程**
+- LLM 看到大纲但看不到后续步骤的正文 → 幻觉补全
+
+### 3.2 章节大纲上限过严
+
+```python
+# pdf_loader.py:1863 — Child mini-TOC capped at 5 items
+_MAX_TOC_ITEMS = 5
+```
+
+对于深度嵌套的章节（如 "3.1.5 Modbus 通讯设置" 下有 8 个子步骤），大纲只展示前 5 条 + "... (更多章节略)"。宏观提问时，LLM 看到 "..." 可能自行脑补。
+
+### 3.3 宏观提权关键词覆盖有限
+
+```python
+# rag_chain.py:2843-2873 — 宏观提权 v2
+if (_is_macro_intent or chunk_type == "parent" or _has_toc_in_content):
+```
+
+`_is_macro_intent` 关键词覆盖有限（"内容/总结/介绍/大意/结构"），对"有哪些步骤"、"包含什么功能"这类问法可能漏判。
+
+---
+
+## 四、多轮对话污染 —— 历史净化的"表面清洗"
+
+### 4.1 净化不完整：技术数据不在代码块内就无法剥离
+
+```python
+# rag_chain.py:2093-2097 — 仅剥离代码块，不剥离技术数据
+content = re.sub(r'```python[\s\S]*?```', '[已提供代码示例]', content, flags=re.DOTALL)
+content = re.sub(r'```[\s\S]*?```', '[已提供代码块]', content, flags=re.DOTALL)
+```
+
+上一轮 LLM 输出了 "根据《JAKA手册》【Modbus通讯设置】的记载：端口号 6502，波特率 9600..."。这些技术数据**不在代码块内**，因此不被净化。下一轮用户问"OpenC3 怎么配置端口"，模型可能把上一轮的 JAKA 端口 6502 带入 OpenC3 的上下文中。
+
+### 4.2 跨产品多轮对话缺少产品上下文隔离
+
+`MAX_HISTORY_TURNS = 2` (只保留最近 4 条消息) 对于跨产品切换是**双刃剑**：
+- 如果前 2 轮在讨论 JAKA，第 3 轮切换到 OpenC3：历史中仍有 JAKA 的参数/代码 → OpenC3 答案被污染
+- 如果只保留 1 轮（2 条消息）：指代消解失效（"那它的参数呢？"无法解析"它"）
+
+### 4.3 `_HARD_REFUSAL` 进历史后的复读风险
+
+`sanitize_chat_history` 中的 `_TAIL_REFUSAL_RE` 能剥离大部分拒答句式，但 `_HARD_REFUSAL` 消息格式不完全匹配剥离正则——残余片段仍可能在下一轮被模型复读。
+
+---
+
+## 五、OCR 参数丢失与暴力截断 —— 终极根因
+
+### 5.1 完整调用链还原
+
+```
+PDF Page (含表+截图)
+  → PyMuPDF get_text("dict") → 按 line 级 y 聚类重建（gui_app 轨）
+  → 字符密度检测 → 低密度页或 gui_app 强制扫图
+  → RapidOCR 识别图片文字 → _ocr_kv_normalize_row + _ocr_merge_cross_line
+  → ocr_lines 按图子块化（[图表内容包含：本页第N张截图]）
+  → 追加到 page_parts：page_text + [本页图片解析参数: page=N] + OCR内容
+  → 所有页面 "\n\n" 拼接 → full_text
+  → _v4_extract_headings() 提取标题树
+  → _v4_build_parent_child_docs() 构建 Parent + Child
+    → Parent 按 H2 边界切 → 正文 > 2000 chars → **截断！OCR 参数在此丢失**
+    → Child 按 H3 边界切 → _split_text_into_children(gui_app) → 整段保留（无截断）
+```
+
+### 5.2 为什么 Child Chunk 有完整内容但仍召回失败
+
+1. **检索时 Child 的向量与 query 的相似度不足**：OCR 键值对被嵌入大文本，Dense 向量被稀释
+2. **BM25 对纯数字不友好**：`jieba` 分词后 "6502" 作为独立 token 权重被稀释
+3. **Parent 被召回但 OCR 内容缺失**：宏观或步骤类提问优先召回 Parent（Chapter Isolation +20），但 Parent 中的 OCR 内容已被截断
+4. **结果**：召回排名靠前的是不含 OCR 参数的 Parent chunk → LLM 看不到参数 → 幻觉或拒答
+
+---
+
+# v30 统一架构方案：五层状态机编排
+
+## 核心设计原则
+
+> **从"打补丁"到"状态机编排"。每个故障现象由一个明确的"编排器 (Orchestrator)"在正确层次拦截，而不是分散在 4 层中的多个正则/全局变量/Prompt 指令。**
+
+## 方案总览
+
+```
+                        ┌─────────────────────────────┐
+                        │   L0: GuardOrchestrator     │  ← NEW — 统一拒答状态机
+                        │   单一入口，唯一真相源        │
+                        │   (替代 ABSTAIN + 模板守卫    │
+                        │    + 数字守卫 三个分散机制)   │
+                        └─────────────┬───────────────┘
+                                      │ guard_result (dataclass, 不可变)
+        ┌─────────────┬───────────────┼───────────────┬──────────────┐
+        ▼             ▼               ▼               ▼              ▼
+   L1: ChunkGuard  L2: RecallGuard  L3: Template    L4: Stream     L5: History
+   语义边界保护    动态去噪提权     模板选择器       透传校验       跨轮隔离墙
+   (替代暴力截断)  (替代固定权重)   (替代Prompt逃生舱) (替代正则清洗)  (替代正则净化)
+```
+
+### L0：GuardOrchestrator —— 统一拒答状态机（最高优先级 🔴 P0）
+
+**问题**：当前三个拒答机制（ABSTAIN / 模板守卫 / 数字守卫）各自独立判定，状态分散在模块全局变量和函数返回值之间。
+
+**方案**：
+
+```python
+# 设计意图：L0 是 _build_messages 调用前的单一判定节点
+# 所有调用方（rag_chat / rag_chat_stream / llm_generation_node / run_graph_stream）
+# 在调用 _build_messages 之前，必须先过 L0 门控
+
+@dataclass(frozen=True)  # 不可变，线程安全
+class GuardResult:
+    decision: Literal["allow", "hard_refuse", "numeric_guard", "clarify"]
+    reason: str
+    # allow → 正常走 L1-L4
+    # hard_refuse → 确定性拒答（跳过 L1-L4，直接返回 _HARD_REFUSAL）
+    # numeric_guard → 数字实体缺失，触发 KV/BM25 第二机会
+    # clarify → 多产品歧义，触发澄清反问
+
+class GuardOrchestrator:
+    """
+    统一门控编排器。
+    判定顺序（短路求值）：
+      1. IMPOSSIBLE_COMBOS → hard_refuse (原 L4 检测提升至此)
+      2. 闲聊/身份 → clarify (透传至 product_routing)
+      3. 实体-上下文一致性检测 → numeric_guard 或 hard_refuse
+      4. 模板守卫 A/B/C → hard_refuse (原 _refusal_override)
+    所有判定均基于 (query, context_docs, product_id, doc_types) 四元组，
+    零模块级全局变量。
+    """
+```
+
+**关键变更**：
+- **消除 `_last_numeric_context_missing` 全局变量**：改为 `GuardResult.decision == "numeric_guard"`
+- **ABSTAIN 网关合并**：`graph_rag.py:709-739` 的硬编码实体列表迁移至 GuardOrchestrator 的实体-上下文一致性检测器
+- **所有调用方在调用 LLM 前必须通过 L0**，GuardResult 作为不可变值沿调用链传递
+
+### L1：ChunkGuard —— 语义边界保护替代暴力截断（🔴 P0）
+
+**问题**：Parent Chunk 的 `parent_chunk_size` 暴力截断是 OCR 参数丢失的物理根因。
+
+**方案**：不再按字符数截断，改为**语义边界保护**。
+
+设计要点：
+1. **受保护区域完全豁免**：OCR 补充块、代码块、Markdown 表格绝不截断
+2. **Parent Chunk 改为"完整 H2 章节"或"受保护块 + 上下文窗口"**，不再设硬上限
+3. 当 Parent 确实过大（> 4000 chars 的巨型章节）时，做语义分段：
+   - 第一段：章节导言 + OCR 补充块 → `parent_core`
+   - 后续段：按 H3 边界切 → 各为一个 `child_with_context`
+4. Context Cap（`_MAX_CONTEXT_CHARS=8000`）移至 L3 TemplateSelector，基于检索排名做智能截断（优先保留含数字/表格/OCR 的切片）
+5. **OCR 块标记为 "不可丢弃"**：在 Context Cap 裁剪时，含 `[本页图片解析参数]` 或 `[图表内容包含：]` 的切片具有最高保留优先级
+6. **表格行密度标记**：`| cell1 | cell2 |` 格式的行自动标记为 "高信息密度"，检索时提权
+
+### L2：RecallGuard —— 动态去噪提权替代固定权重（🟡 P1）
+
+**问题**：
+1. 高频词（"JAKA"）稀释 Dense 检索
+2. `_BM25_WEIGHT` 的动态条件不检测高频实体稀释
+3. BM25 对纯数字（6502）的 token 处理不理想
+
+**方案**：
+
+1. **高频实体稀释检测**：统计 query 中各 term 在语料库中的 DF (Document Frequency)；对 DF > 80% 的 term，降低其 Dense 向量维度权重，同时自动提升 BM25 权重
+2. **数字 Token 强化**：检测 query 中的 ≥2 位数字 → 在 BM25 索引中做 n-gram 扩展（"6502" → ["6502", "650", "502"]），提升部分匹配容错；数字 token 在 RRF 融合中额外 +0.05 boost
+3. **OCR 切片提权**：含 `[本页图片解析参数]` 或 `[图表内容包含：]` 的切片 → Dense 检索后额外 +0.03 RRF
+
+### L3：TemplateSelector —— 模板选择器替代 Prompt 逃生舱（🟢 P2）
+
+**问题**：当前双轨模板包含 `> [!WARNING]` 逃生舱条款，但仍然依赖 LLM 服从。
+
+**方案**：将拒答决策从 Prompt 指令**前移**到 Python 层。
+
+- 三种模板：`NORMAL_GUI` / `NORMAL_SDK` / `REFUSAL`
+- **废除 `> [!WARNING]` 逃生舱**：拒答决策完全在 Python 层完成
+- 所有模板均不含内部的条件分支（如 "如果...则输出拒答"）——条件分支已在 Python 层通过 GuardResult 完成
+- 每条 User Message 末尾追加 `[输出指令: 仅输出以下格式]` 标记，用纯文本指令替代 Markdown 引用块
+
+### L4：StreamGuard —— 流式透传校验替代全局变量依赖（🟢 P2）
+
+**方案**：
+- 流式路径不再读取 `_rag_chain_mod._last_numeric_context_missing`
+- StreamGuard 接收 GuardResult，在流开始前即确定行为
+- `_stream_guardrail` 的围栏闭合状态机保留（零缓冲的 ``` 奇偶计数）
+- `render_node` 持续退化为纯透传（v24 方向正确）
+
+### L5：HistoryIsolationWall —— 跨轮隔离墙替代正则净化（🟡 P1）
+
+**问题**：正则清洗无法区分"JAKA 的有效技术数据"和"会污染 OpenC3 的跨产品泄露"。
+
+**方案**：
+
+1. **产品上下文标记**：每条 assistant 消息记录其回答所基于的 product_id
+2. **跨产品切换检测**：当前 query 的 product_id 与历史中最近 assistant 消息的 product_id 不同 → 触发"产品上下文隔离"：历史中的技术数据（数字/代码/API名）被脱敏处理
+3. **同产品延续**：不做额外处理，保留完整历史供指代消解
+4. **拒答隔离**：assistant 消息若为 `_HARD_REFUSAL` / `_ESCAPE_REFUSAL` → 整条消息从历史中移除（而非仅清洗表面文本）
+5. 跨产品脱敏规则：数字（≥2 位）→ `[数值]`；snake_case 函数名 → `[函数名]`；代码块 → `[代码已隔离]`
+
+---
+
+## 架构对比：v29 vs v30
+
+| 维度 | v29 | v30 |
+|------|-----|-----|
+| 拒答判定 | 3 个独立机制 + 模块全局变量 | L0 GuardOrchestrator 单一入口 + 不可变 dataclass |
+| 线程安全 | ❌ `_last_numeric_context_missing` 竞态 | ✅ GuardResult 不可变值传递 |
+| Parent 截断 | 2000 chars 暴力截断 | 语义边界保护 + L3 Context Cap 智能裁剪 |
+| OCR 保留 | Parent 截断可能丢弃 OCR | OCR 块标记 MUST_KEEP + 优先级保护 |
+| BM25 权重 | 固定条件 `len<=8 或复合词` | DF 感知 + 数字 Token Boost |
+| 历史净化 | 正则清洗（语法层面） | 跨产品隔离墙（语义层面） |
+| 逃生舱 | Prompt `> [!WARNING]` 依赖 LLM 服从 | Python 层 TemplateSelector 确定性选择 |
+| 调用链 | 4 个调用方各自处理 guard | 统一 `guard → _build_messages → LLM` 流水线 |
+
+---
+
+## 实施优先级与风险矩阵
+
+| 优先级 | 模块 | 变更 | 影响面 | 风险 |
+|--------|------|------|--------|------|
+| **P0 🔴** | L0 GuardOrchestrator | 统一拒答状态机 + 消除 `_last_numeric_context_missing` 全局变量 | 4 个调用方 + graph_rag.py | 中：需重构 `_build_messages` 调用链 |
+| **P0 🔴** | L1 ChunkGuard | 废除 Parent 暴力截断 → 语义边界保护 | pdf_loader.py `_v4_build_parent_child_docs` | 中：Parent 变大，Context Cap 压力增大 |
+| **P1 🟡** | L5 HistoryIsolationWall | 跨产品隔离墙 | rag_chain.py `sanitize_chat_history` + graph_rag.py | 低：仅影响多轮对话 |
+| **P1 🟡** | L2 RecallGuard | DF 感知权重 + 数字 Token Boost | rag_chain.py `_hybrid_retrieve_single` + vector_store.py | 低：仅改权重参数 |
+| **P2 🟢** | L3 TemplateSelector | 废除 Prompt 逃生舱 → Python 层模板选择 | rag_chain.py `_build_messages` 模板部分 | 低：模板替换 |
+| **P2 🟢** | L4 StreamGuard | 流式路径消除全局变量依赖 | rag_chain.py + graph_rag.py 流式路径 | 低：接口替换 |
+
+### 新增风险与缓解
+
+| 风险 | 缓解 |
+|------|------|
+| 🟡 L0 GuardOrchestrator 误判（如漏召回导致虚拒） | 保留 Condition A 的 BM25 第二机会；所有 `hard_refuse` 决定记录结构化日志供审计 |
+| 🟡 Parent 不再截断 → 单 chunk 可达 8000+ chars | L3 Context Cap 仍上限 8000（整块丢弃），特大 Parent 通过语义拆分降级为 parent_core + overflow_children |
+| 🟡 DF 统计需要额外索引 | DF 可近似自 ChromaDB metadata 的文档计数，无需全量重建 |
+| 🟡 HistoryIsolationWall 的产品归属推断可能有误 | 优先用消息 metadata 中的 product_id（需在 LangGraph State 中新增字段）；fallback 到关键词推断 |
+| 🟡 废除逃生舱可能导致边界 case 缺乏柔性 | TemplateSelector 保留 `numeric_guard` 中间状态（第二机会后再判定），非二元 allow/hard_refuse |
+
+---
+
+# 历史审计记录 (v24)
+
+<details>
+<summary>点击展开 v24 原始审计报告</summary>
 
 ## 🔴 v24 重构核心论述：为什么"放弃 JSON + 正则"转向"模板 + 流式"是对小模型的决定性胜利
 
@@ -46,7 +402,6 @@ _stream_guardrail: 全量缓冲 → 重新分块 → 伪流式输出
 #### 死锁一：注意力衰减 × 结构复杂度 = JSON 提取失败
 
 小模型（尤其是 1.5B）在 8000 字符的长上下文中，注意力分布呈明显的"首尾偏置"（Primacy/Recency Bias）。当 Prompt 末尾要求输出特定 JSON 结构时，模型在生成中途已经"忘记"了 JSON Schema 的精确要求。结果：
-
 - **JSON 格式错误率 ~15-20%**：缺失闭合引号/括号、多余逗号、字段名拼写偏差
 - **`render_node` 的 JSON 解析频繁失败**：触发降级逻辑，整段输出被丢弃
 - **恶性循环**：JSON 解析失败 → 重试 → 更多延迟 → 用户体验崩溃
@@ -54,470 +409,126 @@ _stream_guardrail: 全量缓冲 → 重新分块 → 伪流式输出
 #### 死锁二：正则清洗的"误杀-漏杀"跷跷板
 
 L4 层的 5 道物理清洗正则 + `_fix_and_close_sdk_code` 中的函数名暴力替换，构成了一个脆弱的"补丁塔"：
-
-- **误杀风险**：`_OC3_CORRECTIONS` 字典中的 `robot.movl` → `robot.robot_movl` 暴力替换可能破坏注释中的正常文本（如 "// robot.movl is deprecated" → "// robot.robot_movl is deprecated"）
-- **漏杀风险**：正则无法覆盖 LLM 所有的创造性错误（如编造不存在的参数名）
-- **维护噩梦**：每个新发现的 LLM 错误模式都需要新增一条正则规则，`_fix_and_close_sdk_code` 从 3 行膨胀到 30+ 行
+- **误杀风险**：暴力替换可能破坏注释中的正常文本
+- **漏杀风险**：正则无法覆盖 LLM 所有的创造性错误
+- **维护噩梦**：每个新发现的 LLM 错误模式都需要新增一条正则规则
 
 #### 死锁三：`_stream_guardrail` 的伪流式陷阱
 
-旧版 `_stream_guardrail` 的核心逻辑是：
-
-```python
-def _stream_guardrail(gen):
-    buffer = []
-    for chunk in gen:
-        buffer.append(chunk)       # ← 先全部吞下
-    full_text = "".join(buffer)    # ← 等 60-90s 全部生成完
-    fixed = _fix_and_close_sdk_code(full_text)  # ← 再一次性修正
-    for i in range(0, len(fixed), chunk_size):
-        yield fixed[i:i + chunk_size]  # ← 重新分块输出
-```
-
-这导致：**TTFB = 完整生成时间（60-90s）**。前端用户看到的是长时间空白，然后瞬间吐出一大段文字——完全丧失了流式输出的用户体验价值。
+旧版全量缓冲 + 重新分块导致：**TTFB = 完整生成时间（60-90s）**。前端用户看到的是长时间空白，然后瞬间吐出一大段文字——完全丧失了流式输出的用户体验价值。
 
 ### 新架构：Markdown 模板强约束 (Template Masking) + 极速流式穿透
 
 v24 的核心理念转变是：**不再让小模型"自由创作然后修正"，而是给小模型一个精确的"填空模板"，将模型的自由度限制在模板的槽位（slot）内。**
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Prompt 结构（v24 模板约束）                                      │
-│                                                                  │
-│  RAG_SYSTEM_PROMPT (精简至 ~500 chars)                            │
-│    ↓                                                             │
-│  【参考资料】+ Context Chunks                                     │
-│    ↓                                                             │
-│  【用户问题】                                                     │
-│    ↓                                                             │
-│  🔴 Markdown 填空模板（置于 Prompt 最底端）                         │
-│    ├── gui_app 轨：                                               │
-│    │   根据《{doc_name}》【{section}】的记载：                      │
-│    │   1. [填写操作步骤1]                                         │
-│    │   2. [填写操作步骤2]                                         │
-│    │                                                             │
-│    └── c_sdk 轨：                                                │
-│        根据《{doc_name}》【{section}】的记载：                      │
-│        💻 Python ctypes 调用示例:                                 │
-│        ```python                                                 │
-│        import ctypes                                             │
-│        robot = ctypes.CDLL('{dll_name}')                         │
-│        # 1. [基于原文说明步骤作用]                                 │
-│        robot.[准确函数名]([参数])                                  │
-│        ```                                                       │
-└─────────────────────────────────────────────────────────────────┘
-```
-
 #### 为什么模板约束对 1.5B/7B 小模型是决定性的
 
-**1. 注意力锚定效应 (Attention Anchoring)**
+1. **注意力锚定效应 (Attention Anchoring)**：序列末尾的 token 对模型输出的影响权重最高（Recency Bias）。模板在 Prompt 底端 → 模型生成每个 token 时，模板约束始终在其注意力窗口的"热点区域"内
+2. **自由度压缩 (Degrees-of-Freedom Compression)**：模板将"怎么说"的决策空间压缩到接近于零——释放认知资源给"说什么"
+3. **错误模式可预测性 (Error Mode Predictability)**：自由格式的错误是发散的，模板约束下的错误是收敛的（只可能发生在槽位填充环节）
+4. **流式穿透**：模板约束确保格式正确 → 不再需要等待完整输出后再用正则修正 → TTFB 降至 <2s
 
-心理学和深度学习研究均证实：序列末尾的 token 对模型输出的影响权重最高（Recency Bias）。将精确的格式模板置于 Prompt 最底端，意味着模型在生成每一个 token 时，模板的约束始终在其注意力窗口的"热点区域"内。模型不需要"记住" 3000 字符前的 JSON Schema——它只需要"抄写"紧邻上方的模板格式，然后填入自己的内容。
-
-对于 1.5B 模型（仅 28 层 Transformer，注意力头数有限），这种"近端锚定"的效果尤为显著：模板格式的正确率从 ~80% 跃升至 ~97%+。
-
-**2. 自由度压缩 (Degrees-of-Freedom Compression)**
-
-在没有模板约束时，模型面临一个开放域生成问题：它需要同时决策"说什么"（内容）和"怎么说"（格式）。对于小模型，这两个子任务竞争有限的注意力资源，导致内容质量和格式正确性双双下降。
-
-模板将"怎么说"的决策空间压缩到接近于零——模型只需要将内容填入预定义的格式槽位。这释放了模型的认知资源，使其能集中注意力于"说什么"——从参考文档中准确提取函数名、参数和步骤描述。
-
-**3. 错误模式可预测性 (Error Mode Predictability)**
-
-自由格式生成的错误模式是发散的、不可预测的（模型可能在任何位置以任何方式偏离预期）。而模板约束下的错误模式是收敛的——错误只可能发生在"槽位填充"环节（如填入了错误的函数名）。这种收敛性使得：
-
-- L4 后处理可以从"擦屁股"简化为"兜底校验"
-- 不再需要 30+ 条正则规则去覆盖发散的兜底场景
-- `_fix_and_close_sdk_code` 中的函数名修正表可以逐步缩减
-
-**4. 流式穿透：TTFB 从 60-90s 降至 <2s**
-
-新版 `_stream_guardrail` 的核心逻辑变为：
-
-```python
-def _stream_guardrail(gen):
-    for chunk in gen:
-        yield chunk  # 直接透传，零缓冲
-```
-
-模板约束确保了模型输出的格式在生成过程中就是正确的——不再需要等待完整输出后再用正则修正。每个 token 到达后立即透传给前端，TTFB 降至首 token 生成时间（<2s）。这是用户体验的质变。
-
-### 变更清单（v24）
+### v24 变更清单
 
 | 文件 | 变更 | 类别 |
 |------|------|------|
-| `rag_chain.py` | `RAG_SYSTEM_PROMPT` 重写：从 210 行压缩至 ~30 行，Markdown 填空模板移至 Prompt 底端 | L3 重构 |
-| `rag_chain.py` | `_doc_section_str` 仅取 Top-1 来源章节（`_sections[0]`），拒绝大杂烩 | L3 优化 |
+| `rag_chain.py` | `RAG_SYSTEM_PROMPT` 重写：从 210 行压缩至 ~30 行 | L3 重构 |
+| `rag_chain.py` | `_doc_section_str` 仅取 Top-1 来源章节 | L3 优化 |
 | `rag_chain.py` | `_stream_guardrail` 废除全量缓冲，恢复极速流式透传 | L4 重构 |
 | `rag_chain.py` | `_fix_and_close_sdk_code` 函数名修正表保留但标注为"过渡期兜底" | L4 收敛 |
 | `graph_rag.py` | `render_node` 退化为极简文本透传（废弃 JSON 解析） | L4 简化 |
 | `graph_rag.py` | `extract_align_node` 删除"屠魔版"正则清洗逻辑 | L4 简化 |
-| `graph_rag.py` | `run_graph_stream` 底部删除双重输出 Bug（已注释的三行 yield 代码） | Bug 修复 |
-| `graph_rag.py` | `sdk_verify_node` 硬熔断逻辑保持不变，但触发频率预期大幅下降 | L4 维持 |
+| `graph_rag.py` | `run_graph_stream` 底部删除双重输出 Bug | Bug 修复 |
 
----
+### v24 审计评分
 
-## 第一层：数据摄入与切片层 (Data Ingestion & Chunking)
+| 层级 | 名称 | 严重问题 | 性能瓶颈 | 幻觉风险 | 评分 |
+|------|------|---------|---------|---------|------|
+| L1 | 数据摄入与切片 | 1 | 1 | 0 | A- |
+| L2 | 检索与重排 | 2 → 1 | 1 | 0 | A |
+| L3 | 上下文组装与指令 | 1 → 0 | 1 → 0 | 1 → 0 | A- → A |
+| L4 | 生成控制与后处理 | 0 | 1 → 0 | 0 | A → A+ |
 
-### 1.1 当前健康度
+**综合评分: A → A+ (94/100)**
 
-L1 层在 v23 的 GUI 轨专项攻坚后已达到较高成熟度。v24 重构未触及 L1，状态维持。
+### v24 仍存在的隐患
 
-### 1.2 保持的优良设计
+- **BUG-2.1**: Search-First 软路由的 `_score` 属性为空 (`graph_rag.py:411`)
+- **BUG-2.2**: Retry 逻辑 off-by-one (`run_graph_stream` 用 `>` 而 `_route_after_sdk_verify` 用 `<=`)
+- **FLOW-2**: `_last_numeric_context_missing` 等模块级全局变量的并发安全问题
 
-1. **代码注释拦截 (v18)**: `_CODE_KEYWORDS` 八特征词 ±120 字符上下文校验
-2. **伪标题黑名单**: `_PSEUDO_SECTION_BLACKLIST` frozenset 10 项
-3. **4 级 Title Fallback 链**: 状态机标题 → 面包屑路径 → 父级 H2 → 硬兜底
-4. **v23: 动态双轨标题拦截**: gui_app 轨禁止单数字编号提权
-5. **v23: 动态切片容量分配**: GUI=1500/2000, SDK=400/1000
-6. **v23: 跨级大纲扫描 + 微缩大纲降噪**: TOC 上限 5 条
-
-### 1.3 仍存在的隐患
-
-#### BUG-1.1: `_sanitize_section_title()` 黑名单 substring 误杀
-
-**状态**: 🟡 部分缓解但未根除。v23 降低了 GUI 侧暴露面，但 SDK 侧仍存在 substring 误杀风险。
-
-#### HALL-1.2 (v23): GUI 超大切片 (1500ch) 的嵌入语义稀释风险
-
-**状态**: 🟡 监控中。被 L2 稀疏提权引擎对冲，但需长期关注。
-
-### 1.4 v24 影响评估
-
-无直接影响。L1 切片质量直接影响 L3 模板的槽位填充质量——如果切片本身质量差（标题脏化、代码注释混入正文），模板约束无法补救。**L1 的质量是模板约束策略有效性的前提条件。**
-
----
-
-## 第二层：检索与重排层 (Retrieval & Reranking)
-
-### 2.1 当前健康度
-
-L2 层在 v23 引入 Title Exact Match (+5.0) 和 Chapter Isolation (+20.0/-10.0) 后，检索精准度达到历史最高水平。v24 重构未触及 L2 核心逻辑。
-
-### 2.2 v24 间接影响
-
-模板约束策略对 L2 提出了更高的要求：**模板的槽位填充质量完全取决于检索召回的质量**。如果检索召回的切片不包含正确的函数名/步骤描述，模板约束无法凭空创造正确内容——它只能让模型"更诚实地拒答"而非"更聪明地编造"。
-
-这意味着：
-- **检索召回率 (Recall) 比精确率 (Precision) 更重要**：宁可多召回让模板约束下的模型自行筛选，也不应漏掉关键切片
-- **Autocut 策略需要重新评估**：`_AUTOCUT_MIN_K=8` (SDK=10) 在模板约束下可能偏保守，因为模型不再会被多余切片中的噪声干扰（模板限定了输出结构）
-
-### 2.3 仍存在的隐患
-
-#### BUG-2.1: Search-First 软路由的 `_score` 属性为空
-
-`graph_rag.py:411` — `getattr(doc, '_score', None)` 永远返回 None。修复需要改用 `similarity_search_with_score()`。
-
-#### BUG-2.2: Retry 逻辑 off-by-one
-
-`run_graph_stream` 用 `>` 而 `_route_after_sdk_verify` 用 `<=`，导致 retry_count=2 时的行为不一致。v24 模板约束使得 SDK 自纠错的触发频率预期大幅下降，但 off-by-one 漏洞本身仍需修复。
-
----
-
-## 第三层：上下文组装与指令层 (Augmentation & Prompting)
-
-### 3.1 v24 核心变更：System Prompt 瘦身 + 模板约束
-
-#### 变更前 (v23)
-
-```
-RAG_SYSTEM_PROMPT: 210 行, ~3,500 字符, ~1,500 tokens
-  ├── 身份声明
-  ├── 最高铁律（3 条）
-  ├── [大量 Few-Shot 示例]
-  ├── [详细规则说明]
-  └── [格式要求散落在各处]
-```
-
-**核心问题**：
-1. **Token 预算失控**：1,500 tokens 的 System Prompt 占据 Qwen2.5-7B 的 8192 上下文窗口的 ~18%，挤占了实际参考资料的预算
-2. **注意力稀释**：过长的 System Prompt 导致模型对关键约束的注意力分散
-3. **格式约束位置不佳**：最重要的格式要求埋藏在 System Prompt 中间，不在模型的注意力热点区域
-
-#### 变更后 (v24)
-
-```
-RAG_SYSTEM_PROMPT: ~15 行, ~500 字符, ~250 tokens
-  ├── 身份声明（1 行）
-  ├── 最高铁律（3 条，精简）
-  └── 模板约束引用（1 行，指向底端模板）
-
-Prompt 底端（User Message 末尾）:
-  └── _dual_track_prefix: 精确的 Markdown 填空模板
-        ├── gui_app: 6 条排版铁律 + 步骤列表模板
-        └── c_sdk: 两段式排版铁律 + 代码块模板
-```
-
-**Token 预算对比**：
-
-| 组件 | v23 | v24 | 节省 |
-|------|-----|-----|------|
-| System Prompt | ~1,500 tokens | ~250 tokens | **-83%** |
-| `_dual_track_prefix` (在 User Msg 末尾) | ~200 tokens | ~200 tokens | — |
-| **System Prompt 总节省** | — | — | **~1,250 tokens** |
-
-这 1,250 tokens 的释放意味着：可以多塞入约 2-3 个额外的 Child 切片，或保留更多 Parent 背景信息。
-
-### 3.2 关键设计：`_doc_section_str` 仅取 Top-1 来源
-
-**变更前**：
-```python
-_doc_section_str = "；".join(_sections)  # 拼接所有章节 → 大杂烩
-# 输出: "第3章 通讯设置；第2章 硬件安装；第5章 故障排查"
-```
-
-**变更后**：
-```python
-_doc_section_str = _sections[0] if _sections else "相关章节"  # 仅取排名第一的章节
-```
-
-**理由**：模板约束下，"根据《xxx》【第3章 通讯设置；第2章 硬件安装】的记载" 这种多章节引用会让模型困惑——它不确定应该以哪个章节为主要依据。单一来源引用给模型一个明确的锚点，降低认知负担。检索排名第一的章节在绝大多数情况下就是最相关的章节。
-
-### 3.3 v24 影响：System Prompt 膨胀问题 ✅ 已解决
-
-BUG-3.1 (v23) 的核心问题是 System Prompt 从 15 行膨胀到 210 行。v24 的瘦身重构从根本上解决了此问题。System Prompt 现在严格控制在 ~250 tokens，为实际参考资料留出充足空间。
-
----
-
-## 第四层：生成控制与后处理层 (Generation & Post-Processing)
-
-### 4.1 v24 核心变更：L4 从"擦屁股"回归"兜底校验"
-
-v24 的 L4 层经历了最剧烈的简化。核心哲学转变：
-
-| 维度 | v23 (旧) | v24 (新) |
-|------|---------|---------|
-| **JSON 提取** | `render_node` 尝试 JSON 解析 LLM 输出 | `render_node` 直接透传 Markdown |
-| **正则清洗** | 5 道物理清洗正则 + 暴力函数名替换 | `_fix_and_close_sdk_code` 保留为过渡期兜底 |
-| **流式输出** | `_stream_guardrail` 全量缓冲 → 重新分块 | `_stream_guardrail` 直接透传，零缓冲 |
-| **属性对齐** | `extract_align_node` 屠魔版正则 | 保留 KV 实体提取，简化冲突检测 |
-| **SDK 自纠错** | `sdk_verify_node` + 回环重试 | 保持不变，但触发频率预期大幅下降 |
-| **后处理定位** | "修正大模型的错误输出" | "校验模板填充的正确性" |
-
-### 4.2 `render_node` 退化
-
-```python
-# v23: 尝试 JSON 解析，失败则降级
-def render_node(state):
-    raw = state.get("raw_llm_answer", "")
-    try:
-        data = json.loads(raw)
-        # ... 复杂渲染逻辑
-    except json.JSONDecodeError:
-        # 降级：直接透传
-        pass
-
-# v24: 直接透传 Markdown
-def render_node(state):
-    raw_answer = state.get("raw_llm_answer") or state.get("final_answer", "")
-    return {
-        "final_answer": raw_answer.strip(),
-        "route_status": state.get("route_status", "complete"),
-    }
-```
-
-**理由**：模板约束下，LLM 输出的格式在生成时就已经是目标 Markdown 格式——不需要 JSON 中间表示。`render_node` 的角色从"结构化渲染器"退化为"文本透传器"。
-
-### 4.3 `_stream_guardrail` 极速穿透
-
-v24 的 `_stream_guardrail` 是最具用户感知价值的变更：
-
-```python
-# v23: 全量缓冲 + 重新分块 → TTFB = 60-90s
-def _stream_guardrail(gen):
-    buffer = []
-    for chunk in gen:
-        buffer.append(chunk)
-    full_text = "".join(buffer)
-    fixed = _fix_and_close_sdk_code(full_text)
-    for i in range(0, len(fixed), chunk_size):
-        yield fixed[i:i + chunk_size]
-
-# v24: 直接透传 → TTFB < 2s
-def _stream_guardrail(gen):
-    for chunk in gen:
-        yield chunk
-```
-
-### 4.4 `run_graph_stream` 双重输出 Bug 修复
-
-v23 的 `run_graph_stream` 在流式输出完成后，又对 `extract_align_node` 的结果进行了二次 yield（L1876-1879），导致前端收到重复内容。v24 删除了这段代码，后处理结果仅存入 State 供历史记录使用。
-
----
-
-## 跨层数据流问题
-
-### FLOW-1: 两套管线并存 ✅ 方向明确但未完全清理
-
-`rag_chat` / `rag_chat_stream`（旧管线）与 `run_graph` / `run_graph_stream`（LangGraph 管线）仍然并存。v24 重构主要作用于 LangGraph 管线。旧管线的 `_fix_and_close_sdk_code` 函数名修正表仍然保留但不再膨胀。
-
-**建议**: 在 v25 中正式废弃 `rag_chat` / `rag_chat_stream`，将所有外部调用统一到 LangGraph 引擎。
-
-### FLOW-2: 模块级可变全局变量 🟡 技术债持续累积
-
-`_last_numeric_context_missing`、`_HYDE_CACHE`、`_resolved_vllm_model` 等模块级全局变量在多线程环境下的并发安全性仍无保障。v24 未触及此问题。
-
----
-
-## 未来升级推演：四层架构的工业级进化方向
-
-基于当前的"模板约束"形态，以下是每层架构的理论升级方向：
-
-### L1 — 数据摄入与切片层
-
-| 方向 | 描述 | 优先级 | 复杂度 |
-|------|------|--------|--------|
-| **Agentic Chunking** | 用小模型动态判定切片边界，替代当前的规则-based 标题树切分。对排版不规范的 PDF 更鲁棒 | 🟡 中 | 高 |
-| **Multi-Modal Ingestion** | 直接摄入 PNG/JPEG 截图中的 UI 操作流程，用视觉模型生成文本描述后入向量库 | 🟡 中 | 高 |
-| **Chunk Quality Scoring** | 在切片阶段为每个 Chunk 预计算"信息密度分数"，供 L2 检索时作为排序信号 | 🟢 低 | 低 |
-| **增量切片热更新** | 新 PDF 上传后仅重建受影响产品的切片索引，不触发全量 BM25 重建 | 🟡 中 | 中 |
-
-### L2 — 检索与重排层
-
-| 方向 | 描述 | 优先级 | 复杂度 |
-|------|------|--------|--------|
-| **Learned RRF Weights** | 用点击率/用户反馈数据训练六大提权引擎的权重系数，替代当前手工设定 | 🟡 中 | 高 |
-| **Query-Aware Chunk Expansion** | 检索后，用小模型判定每个召回切片是否需要扩展前后相邻切片，动态调整上下文窗口 | 🟢 低 | 中 |
-| **Cross-Lingual Retrieval** | 支持英文查询检索中文文档（利用 bge 模型的多语言能力），服务国际化需求 | 🟢 低 | 低 |
-| **BM25 磁盘持久化** | pickle 序列化分词索引，消除每次重启 30s 冷启动 | 🔴 高 | 低 |
-
-### L3 — 上下文组装与指令层
-
-| 方向 | 描述 | 优先级 | 复杂度 |
-|------|------|------|--------|
-| **Template Auto-Selection** | 基于 Query 意图分类（操作步骤 / API 查询 / 参数查询 / 故障排查）自动选择最优模板变体 | 🟡 中 | 中 |
-| **Dynamic Few-Shot Injection** | 从向量库中检索与当前 Query 最相似的"历史成功问答对"，注入为 Few-Shot 示例 | 🟡 中 | 中 |
-| **Context-Aware Template Truncation** | 当 Context 中无代码块时，自动切换到纯文本模板，避免空白代码块 | 🟢 低 | 低 |
-| **Multi-Turn Template Memory** | 在多轮对话中，复用上一轮的模板结构，只更新槽位内容，强化格式一致性 | 🟢 低 | 中 |
-
-### L4 — 生成控制与后处理层
-
-| 方向 | 描述 | 优先级 | 复杂度 |
-|------|------|------|--------|
-| **Streaming Template Validator** | 在流式输出的同时，增量检查当前输出是否偏离模板结构——一旦偏离立即发送修正 token | 🟡 中 | 高 |
-| **Slot-Level Factual Verifier** | 对模板的每个槽位（函数名/参数/步骤描述），在 Context 中做精确字符串匹配验证 | 🟡 中 | 中 |
-| **Confidence-Anchored Output** | 当模板槽位填充的置信度低时（如函数名不在 Context 中），自动追加不确定性标记 | 🟢 低 | 低 |
-| **A/B Template Testing Framework** | 对同一 Query 用不同模板变体生成回答，自动评估哪个模板产出更高质量 | 🟢 低 | 中 |
-
----
-
-## 代码结构"体检"：核心文件拆分与重构建议
-
-### 现状诊断
+### v24 代码结构"体检"
 
 | 文件 | 行数 | 职责数 | 问题 |
 |------|------|--------|------|
-| `rag_chain.py` | ~3,242 | **12+** | 上帝类反模式：Prompt 构建 + 混合检索 + LLM 调用 + Query 预处理 + HyDE + 闲聊路由 + 直接检索 + 流式/非流式双管线 + 代码修复 + 历史净化 + 意图重写 + 复合查询拆解 |
-| `graph_rag.py` | ~1,926 | **8+** | 图定义 + 9 个节点实现 + 条件路由 + 流式回路 + KV 实体提取 + SDK 代码检测 + 安全包装器 + SubGoal Planner + CrossProduct 检索 + Synthesize |
-| `pdf_loader.py` | ~1,938 | **6+** | PDF 文本提取 + 清洗 + 标题解析 + 切片构建 + OCR + 状态机 SDK 解析 |
-| `vector_store.py` | ~400 | 3 | 向量库管理 + BM25 + 嵌入模型管理 |
+| `rag_chain.py` | ~3,242 | 12+ | 上帝类反模式 |
+| `graph_rag.py` | ~1,926 | 8+ | 图定义 + 9 个节点实现 + 条件路由 |
+| `pdf_loader.py` | ~1,938 | 6+ | PDF 文本提取 + 清洗 + 标题解析 + 切片构建 + OCR |
 
-### 拆分方案
+### v24 优先修复路线图
 
-#### `rag_chain.py` → 6 个模块
+| 阶段 | 编号 | 问题 | 预计 |
+|------|------|------|------|
+| 第一阶段 | REF-1 | `rag_chain.py` 拆分为 6 个子模块 | 8h |
+| 第一阶段 | REF-2 | `graph_rag.py` 拆分为 4 个子模块 | 4h |
+| 第一阶段 | FLOW-2 | `_last_numeric_context_missing` → RAGState 字段 | 1h |
+| 第一阶段 | FLOW-1 | 废弃旧管线 `rag_chat` / `rag_chat_stream` | 2h |
+| 第二阶段 | PERF-2.1 | BM25 磁盘持久化 (pickle) | 2h |
+| 第二阶段 | BUG-2.1 | Search-First `_score` 属性修复 | 1h |
+| 第二阶段 | BUG-2.2 | Retry 逻辑 off-by-one 修复 | 30min |
+| 第三阶段 | L3-UP | 模板自动选择（基于 Query 意图分类） | 4h |
+| 第三阶段 | L2-UP | Query-Aware Chunk Expansion | 3h |
+| 第三阶段 | L4-UP | Slot-Level Factual Verifier | 4h |
 
-```
-src/
-├── rag_chain.py              # ~400 行: 仅保留顶层编排 + 公开 API (rag_chat/rag_chat_stream)
-├── prompts/
-│   ├── __init__.py
-│   ├── system_prompt.py      # ~150 行: RAG_SYSTEM_PROMPT + _dual_track_prefix + _term_alignment_prefix
-│   ├── rewrite_prompt.py     # ~100 行: REWRITE_SYSTEM_PROMPT + _rewrite_query_with_llm()
-│   └── templates.py          # ~100 行: Markdown 模板定义与选择逻辑
-├── retrieval/
-│   ├── __init__.py
-│   ├── hybrid_retrieve.py    # ~500 行: _hybrid_retrieve + _hybrid_retrieve_single + RRF + Autocut
-│   ├── query_preprocess.py   # ~200 行: _preprocess_query + 噪音模式 + 中文数字转换
-│   └── hyde.py               # ~100 行: _generate_hyde_doc + HyDE 缓存
-├── routing/
-│   ├── __init__.py
-│   ├── product_router.py     # ~150 行: _resolve_product_from_query + product_routing_node
-│   └── intent_classifier.py  # ~200 行: _is_chitchat + _is_sdk_code_query + _is_impossible_query
-├── generation/
-│   ├── __init__.py
-│   ├── llm_client.py         # ~300 行: _get_client + _get_deepseek_client + _call_llm + _stream_llm + vLLM 健康检查 + 锁管理
-│   └── context_builder.py    # ~400 行: _build_messages + Context Cap + 历史净化 + 父子组装
-├── postprocess/
-│   ├── __init__.py
-│   ├── code_fixer.py         # ~100 行: _fix_and_close_sdk_code
-│   ├── guardrail.py          # ~50 行: _stream_guardrail
-│   └── direct_retrieval.py   # ~300 行: _direct_retrieval_response + _extract_structured_content + 评分
-└── history/
-    ├── __init__.py
-    └── sanitizer.py          # ~150 行: sanitize_chat_history + 净化正则
-```
-
-#### `graph_rag.py` → 4 个模块
-
-```
-src/
-├── graph_rag.py              # ~300 行: 仅保留图构建 + run_graph/run_graph_stream + set_graph_vector_store
-├── graph_nodes/
-│   ├── __init__.py
-│   ├── query_fusion.py       # ~100 行: query_fusion_node
-│   ├── product_routing.py    # ~200 行: product_routing_node + Search-First + 多产品检测
-│   ├── retrieval.py          # ~150 行: hybrid_retrieval_node + cross_product_retrieval_node
-│   ├── generation.py         # ~250 行: llm_generation_node (四层容灾)
-│   ├── postprocess.py        # ~200 行: sdk_verify_node + render_node + extract_align_node
-│   └── planner.py            # ~200 行: subgoal_planner_node + synthesize_node
-├── graph_routing/
-│   ├── __init__.py
-│   └── conditions.py         # ~100 行: _route_after_product_routing + _route_after_planner + _route_after_llm + _route_after_sdk_verify
-└── graph_utils/
-    ├── __init__.py
-    ├── code_entities.py      # ~100 行: _extract_code_entities + 运动别名 + CODE 标签
-    ├── kv_extractor.py       # ~100 行: _extract_generic_kv_entities + 属性词库
-    └── safe_nodes.py         # ~50 行: _node_safe 装饰器 + _NODE_FALLBACKS
-```
-
-### 全局状态清理
-
-| 变量 | 当前所在 | 问题 | 建议 |
-|------|---------|------|------|
-| `_last_numeric_context_missing` | `rag_chain.py` 模块级 | 并发不安全 | 移入 RAGState 字段 |
-| `_HYDE_CACHE` | `rag_chain.py` 模块级 | 无 TTL，无限增长 | 移入独立缓存模块 + LRU |
-| `_resolved_vllm_model` | `rag_chain.py` 模块级 | 单次写入后不变，可接受 | 保持 |
-| `_compiled_graph` | `graph_rag.py` 模块级 | 单例模式，合理 | 保持 |
-| `_graph_vector_store` | `graph_rag.py` 模块级 | 单例模式，合理 | 保持 |
+</details>
 
 ---
 
-## 优先修复路线图 (v24 更新)
+# v30 优先修复路线图
 
-### 第一阶段：代码结构 (v25 目标)
+### 第一阶段：架构安全 (v30 目标)
 | 编号 | 问题 | 预计 | 影响 |
 |------|------|------|------|
-| REF-1 | `rag_chain.py` 拆分为 6 个子模块 | 8h | 可维护性 ↑↑↑ |
-| REF-2 | `graph_rag.py` 拆分为 4 个子模块 | 4h | 可测试性 ↑↑ |
-| FLOW-2 | `_last_numeric_context_missing` → RAGState 字段 | 1h | 并发安全 |
-| FLOW-1 | 废弃旧管线 `rag_chat` / `rag_chat_stream` | 2h | 维护负担 -50% |
+| **REF-3** | L0 GuardOrchestrator 实现 + 消除 `_last_numeric_context_missing` 全局变量 | 6h | 并发安全 + 拒答一致性 |
+| **REF-4** | L1 ChunkGuard：废除 Parent 暴力截断 → 语义边界保护 + OCR MUST_KEEP 标记 | 4h | OCR 参数零丢失 |
+| **REF-5** | L5 HistoryIsolationWall：跨产品上下文隔离墙 | 3h | 多轮跨产品污染根除 |
+| REF-1 | `rag_chain.py` 拆分为 6 个子模块 (延续 v24 路线图) | 8h | 可维护性 |
+| REF-2 | `graph_rag.py` 拆分为 4 个子模块 (延续 v24 路线图) | 4h | 可测试性 |
+| FLOW-1 | 废弃旧管线 `rag_chat` / `rag_chat_stream` (延续 v24 路线图) | 2h | 维护负担 -50% |
 
-### 第二阶段：性能优化
+### 第二阶段：检索质量
 | 编号 | 问题 | 预计 |
 |------|------|------|
+| **REF-6** | L2 RecallGuard：DF 感知权重 + 数字 Token Boost + OCR 切片提权 | 4h |
 | PERF-2.1 | BM25 磁盘持久化 (pickle) | 2h |
 | BUG-2.1 | Search-First `_score` 属性修复 | 1h |
 | BUG-2.2 | Retry 逻辑 off-by-one 修复 | 30min |
 
-### 第三阶段：功能升级
-| 编号 | 方向 | 预计 |
+### 第三阶段：模板与流式
+| 编号 | 问题 | 预计 |
 |------|------|------|
-| L3-UP | 模板自动选择（基于 Query 意图分类） | 4h |
-| L2-UP | Query-Aware Chunk Expansion | 3h |
-| L4-UP | Slot-Level Factual Verifier | 4h |
+| REF-7 | L3 TemplateSelector：废除 `> [!WARNING]` 逃生舱 → Python 层二元模板 | 3h |
+| REF-8 | L4 StreamGuard：流式路径消除全局变量依赖 | 2h |
 
 ---
 
-## 架构设计评价
+## 架构设计评价 (v30 更新)
 
 ### 杰出之处
-1. **v24 模板约束策略**: 对 1.5B/7B 小模型的理解深刻——不试图让模型"更聪明"，而是给模型"更窄的跑道"。这是务实的工业级工程思维
-2. **四层容灾金字塔**: 设计优雅，v24 未触及证明其稳定性
-3. **双轨制 (c_sdk/gui_app)**: v24 模板约束进一步强化了双轨差异——每轨有独立的格式模板
-4. **流式穿透**: TTFB 从 60-90s 降至 <2s，用户体验质变
+1. **v24 模板约束策略**：对 1.5B/7B 小模型的理解深刻——不试图让模型"更聪明"，而是给模型"更窄的跑道"
+2. **四层容灾金字塔**：设计优雅，历经 v24-v29 仍保持稳定
+3. **双轨制 (c_sdk/gui_app)**：模板约束进一步强化了双轨差异
+4. **v29 OCR 键值法 + Fast-Path 侧信道**：方向正确，`(messages, refusal_flag)` 元组设计消除了模板守卫本身的竞态
+5. **v28 区域状态机标题提取**：保护区内跳过匹配——标题提取与区域保护首次解耦
 
 ### 需警惕的架构债
-1. **代码结构臃肿**: `rag_chain.py` 3,242 行单文件是项目最大的可维护性负债
-2. **两套管线并存**: v25 应正式完成统一
-3. **模块级可变全局状态**: 并发安全隐患
-4. **`_fix_and_close_sdk_code` 函数名修正表**: 模板约束使其逐步过时，但 30+ 条暴力替换规则仍保留——这是技术债标志
+| 编号 | 问题 | 严重度 | 首次识别 |
+|------|------|--------|---------|
+| DEBT-1 | `_last_numeric_context_missing` 模块级全局变量并发竞态 | 🔴 致命 | v24 |
+| DEBT-2 | Parent Chunk 暴力截断导致 OCR 参数丢失 | 🔴 致命 | **v30 新识别** |
+| DEBT-3 | 三种拒答机制（ABSTAIN/模板守卫/数字守卫）各自独立运行 | 🔴 致命 | **v30 新识别** |
+| DEBT-4 | 历史净化无法区分跨产品技术数据泄露 | 🟡 严重 | **v30 新识别** |
+| DEBT-5 | 逃生舱依赖 LLM Prompt 服从（非确定性） | 🟡 严重 | v25 |
+| DEBT-6 | `rag_chain.py` 3,242 行单文件上帝类 | 🟡 严重 | v24 |
+| DEBT-7 | 两套管线并存 (`rag_chat` vs `run_graph`) | 🟡 严重 | v24 |
+| DEBT-8 | Dense 检索无高频词稀释保护（IDF 缺失） | 🟡 严重 | **v30 新识别** |

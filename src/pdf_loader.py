@@ -1039,9 +1039,12 @@ def _v4_extract_text_universal(pdf_path: str, doc_type: str = "general") -> Tupl
         last_header["path"] = " > ".join(t for _, _, t in stack)
         last_header["level"] = level
 
+    # 🔴 v30: 跨页表格表头向下继承 —— 上一页生成的 Markdown 表格表头
+    _table_header: Optional[str] = None
+
     for page_idx in range(total_pages):
         page = doc[page_idx]
-        
+
         # -------------------- 🔴 [终极修复 1] Y 坐标物理排序 --------------------
         # 🔴 v28: gui_app 轨升级为 line 级几何重建 —— PyMuPDF block 会把表格整行
         # 单元格合并为单 block（内部 \n 分隔），block 级排序无法重建表格行。
@@ -1083,9 +1086,38 @@ def _v4_extract_text_universal(pdf_path: str, doc_type: str = "general") -> Tupl
                     if len(_cells) >= 2 and all(len(c) <= 40 for c in _cells):
                         # 表格行：包装为 Markdown 形态 → 受保护 + 不被标题提取
                         _row_texts.append("| " + " | ".join(_cells) + " |")
+                    elif len(_cells) == 1 and len(_cells[0]) < 10 and _row_texts:
+                        # 🔴 v30.final: 孤儿行合并 —— 修复单元格内换行导致表格碎裂
+                        # "Windows7及以上\n上" → 追加到上一行最后一个单元格末尾
+                        _prev = _row_texts[-1]
+                        if _prev.startswith("|"):
+                            _prev_clean = _prev.rstrip()
+                            if _prev_clean.endswith("|"):
+                                _row_texts[-1] = _prev_clean[:-1] + _cells[0] + " |"
+                            else:
+                                _row_texts[-1] = _prev_clean + _cells[0]
+                        else:
+                            _row_texts.append(_cells[0])
                     else:
                         # 单 item 带 / 长文本行：原样输出（保住标题/图注/散文）
                         _row_texts.append(_cells[0] if _cells else "")
+                # 🔴 v30: 跨页大表格表头向下继承
+                # 检测本页是否以表格续行开头（前页表格被分页截断），若是则强制注入暂存表头
+                # 🔴 修复：只检查本页的第一行非空文本，严格判定"以表格开头"
+                _page_starts_with_table = False
+                for _rt in _row_texts:
+                    if _rt.strip(): # 找到第一行有效文本
+                        if _rt.startswith("|"):
+                            _page_starts_with_table = True
+                        break
+                if _page_starts_with_table and _table_header:
+                    _row_texts.insert(0, _table_header)
+                # 更新暂存表头：取本页第一个表格行作为传给下一页的表头
+                for _rt in _row_texts:
+                    if _rt.startswith("|"):
+                        _table_header = _rt
+                        break
+
                 page_text = "\n".join(_row_texts)
             except Exception:
                 page_text = ""
@@ -1112,13 +1144,85 @@ def _v4_extract_text_universal(pdf_path: str, doc_type: str = "general") -> Tupl
             _try_update_header(page_text, page_idx)
 
         # ── Step 3: OCR 补漏（低密度页 或 🔴 强制图片OCR）──
-        ocr_lines = []
+        # 🔴 v30.final: gui_app → 全景快照 OCR（废弃逐图抠取）；c_sdk → 保持原逻辑
+        ocr_groups: List[List[str]] = []   # gui_app: Y 分组 OCR 行
+        ocr_lines: List[str] = []           # c_sdk: 保持原有扁平列表
+
+        # ── 🔴 v30.final: gui_app 全景快照 OCR + 智能去重 + Y 轻量分组 ──
+        # 废弃 page.get_images() 逐图抠取 —— 矢量图设置框（如 6502 端口配置界面）
+        # 无法被 get_images() 捕获；改为整页高清截图 + 只保留 PyMuPDF 未提取的
+        # "增量幽灵参数"；Y 坐标轻量分组防整页 giant <OCR_BLOCK> 撑爆向量模型
+        if (needs_ocr or force_image_ocr) and ocr is not None and doc_type == "gui_app":
+            try:
+                # 🔴 修复：强制 RGB 颜色空间并剥离 Alpha 通道，防止 Image.frombytes 转换时通道数不匹配崩溃
+                _pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False, colorspace=fitz.csRGB)
+                _np_img = np.array(Image.frombytes(
+                    "RGB", [_pix.width, _pix.height], _pix.samples))
+                _ocr_res = ocr(_np_img)
+                if _ocr_res and _ocr_res[0] is not None:
+                    # 智能去重: page_text 中已存在的文字不再 OCR
+                    _page_text_norm = re.sub(r'\s+', '',
+                        page_text.strip()) if page_text.strip() else ""
+                    _ocr_items = []
+                    for _item in _ocr_res[0]:
+                        _box = _item[0] if _item[0] else None
+                        _text = str(_item[1]).strip()
+                        if len(_text) < 2:
+                            continue
+                        _text_norm = re.sub(r'\s+', '', _text)
+                        # 🔴 修复：增加长度门槛 (>= 6个字符才去重)。保护离散的参数值和短标签不被误杀！
+                        if len(_text_norm) >= 6 and _page_text_norm and _text_norm in _page_text_norm:
+                            continue
+                        if _box:
+                            _y_c = sum(_p[1] for _p in _box) / len(_box)
+                            _x_l = min(_p[0] for _p in _box)
+                        else:
+                            _y_c, _x_l = 0.0, 0.0
+                        _ocr_items.append((_y_c, _x_l, _text))
+                    if _ocr_items:
+                        _ocr_items.sort(key=lambda t: (round(t[0] / 12), t[1]))
+                        # Y 聚类成行 + KV 归一化（与旧逐图逻辑一致）
+                        _row_acc = []
+                        _row_norm_list = []
+                        _cur_row = None
+                        for _y_c, _x_l, _text in _ocr_items:
+                            _row_key = round(_y_c / 12)
+                            if _cur_row is None:
+                                _cur_row = _row_key
+                            if _row_key == _cur_row:
+                                _row_acc.append(_text)
+                            else:
+                                _norm = _ocr_kv_normalize_row(_row_acc)
+                                if _norm:
+                                    _row_norm_list.append(_norm)
+                                total_ocr_chars += sum(len(l) for l in _row_acc)
+                                _row_acc = [_text]
+                                _cur_row = _row_key
+                        if _row_acc:
+                            _norm = _ocr_kv_normalize_row(_row_acc)
+                            if _norm:
+                                _row_norm_list.append(_norm)
+                            total_ocr_chars += sum(len(l) for l in _row_acc)
+                        # 🔴 v30.final: Y 坐标轻量分组 —— 每 ≤12 行合并为一组
+                        _GROUP_SIZE = 12
+                        for _gi in range(0, len(_row_norm_list), _GROUP_SIZE):
+                            _chunk = _row_norm_list[_gi:_gi + _GROUP_SIZE]
+                            ocr_groups.append(_chunk)
+                        # 组内跨行键值合并
+                        for _gi in range(len(ocr_groups)):
+                            ocr_groups[_gi] = _ocr_merge_cross_line(
+                                ocr_groups[_gi], page_idx + 1)
+            except Exception:
+                ocr_groups = []
 
         # 👇 修改点 3：条件放宽，即使文本很密，只要是 GUI 手册也强制扫图
         if (needs_ocr or force_image_ocr) and ocr is not None:
             image_list = page.get_images(full=True)
             _img_seq = 0   # 🔴 v29: 本页图片序号（按图子块化）
             for img_info in (image_list or []):
+                # 🔴 v30.final: gui_app 已走全景快照 OCR，跳过逐图路径
+                if doc_type == "gui_app":
+                    continue
                 xref = img_info[0]
                 # 🔴 v26 保留: 该图在页面上的放置矩形（供 gui_app 面积比过滤）
                 _img_rect = None
@@ -1225,8 +1329,34 @@ def _v4_extract_text_universal(pdf_path: str, doc_type: str = "general") -> Tupl
             if ocr_lines:
                 ocr_pages += 1
 
-        # ── Step 4: 页面内容组装 — OCR 页尾追加 + 章节上下文继承 ──
+        # ── Step 4: 页面内容组装 ──
         page_parts = []
+
+        # 🔴 v30.final: gui_app OCR 块前置 —— 插入 page_text 最前方
+        # （旧逻辑追加页尾会撕裂跨页长句；前置让 OCR 参数成为页面"语义头"）
+        if doc_type == "gui_app" and ocr_groups:
+            ocr_pages += 1
+            section_header = ""
+            if last_header.get("title"):
+                section_header = (
+                    f"\n[路径: {last_header['path']}]"
+                    f"\n[章节: {last_header['title']}]"
+                )
+            if needs_ocr:
+                try:
+                    _all_ocr_text = "\n".join(
+                        "\n".join(g) for g in ocr_groups)
+                    _try_update_header(_all_ocr_text, page_idx)
+                except Exception:
+                    pass
+            for _gi, _group_lines in enumerate(ocr_groups):
+                _ocr_header = (
+                    f"[本页图片解析参数: page={page_idx + 1}, block={_gi + 1}]"
+                    f"{section_header}"
+                )
+                _ocr_content = _ocr_header + "\n" + "\n".join(_group_lines)
+                page_parts.append(f"<OCR_BLOCK>\n{_ocr_content}\n</OCR_BLOCK>")
+
         if page_text.strip():
             page_parts.append(page_text.strip())
 
@@ -1247,11 +1377,14 @@ def _v4_extract_text_universal(pdf_path: str, doc_type: str = "general") -> Tupl
                 )
             # 🔴 v27: 安全追加在该页最后一个 Header 层级之下（回退 v26 CTM Y 归位）
             # 🔴 v29: 块级前缀简化（子块级 [图表内容包含：] 已带语义）
+            # 🔴 v30: OCR 标签化防稀释 —— <OCR_BLOCK> 包裹确保 Dense 向量不被
+            # 离散 OCR 文本稀释，同时 _PROTECTED_BLOCK_RE 识别为保护区
             ocr_header = (
                 f"[本页图片解析参数: page={page_idx + 1}]"
                 f"{section_header}"
             )
-            page_parts.append(ocr_header + "\n" + "\n".join(ocr_lines))
+            ocr_content = ocr_header + "\n" + "\n".join(ocr_lines)
+            page_parts.append(f"<OCR_BLOCK>\n{ocr_content}\n</OCR_BLOCK>")
 
         if page_parts:
             page_texts.append("\n".join(page_parts))
@@ -1273,16 +1406,19 @@ def _v4_extract_text_universal(pdf_path: str, doc_type: str = "general") -> Tupl
     return full_text, total_pages, ocr_pages
 
 
-# ── 受保护区域正则: 代码块 ```...```、Markdown 表格 |...|、OCR 补充块 ──
+# ── 受保护区域正则: 代码块 ```...```、Markdown 表格 |...|、OCR 语义块 <OCR_BLOCK> ──
 # 🔴 v28: 第三分支 OCR 补充块 —— 标记行起，锚定 \n\n 页分隔止。
 # 必须锚定页分隔而非"下一个标记"（否则会吞掉下一页全部正文，标题树塌陷）
 # 🔴 v29: 标记同步 —— 块级 [本页图片解析参数: page=N] 与子块级 [图表内容包含：] 均入保护区
+# 🔴 v30: 第四分支 OCR 语义块 —— <OCR_BLOCK>...</OCR_BLOCK> 包裹的 OCR 文本（防 Dense 稀释 + 保护区识别）
 _PROTECTED_BLOCK_RE = re.compile(
-    r'(```[\s\S]*?```)'                              # 代码块
+    r'(```[\s\S]*?```)'                              # ① 代码块
     r'|'                                              # 或
-    r'((?:^\|.+\|[\s\S]*?)(?=\n\n|\n(?:[^|]|\Z)|\Z))'  # Markdown 表格
+    r'(<OCR_BLOCK>[\s\S]*?</OCR_BLOCK>)'              # ② 🔴 v30: OCR 语义块（不可切分 + 防向量稀释）
     r'|'                                              # 或
-    r'(^\[(?:本页图片解析参数|图表内容包含)：[^\]]*\][\s\S]*?(?=\n\n|\Z))',  # OCR 补充块
+    r'((?:^\|.+\|[\s\S]*?)(?=\n\n|\n(?:[^|]|\Z)|\Z))'  # ③ Markdown 表格
+    r'|'                                              # 或
+    r'(^\[(?:本页图片解析参数|图表内容包含)：[^\]]*\][\s\S]*?(?=\n\n|\Z))',  # ④ OCR 补充块
     re.MULTILINE,
 )
 
@@ -1297,6 +1433,8 @@ def _v4_find_protected_ranges(text: str) -> List[Tuple[int, int, str]]:
         if m.group(1):
             rtype = "code"
         elif m.group(2):
+            rtype = "ocr"   # 🔴 v30: OCR 语义块 (<OCR_BLOCK>...</OCR_BLOCK>)
+        elif m.group(3):
             rtype = "table"
         else:
             rtype = "ocr"   # 🔴 v28: OCR 补充块（页尾图片解析文本，不得参与标题提取）
@@ -1490,13 +1628,52 @@ def _v4_build_parent_child_docs(
         if len(parent_text) < 30:
             continue
 
+        # 🔴 v30: AST-Lite 软装箱 —— 替代暴力腰斩，受保护块（代码/表格/OCR）不可分割
         if len(parent_text) > parent_chunk_size:
-            cutoff = max(
-                parent_text.rfind('\n\n', parent_chunk_size - 200, parent_chunk_size + 200),
-                parent_text.rfind('\n', parent_chunk_size - 100, parent_chunk_size + 100),
-                parent_chunk_size,
-            )
-            parent_text = parent_text[:cutoff].strip()
+            # 1. 将 parent_text 解析为 普通文本 / 受保护块 交替序列
+            _segments = []
+            _last_end = 0
+            for _m in _PROTECTED_BLOCK_RE.finditer(parent_text):
+                if _m.start() > _last_end:
+                    _segments.append(("normal", parent_text[_last_end:_m.start()]))
+                _segments.append(("protected", _m.group(0)))
+                _last_end = _m.end()
+            if _last_end < len(parent_text):
+                _segments.append(("normal", parent_text[_last_end:]))
+
+            # 2. 软装箱: 受保护块整体装入（允许超标），普通文本在 \n\n 安全切断
+            _packed_parts = []
+            _packed_len = 0
+            _sealed = False
+
+            for _seg_type, _seg_text in _segments:
+                if _sealed:
+                    break
+                if _seg_type == "protected":
+                    # 规则 b: 受保护块整体装入
+                    _packed_parts.append(_seg_text)
+                    _packed_len += len(_seg_text)
+                    # 🔴 修复：只有当装入保护块后确实超标了，才封箱结束。如果没满，继续装！
+                    if _packed_len >= parent_chunk_size:
+                        _sealed = True
+                else:
+                    if _packed_len + len(_seg_text) <= parent_chunk_size:
+                        _packed_parts.append(_seg_text)
+                        _packed_len += len(_seg_text)
+                    else:
+                        # 规则 a: 普通文本溢出 → 在最近 \n\n 段落边界安全切断
+                        _remaining = max(parent_chunk_size - _packed_len, 100)
+                        _cutoff = _seg_text.rfind('\n\n', 0, _remaining)
+                        if _cutoff < 80:
+                            _cutoff = _seg_text.rfind('\n', 0, _remaining)
+                        if _cutoff > 60:
+                            _packed_parts.append(_seg_text[:_cutoff].strip())
+                        else:
+                            # 退路: 无合适段落边界时硬切到剩余长度（远优于原暴力腰斩）
+                            _packed_parts.append(_seg_text[:_remaining].strip())
+                        _sealed = True
+
+            parent_text = "\n\n".join(p for p in _packed_parts if p.strip()).strip()
 
         # 👇 ================= 🔴 核心修复：跨级大纲扫描 ================= 👇
         # 寻找下一个同级或更高级别的标题位置，作为大纲的扫描终点
@@ -2005,10 +2182,69 @@ def _split_text_into_children(
         child_idx += 1
 
     # ── 🔴 v5: GUI 轨 — 废除字符硬切，按 Heading-to-Heading 完整保留 ──
+    # 🔴 v30: AST-Lite OCR 子块隔离 —— <OCR_BLOCK> 强制作为独立 ocr_child 切片，
+    # 坚决不混入普通文本切片中（防止 OCR 离散文本稀释 Dense 向量语义）
     if doc_type == "gui_app":
         content = text.strip()
-        if len(content) >= 10:
+        if len(content) < 10:
+            return children
+
+        # 🔴 v30: OCR 块独立 emit（与 _emit_child 分离，chunk_type="ocr_child"）
+        def _emit_ocr_child(ocr_content: str):
+            nonlocal child_idx
+            ocr_content = ocr_content.strip()
+            if len(ocr_content) < 10:
+                return
+            if _is_skeleton_chunk(ocr_content):
+                return
+            # OCR 子块继承章节面包屑，但不提取 function_names（非代码块）
+            _clean_sec = _sanitize_section_title(section_title)
+            if not _clean_sec:
+                _clean_sec = _sanitize_section_title(breadcrumb)
+            if not _clean_sec:
+                _clean_sec = "技术文档"
+            prefix = _build_child_prefix(source, breadcrumb, _clean_sec, [])
+            children.append(Document(
+                page_content=f"{prefix}{ocr_content}",
+                metadata={
+                    "source": source, "product_id": product_id,
+                    "doc_type": _resolve_doc_type(product_id),
+                    "chunk_type": "ocr_child", "parent_id": parent_id,
+                    "section_title": _clean_sec,
+                    "section_level": section_level,
+                    "function_names": "",
+                    "api_atomic": False,
+                    "is_api": False,
+                    "sdk_header": "",
+                },
+            ))
+            child_idx += 1
+
+        # v30: 扫描 <OCR_BLOCK> 标签，OCR 块独立切片
+        _ocr_blocks = list(_PROTECTED_BLOCK_RE.finditer(content))
+        _has_ocr = any(_m.group(2) for _m in _ocr_blocks)  # group(2) = <OCR_BLOCK>
+
+        if not _has_ocr:
             _emit_child(content)
+            return children
+
+        # 有 OCR 块 → alternating 分离: 普通文本归 child，OCR 块归 ocr_child
+        _last_end = 0
+        for _m in _ocr_blocks:
+            if _m.group(2):  # <OCR_BLOCK>...</OCR_BLOCK>
+                # Emit OCR 前的普通文本
+                _normal = content[_last_end:_m.start()].strip()
+                if _normal and len(_normal) >= 10:
+                    _emit_child(_normal)
+                # Emit OCR 块为独立 ocr_child（不受 chunk_size 限制，整体保留）
+                _emit_ocr_child(_m.group(2))
+                _last_end = _m.end()
+
+        # 尾部剩余普通文本
+        _tail = content[_last_end:].strip()
+        if _tail and len(_tail) >= 10:
+            _emit_child(_tail)
+
         return children
 
     # ── 🔴 v12: SDK 轨 — 状态机已定义完整 API 边界，绝对禁止二次拆切 ──
