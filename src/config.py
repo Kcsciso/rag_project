@@ -56,7 +56,7 @@ DEEPSEEK_MODEL = "glm-4.7-flash"  # 智谱 GLM-4.7-Flash 免费模型
 # ============================================================
 BASE_URL = os.environ.get("LLM_BASE_URL", "http://localhost:8001/v1")
 API_KEY = os.environ.get("LLM_API_KEY", "EMPTY")
-MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct-AWQ")
+MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "/home/kasm-user/LLM/mo/models/Qwen--Qwen2.5-7B-Instruct-AWQ/snapshots/master")
 
 # ============================================================
 # 向量库 & 嵌入模型配置

@@ -356,8 +356,14 @@ _FALLBACK_EXCEPTIONS = (
 # 当主 BASE_URL 已经是 DeepSeek 时，跳过同源降级（避免无意义的重复请求）
 _FALLBACK_ENABLED = BASE_URL != DEEPSEEK_BASE_URL
 
-# vLLM 健康检查超时（短超时，避免长时间阻塞）
-_VLLM_HEALTH_TIMEOUT = httpx.Timeout(connect=5.0, read=8.0, write=5.0, pool=3.0)
+# vLLM 健康检查超时
+# connect=3s: localhost 连接应该瞬间完成，3s 已足够容错
+# read=10s:  /v1/models 是纯 HTTP 端点（不触发 GPU 推理），正常 <100ms。
+#            10s 容忍 vLLM event loop 被首次推理的 CUDA kernel 编译短暂阻塞
+_VLLM_HEALTH_TIMEOUT = httpx.Timeout(connect=3.0, read=10.0, write=5.0, pool=3.0)
+
+# 缓存最近一次健康检查结果，避免同一请求内重复 GET /v1/models
+_vllm_health_cache: Dict[str, any] = {"ts": 0, "status": False}
 
 
 def _check_vllm_health() -> bool:
@@ -367,6 +373,11 @@ def _check_vllm_health() -> bool:
     使用独立的短超时 httpx 客户端直接 GET /v1/models，
     避免 OpenAI SDK 的重试机制在 vLLM 不可用时浪费数秒。
 
+    🔴 v30.final+ 优化:
+      - 5s 结果缓存：同一请求内的多次调用（_rewrite_query_with_llm +
+        run_graph_stream Layer 1）共享结果，避免重复 GET /v1/models。
+      - read 超时从 8s → 10s：容忍首次推理 CUDA warmup 短暂阻塞 event loop。
+
     Returns:
         True 如果 vLLM 服务正常响应（HTTP 200），否则 False
     """
@@ -374,19 +385,35 @@ def _check_vllm_health() -> bool:
     if "localhost" not in BASE_URL and "127.0.0.1" not in BASE_URL:
         return True  # 云端 API，无需本地健康检查
 
+    # 🔴 5 秒缓存：避免同一请求内 _rewrite_query_with_llm + 主生成重复检查
+    _now = time.time()
+    if _now - _vllm_health_cache["ts"] < 5.0:
+        return _vllm_health_cache["status"]
+
     try:
         with httpx.Client(timeout=_VLLM_HEALTH_TIMEOUT) as client:
             resp = client.get(f"{BASE_URL}/models")
             if resp.status_code == 200:
+                _vllm_health_cache["ts"] = _now
+                _vllm_health_cache["status"] = True
                 logger.debug("✅ vLLM 健康检查通过")
                 return True
             else:
+                _vllm_health_cache["ts"] = _now
+                _vllm_health_cache["status"] = False
                 logger.warning(f"⚠️  vLLM 健康检查异常: HTTP {resp.status_code}")
                 return False
     except httpx.TimeoutException:
-        logger.warning("⚠️  vLLM 健康检查超时 (connect=3s/read=5s)，跳过 Layer 1")
+        _vllm_health_cache["ts"] = _now
+        _vllm_health_cache["status"] = False
+        logger.warning(
+            f"⚠️  vLLM 健康检查超时 (connect={_VLLM_HEALTH_TIMEOUT.connect}s/"
+            f"read={_VLLM_HEALTH_TIMEOUT.read}s)，跳过 Layer 1"
+        )
         return False
     except Exception as e:
+        _vllm_health_cache["ts"] = _now
+        _vllm_health_cache["status"] = False
         logger.warning(f"⚠️  vLLM 健康检查失败: {type(e).__name__}: {e}")
         return False
 
@@ -397,24 +424,29 @@ _resolved_vllm_model: Optional[str] = None
 
 def _resolve_vllm_model() -> str:
     """
-    动态获取 vLLM 当前实际加载的模型 ID。
+    🔴 v30.final+ 修复: 始终返回配置的 MODEL_NAME 用于 chat/completions 请求。
 
-    通过 GET /v1/models 接口查询 vLLM 已加载的模型列表，
-    取第一个模型的 id 字段。结果会缓存在模块级变量中。
+    vLLM 单模型实例对 model 字段宽松——用 MODEL_NAME 即可路由到唯一加载的模型。
+    /v1/models 探测仅做日志记录（健康校验 + 模型一致性告警），
+    其返回的绝对路径不再作为推理请求的 model 参数。
+
+    修复原因: vLLM /v1/models 返回的 id 是 --model 启动参数的原样值（可能是含 --
+    的绝对路径）。某些 vLLM 版本对此路径做严格匹配，chat/completions 收到不匹配的
+    model 字段时可能静默挂起连接而非返回错误，导致 OpenAI SDK 永久阻塞在 read() 上。
 
     Returns:
-        vLLM 实际模型 ID（如 "Qwen/Qwen2.5-1.5B-Instruct"），
-        若获取失败则回退到 config.MODEL_NAME
+        始终返回 config.MODEL_NAME（如 "Qwen/Qwen2.5-7B-Instruct-AWQ"）
     """
     global _resolved_vllm_model
     if _resolved_vllm_model is not None:
         return _resolved_vllm_model
 
-    # 仅对本地 vLLM 做动态解析（云端 API 直接使用配置值）
+    # 仅对本地 vLLM 做动态探测（云端 API 直接使用配置值）
     if "localhost" not in BASE_URL and "127.0.0.1" not in BASE_URL:
         _resolved_vllm_model = MODEL_NAME
         return _resolved_vllm_model
 
+    # ── 健康探测 + 模型一致性告警（不影响返回值）──
     try:
         with httpx.Client(timeout=_VLLM_HEALTH_TIMEOUT) as client:
             resp = client.get(f"{BASE_URL}/models")
@@ -422,15 +454,18 @@ def _resolve_vllm_model() -> str:
                 data = resp.json()
                 models = data.get("data", [])
                 if models:
-                    model_id = models[0].get("id", MODEL_NAME)
-                    _resolved_vllm_model = model_id
-                    logger.info(f"🔍 动态模型解析: vLLM 实际模型 = '{model_id}'")
-                    return _resolved_vllm_model
+                    actual_id = models[0].get("id", "")
+                    if actual_id and actual_id != MODEL_NAME:
+                        logger.info(
+                            f"🔍 vLLM 实际加载: '{actual_id}'，"
+                            f"推理请求将使用配置名: '{MODEL_NAME}'"
+                        )
+                    else:
+                        logger.info(f"🔍 vLLM 模型一致: '{MODEL_NAME}'")
     except Exception as e:
-        logger.warning(f"⚠️  动态模型解析失败: {e}，回退到配置值 '{MODEL_NAME}'")
+        logger.warning(f"⚠️  vLLM 模型探测失败: {e}，使用配置值 '{MODEL_NAME}'")
 
     _resolved_vllm_model = MODEL_NAME
-    logger.info(f"🔍 动态模型解析: 使用配置回退值 '{MODEL_NAME}'")
     return _resolved_vllm_model
 
 # ============================================================
@@ -518,7 +553,8 @@ def _release_vllm_lock():
 # ============================================================
 
 def _call_llm(client: OpenAI, model: str, messages: List[Dict[str, str]],
-              max_tokens: int = 2058, temperature: float = 0.0) -> str:
+              max_tokens: int = 2058, temperature: float = 0.0,
+              extra_body: Optional[dict] = None) -> str:
     """
     调用 LLM 完成非流式推理，返回完整回答文本。
 
@@ -527,18 +563,28 @@ def _call_llm(client: OpenAI, model: str, messages: List[Dict[str, str]],
         model: 模型名称
         messages: 消息列表
         max_tokens: 最大输出 token 数（v16: 1024，代码+步骤已完全充裕）
-        temperature: 采样温度（默认 0.2）
+        temperature: 采样温度（默认 0.0 → 贪婪解码）
+        extra_body: 🔴 可选额外请求体（默认 None 即不发送）。
+                     repetition_penalty 仅主生成路径按需传入，
+                     Query Rewrite 短查询不发送（防 vLLM 静默挂起）。
+
+    🔴 v30.final+ 修复: extra_body 改为显式参数（默认 None），
+    不再首轮无条件发送 repetition_penalty。
+    部分 vLLM 版本对不支持的 extra_body 参数静默丢弃连接而非返回 400，
+    导致 OpenAI SDK 永久阻塞在 read() 上（无任何异常触发重试）。
     """
     _current_tokens = max_tokens
     for _attempt in range(3):  # 最多 3 次：原始 + 裁 Context + 再裁 Context
         try:
-            response = client.chat.completions.create(
+            _kwargs = dict(
                 model=model,
                 messages=messages,
                 temperature=temperature,
                 max_tokens=_current_tokens,
-                extra_body={"repetition_penalty": 1.1} if _attempt == 0 else None,
             )
+            if extra_body is not None:
+                _kwargs["extra_body"] = extra_body
+            response = client.chat.completions.create(**_kwargs)
             raw = response.choices[0].message.content
             return _fix_and_close_sdk_code(raw) if raw else raw
         except BadRequestError as e:
@@ -569,40 +615,52 @@ def _call_llm(client: OpenAI, model: str, messages: List[Dict[str, str]],
                 raise
             elif "repetition_penalty" in _err_msg.lower():
                 logger.warning("⚠️  repetition_penalty 不被支持，去掉 extra_body 重试")
+                extra_body = None  # 后续重试不发送
                 continue
             else:
                 raise
+        except (APITimeoutError, APIConnectionError) as e:
+            # 🔴 v30.final+: vLLM 挂起超时自动重试（去掉 extra_body）。
+            # _attempt=0 且携带 extra_body 时 vLLM 可能静默丢弃连接 → 超时。
+            # 重试时清除 extra_body，用最简参数重发。
+            if extra_body is not None:
+                logger.warning(
+                    f"⚠️  LLM 请求超时/连接失败 (attempt={_attempt}): {type(e).__name__}，"
+                    f"清除 extra_body 重试"
+                )
+                extra_body = None
+                continue
+            raise
     # Exhausted retries
     raise RuntimeError("vLLM 400: unable to fit context after trimming")
 
 
 def _stream_llm(
-    client: OpenAI, model: str, messages: List[Dict[str, str]]
+    client: OpenAI, model: str, messages: List[Dict[str, str]],
+    extra_body: Optional[dict] = None,
 ) -> Generator[str, None, None]:
     """
     调用 LLM 完成流式推理，逐 token 产出文本增量。
 
-    将流式调用封装为独立生成器函数，
-    便于 rag_chat_stream() 中 Layer 1 / Layer 2 复用同一调用逻辑。
-
-    【防死循环采样参数】
-      - temperature=0.2: 极低随机性，代码/函数名输出确定性高
-      - max_tokens=512: 硬限制单次最大输出长度
-      - repetition_penalty=1.15: 惩罚连续重复 token，阻断 Lz27→Lz28 循环
+    🔴 v30.final+ 修复: extra_body 改为显式参数（默认 None 即不发送）。
+    同 _call_llm 修复原因——部分 vLLM 版本对不支持的 extra_body 参数
+    静默丢弃连接，导致流式请求永久阻塞。
     """
     _max_tokens = 2048  # 🔴 v16: 1024 — 代码+步骤已完全充裕，从源头消解 400
     _temperature = 0.0
 
     for _attempt in range(3):  # 🔴 v12: 最多 3 次（原始 + 裁 Context + 再裁 Context）
         try:
-            stream = client.chat.completions.create(
+            _kwargs = dict(
                 model=model,
                 messages=messages,
                 temperature=_temperature,
                 max_tokens=_max_tokens,
                 stream=True,
-                extra_body={"repetition_penalty": 1.1} if _attempt == 0 else None,
             )
+            if extra_body is not None:
+                _kwargs["extra_body"] = extra_body
+            stream = client.chat.completions.create(**_kwargs)
             for chunk in stream:
                 delta = chunk.choices[0].delta
                 if delta and delta.content:
@@ -630,9 +688,19 @@ def _stream_llm(
                 raise
             elif "repetition_penalty" in _err_msg.lower():
                 logger.warning("⚠️  Stream repetition_penalty 不支持，去掉 extra_body 重试")
+                extra_body = None
                 continue
             else:
                 raise
+        except (APITimeoutError, APIConnectionError) as e:
+            if extra_body is not None:
+                logger.warning(
+                    f"⚠️  Stream 超时/连接失败 (attempt={_attempt}): {type(e).__name__}，"
+                    f"清除 extra_body 重试"
+                )
+                extra_body = None
+                continue
+            raise
 
 
 # ============================================================
