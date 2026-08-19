@@ -18,6 +18,8 @@
 
 > **🔴 v30.final 全景快照 OCR + 孤儿行合并 (2026-08-07)**: 孤儿行合并（单元格内换行 `<10ch` → 追加到上一行表格末单元格，修复 `Windows7及以上\n上` Markdown 碎裂）+ **全景快照 OCR**（废弃 `get_images()` 逐图抠取 → `get_pixmap(Matrix(2,2))` 整页 2× 高清截图，矢量图设置框零盲区）+ 智能去重（OCR 文本 vs `page_text` 交叉比对，仅保留增量幽灵参数）+ Y 轻量分组（≤12 行/组，防 giant block）+ **OCR 前置**（插入 `page_text` 最前方，旧逻辑页尾追加撕裂跨页上下文已废弃）+ C-SDK 逐图跳过（`if doc_type=="gui_app": continue`，零触碰隔离）。
 
+> **🔴 v31 数据摄入双轨制 (2026-08-19)**: **JAKA 手册 → MinerU (magic-pdf 1.3.12) 离线解析**（doclayout_yolo 版面 + rapid_table 表格 + unimernet `cache_position` 文件级补丁），产出 `data/jaka_markdown/JAKA_Manual/auto/JAKA_Manual.md`（2659 行，含 Modbus 寄存器大表）；**SDK 文档保留原 L1 状态机管线零改动**。连环排雷记录：layout-config 缺省回退 detectron2 NoneType 崩溃 / `table-master` 非法表名 / transformers 4.49 毒药参数 / modelscope 模型快照漂移 / GPU 争抢自适应（详见 dev_log）。
+
 ---
 
 ## 🏛️ RAG 四层系统架构
@@ -162,6 +164,32 @@
 | 代码块闭合 | `_fix_and_close_sdk_code()` 过渡期兜底 — Markdown ``` 自动闭合 + CDLL 补全 + 函数名修正表; v25: 接入 extract_align_node 覆盖 Graph 全路径 |
 | SemanticDedup | trigram overlap > 0.55 截断 — v25: 无条件精确段落去重 (连续相同 ≥80ch) + 代码块跳过模糊去重 |
 | Temperature | 非流式 0.2 / 流式 0.01 — 代码生成近确定性输出 |
+
+---
+
+## 📄 文档解析双轨制（v31）
+
+不同文档类型走不同的解析管线，互不侵入：
+
+| 文档类型 | 解析管线 | 入口 |
+|---------|---------|------|
+| **JAKA 手册 / GUI 文档** | **MinerU (magic-pdf 1.3.12)** — 深度学习版面分析 + OCR + 表格识别 → Markdown | `src/parse_jaka_mineru.py` |
+| **SDK 文档 (OpenC3/OpenR6)** | 原 L1 状态机管线 `_v4_parse_sdk_state_machine()`（效果稳定，保持不动） | `rebuild_v4.py` / `/api/upload` |
+
+### MinerU 离线解析使用
+
+```bash
+conda activate rag_agent
+python src/parse_jaka_mineru.py     # 权重检查 → magic-pdf.json 生成 → GPU 自适应 → 解析
+```
+
+- **模型权重**: `~/LLM/MinerU_Models`（modelscope `OpenDataLab/PDF-Extract-Kit-1.0`）
+- **输出**: `data/jaka_markdown/JAKA_Manual/auto/JAKA_Manual.md`
+- **配置要点**（`~/magic-pdf.json` 由脚本自动生成）:
+  - `layout-config: {"model": "doclayout_yolo"}` — **必须显式指定**，缺省会回退 layoutlmv3（detectron2 崩溃）
+  - `table-config: {"model": "rapid_table"}` — 合法名 `tablemaster` / `rapid_table` / `struct_eqtable`
+- **环境补丁**: transformers ≥4.49 下需先执行 `auto_patch_mbart.py` / `patch_unimernet.py`（unimernet `cache_position` 文件级补丁）
+- **已知事项**: 大表输出为 HTML `<table>` 混合 Markdown；MinerU 依赖（transformers≥4.49）与 vLLM 0.5.4（<4.46）版本互斥，升级任一方前需评估
 
 ---
 
@@ -311,7 +339,7 @@ python audit_chunks.py                # 切片健康度审计
 
 ## 📝 开发日志与架构审计
 
-- **[dev_log.md](./dev_log.md)**: 从 2026-07-20 至今共 33 章完整开发记录与架构决策（最新: v29 数据语义化 + 确定性拒答 — OCR 键值法 + Fast-Path 短路）
+- **[dev_log.md](./dev_log.md)**: 从 2026-07-20 至今共 34 章完整开发记录与架构决策（最新: v31 数据摄入双轨制 — JAKA 手册走 MinerU，SDK 保留原管线）
 - **[ARCHITECTURE_AUDIT.md](./ARCHITECTURE_AUDIT.md)**: v24 全盘四层架构审计报告（含模板约束理论分析/代码结构体检/拆分方案/未来升级推演）
-- **[CLAUDE.md](./CLAUDE.md)**: AI 协同开发规范（含 v24 四层架构排雷法思想钢印：System Prompt 极简/模板底端锚定/流式零缓冲/render_node 纯透传/L4 正则最小化；v25: 逃生舱条款/围栏闭合状态机/JAKA 数字保护特判；v26: OCR Y 归位/复合词原子化/重写器 always-on；v27: 路由责任切分/模板选择守卫/OCR 回退；v28: 区域状态机标题提取/line 级表格重建/last_header 层级栈；v29: OCR 键值法/Fast-Path 确定性拒答/数字守卫豁免/重写中立性）
+- **[CLAUDE.md](./CLAUDE.md)**: AI 协同开发规范（含 v24 四层架构排雷法思想钢印：System Prompt 极简/模板底端锚定/流式零缓冲/render_node 纯透传/L4 正则最小化；v25: 逃生舱条款/围栏闭合状态机/JAKA 数字保护特判；v26: OCR Y 归位/复合词原子化/重写器 always-on；v27: 路由责任切分/模板选择守卫/OCR 回退；v28: 区域状态机标题提取/line 级表格重建/last_header 层级栈；v29: OCR 键值法/Fast-Path 确定性拒答/数字守卫豁免/重写中立性；v30/v30.final: AST-Lite 软装箱/全景快照 OCR/孤儿行合并；v31: 数据摄入双轨制 — JAKA→MinerU / SDK→原管线）
 - **[tests/TEST_REPORT.md](./tests/TEST_REPORT.md)**: 评测报告归档

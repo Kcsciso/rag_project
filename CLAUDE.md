@@ -45,6 +45,7 @@
 | 🔴 跨级大纲扫描终点 (v23) | TOC 扫描至下一个同级/更高级标题，H1 章节完整囊括子章节 |
 | 🔴 微缩大纲上限 (v23) | Child TOC 上限 **5 条** (v22: 15)，超出显示 "... (更多章节略)" |
 | 🔴 大纲标签统一 (v23) | 全部使用 `[章节大纲参考]:`，禁止旧 `【子章节】` / `[本章/本节包含以下子内容大纲]` |
+| 🔴 数据摄入双轨制 (v31) | JAKA 手册 → MinerU 离线解析（`src/parse_jaka_mineru.py`）；SDK 文档 → 原 L1 状态机管线。两轨互不侵入；SDK 轨零触碰；gui_app 轨 L1 逻辑保留不删除 |
 
 ### L2 — 检索与重排层 (vector_store.py + rag_chain.py `_hybrid_retrieve`)
 | 核心特性 | 严禁破坏 |
@@ -158,6 +159,7 @@ Conda `rag_agent` (Python 3.10)。**严禁 `pip install --upgrade`**：
 | 🔴 **v29** | **v29** | **数据语义化 + 确定性拒答: OCR 键值法 (`端口：\|6502`, 跨行配对, 按图子块化) / 图片过滤重构 (0.5%/40px 下限 + xref 去重 + 放置次数) / 数字守卫复合词豁免 (Ethernet/IP 的 IP 不误杀) / Fast-Path 确定性拒答 (`_build_messages` 返回侧信道, 守卫命中跳过 LLM 直出 `_HARD_REFUSAL`, 封堵 Layer 3 泄漏) / 重写协议主题中立性 (规则 2 限制 + Few-Shot + `_PROTOCOL_TERMS_RE` 确定性兜底)** | `_ocr_kv_normalize_row`/`_ocr_merge_cross_line`, `_guard_query` 剥离, `(messages, refusal_flag)` 侧信道, `_PROTOCOL_TERMS_RE` |
 | 🔴 **v30** | **v30** | **AST-Lite 软装箱: 跨页表格表头向下继承 (暂存 `_table_header` → 下页注入) / OCR 标签化防稀释 (`<OCR_BLOCK>` 包裹 + `_PROTECTED_BLOCK_RE` 第二分支 + `_v4_find_protected_ranges` `type="ocr"`) / Parent 软装箱算法 (受保护块不可分割 → 整体装入允许超标, 普通文本 `\n\n` 安全切断) / OCR 子块隔离 (`_emit_ocr_child` + `chunk_type="ocr_child"` 独立切片) / 过早封箱 Bug 修复 (`_packed_len >= parent_chunk_size` 条件封箱)** | `_table_header`, `<OCR_BLOCK>`, `_PROTECTED_BLOCK_RE` 第二分支, `_emit_ocr_child()`, `chunk_type="ocr_child"` |
 | 🔴 **v30.final** | **v30.final** | **全景快照 OCR + 孤儿行合并: 孤儿行合并 (短文本 <10ch 追加到上一行表格末单元格, 修复 `Windows7及以上\n上` 碎裂) / 全景快照 OCR (`get_pixmap(Matrix(2,2))` 整页截图 → 废弃 `get_images()` 逐图抠取, 矢量图盲区归零) / 智能去重 (OCR 文本去空格后 vs `page_text` 交叉比对, 仅保留增量) / Y 轻量分组 (≤12 行/组, 防 giant block) / OCR 前置 (`page_text` 最前方插入, 旧逻辑页尾追加撕裂跨页上下文) / C-SDK 逐图跳过 (`if doc_type=="gui_app": continue`)** | `_pix = page.get_pixmap()`, `_page_text_norm` 去重, `_GROUP_SIZE=12`, OCR prepend, 孤儿行合并 `elif len(_cells)==1` |
+| 🔴 **v31** | **v31** | **数据摄入双轨制: JAKA 手册 → MinerU 离线解析 (magic-pdf 1.3.12, doclayout_yolo 版面 + rapid_table 表格 + unimernet `cache_position` 文件级补丁) 产出 `data/jaka_markdown/JAKA_Manual/auto/JAKA_Manual.md`；SDK 文档保留原 L1 状态机管线零改动。连环排雷: layout-config 缺省回退 detectron2 NoneType 崩溃 / `table-master` 非法表名 / transformers 4.49 毒药参数 (subprocess 内 monkeypatch 无效 → 文件级补丁) / modelscope 模型快照漂移 (OCR v3 det 缺失) / GPU 争抢自适应** | `src/parse_jaka_mineru.py`, `auto_patch_mbart.py`, `patch_unimernet.py` |
 
 ### 当前关键配置
 
@@ -259,7 +261,15 @@ Conda `rag_agent` (Python 3.10)。**严禁 `pip install --upgrade`**：
 | **Y 轻量分组 (v30.final)** | OCR 行按 Y 坐标 ≤12 行合并为一组（`_GROUP_SIZE=12`），每组独立 `<OCR_BLOCK>`——防整页 giant block 撑爆 512 维向量窗口 |
 | **OCR 前置 (v30.final)** | gui_app OCR 块必须插入 `page_text`**最前方**（非页尾追加）；C-SDK 轨 OCR 追加逻辑严禁触碰；逐图循环入口 `if doc_type=="gui_app": continue` 跳过 |
 
----
+### 🔴 v31 新增关键约束
+
+| 约束 | 说明 |
+|------|------|
+| **数据摄入双轨制** | JAKA 手册 → MinerU 离线解析（`src/parse_jaka_mineru.py`，magic-pdf 1.3.12）；SDK 文档 → 原 L1 状态机管线。两轨互不侵入；禁止将 JAKA 手册回切自研管线（除非 MinerU 失效且 gui_app 轨仍可用） |
+| **MinerU 配置三键** | `~/magic-pdf.json` 必须含：`layout-config: {"model": "doclayout_yolo"}`（**缺省回退 layoutlmv3 → detectron2/fvcore 抛 NoneType**）、`table-config` 合法名（tablemaster/rapid_table/struct_eqtable，带连字符非法）、`models-dir` 绝对路径 |
+| **unimernet 补丁文件级** | transformers ≥4.49 下必须执行 `auto_patch_mbart.py`/`patch_unimernet.py`（site-packages 文件级补丁）；**进程内 monkeypatch 对 subprocess 调用的 magic-pdf 无效** |
+| **MinerU 依赖互斥** | magic-pdf 1.3.12 要求 transformers≥4.49，vLLM 0.5.4 要求 <4.46——升级/安装任一栈前必须评估对方影响；禁止将 MinerU 依赖写入核心依赖锁定清单 |
+| **SDK 轨零触碰** | MinerU 双轨制下 `pdf_loader.py` C-SDK 轨逻辑保持原样；gui_app 轨 L1 逻辑保留（其他 GUI 文档仍依赖），禁止删除 |
 
 # 🚀 本地服务启动
 
@@ -299,6 +309,8 @@ python app.py   # → http://localhost:8000 (比邻星 ProximaRAG) · API: /docs
 | `check_status.py` | 健康检查 — vLLM + FastAPI + GPU |
 | `start_services.sh` | 一键启动 — GPU 智能选择 + 就绪轮询 + 优雅退出 |
 | `audit_chunks.py` | 切片健康度审计 (Health Score) |
+| `src/parse_jaka_mineru.py` | 🔴 v31: MinerU 离线解析入口 (JAKA 手册) — modelscope 权重检查 + `~/magic-pdf.json` 生成 (doclayout_yolo + rapid_table) + GPU 自适应 + magic-pdf CLI 调用 |
+| `auto_patch_mbart.py` / `patch_unimernet.py` | 🔴 v31: unimernet × transformers 4.49 `cache_position` 文件级补丁 (site-packages 注入) |
 
 ### 关键函数索引
 
@@ -384,4 +396,5 @@ pkill -f "app.py"; pkill -f "vllm"  # 一键停止
 python check_status.py           # 健康检查
 python tests/run_eval.py --verbose  # 回归评测
 python audit_chunks.py           # 切片健康度审计
+python src/parse_jaka_mineru.py  # v31: JAKA 手册 MinerU 离线解析
 ```

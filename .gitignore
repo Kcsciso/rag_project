@@ -1,6 +1,18 @@
+# Python 缓存
 __pycache__/
 *.pyc
-vector_db/
+*.pyo
+*.pyd
+.venv/
+env/
+venv/
+
+# 环境变量与敏感配置
 .env
-# 把规则写进 .gitignore
-echo "__pycache__/" >> .gitignore
+
+# 向量数据库与本地大模型缓存
+vector_db/
+rag_index/
+
+# MinerU 解析输出的临时与 Markdown 产物目录
+data/

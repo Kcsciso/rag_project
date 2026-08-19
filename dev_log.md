@@ -1,5 +1,45 @@
 # 比邻星 (ProximaRAG) — 开发日志
 
+> **日期**: 2026-08-19 | **版本**: v30.final → v31 | **类型**: 数据摄入双轨制 — JAKA 手册接入 MinerU 离线解析（SDK 轨保留原管线）
+
+### v31 变更 (Dual-Track Ingestion: MinerU for JAKA Manual, Legacy Pipeline for SDK)
+
+**背景**: JAKA Zu APP 使用手册版式复杂（大量参数截图、跨页寄存器大表、矢量图设置框），自研 L1 管线的 OCR 修复成本持续走高；SDK 文档在 `_v4_parse_sdk_state_machine` 状态机管线下的效果已稳定。经评估决策：**JAKA 文档数据摄入切换为 MinerU (magic-pdf 1.3.12) 离线解析；SDK 文档保留原 pdf_loader 管线，零改动。**
+
+**产出验证**: `data/jaka_markdown/JAKA_Manual/auto/JAKA_Manual.md`（2659 行 / 193KB）——封面、注意条款、目录、Modbus 寄存器大表全部解析到位。
+
+---
+
+#### MinerU 集成踩坑记录（五个连环雷，已全部排除）
+
+1. **layout-config 缺省回退陷阱**: `~/magic-pdf.json` 缺 `layout-config` 键 → magic-pdf 1.3.12 回退 layoutlmv3 → detectron2/fvcore 抛 `TypeError: argument of type 'NoneType' is not iterable`（`load_yaml_with_base` 中 yaml 载入返回 None）。修复：显式 `{"model": "doclayout_yolo"}`（权重 `Layout/YOLO/doclayout_yolo_docstructbench_imgsz1280_2501.pt`），彻底绕开 detectron2。
+2. **table-config 非法模型名**: `"table-master"` 带连字符非法（合法值 `tablemaster` / `rapid_table` / `struct_eqtable`）→ 命中 `exit(1)`。当前采用 `rapid_table`。
+3. **unimernet × transformers 4.49 `cache_position` 毒药参数**: 高版本 transformers 向 `UnimerMBartForCausalLM.forward` 注入 `cache_position`/`num_logits_to_keep` 致崩溃。修复：`auto_patch_mbart.py` / `patch_unimernet.py` 对 site-packages 内 `unimernet/models/mbart/modeling_mbart.py` 做**文件级补丁**。教训：进程内 monkeypatch 对 subprocess 调用的 magic-pdf **无效**——补丁必须落在被调用进程内（文件级或入口注入）。
+4. **模型快照漂移**: modelscope `PDF-Extract-Kit-1.0` master 已换代至 PP-OCRv5/v6 权重，magic-pdf 1.3.12 仍找 `ch_PP-OCRv3_det_infer.pth` → OCR 静默失败、零产物。修复：按需补缺对应权重文件。
+5. **GPU 争抢**: vLLM 常驻时 `device-mode: cuda` 默认落繁忙 GPU。`parse_jaka_mineru.py` 内置 nvidia-smi 空闲显存扫描，`CUDA_VISIBLE_DEVICES` 仅作用于子进程（不污染全局，符合项目 GPU 自适应红线）。
+
+#### 新增文件
+
+| 文件 | 用途 |
+|------|------|
+| `src/parse_jaka_mineru.py` | MinerU 离线解析入口 — modelscope 权重检查 + `~/magic-pdf.json` 生成 (doclayout_yolo + rapid_table) + GPU 自适应 + magic-pdf CLI 调用 |
+| `auto_patch_mbart.py` / `patch_unimernet.py` | unimernet `cache_position` 文件级补丁（site-packages 地毯式搜索注入） |
+
+### 架构影响
+
+| 维度 | v30.final (旧) | v31 (新) | 变化 |
+|------|---------------|----------|------|
+| JAKA 文档摄入 | 自研 L1 管线 (PyMuPDF + 全景快照 OCR) | MinerU (magic-pdf 1.3.12) 离线解析 → Markdown | 版式解析质量大幅提升 |
+| SDK 文档摄入 | `_v4_parse_sdk_state_machine` 状态机管线 | **保持原样** | 零改动 |
+| gui_app L1 逻辑 | — | 保留（其他 GUI 文档仍依赖） | 不删除 |
+| 入库链路 | PDF → pdf_loader → ChromaDB | JAKA: PDF → MinerU Markdown → (待接) ChromaDB | Markdown 入库为后续步骤 |
+
+**新增风险**:
+- 🟡 MinerU 依赖栈与 RAG 推理栈存在版本互斥（magic-pdf 1.3.12 要求 transformers≥4.49，vLLM 0.5.4 要求 <4.46）——当前靠补丁共存，后续升级任一栈前必须重新评估对方影响
+- 🟡 MinerU 大表输出为 HTML `<table>` 标签与 Markdown 混合——入库前需要表格清洗/转 Markdown 管道（后续步骤）
+
+---
+
 > **日期**: 2026-08-07 | **版本**: v29 → v30 → v30.final | **类型**: L1 切片架构升级 — AST-Lite 软装箱 + 全景快照 OCR + 跨页表头继承 + 孤儿行合并
 
 ### v30 / v30.final 变更 (AST-Lite Soft Bin Packing: Full-Page OCR + Table Repair + Protected-Block-Aware Truncation)
