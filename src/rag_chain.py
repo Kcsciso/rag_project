@@ -1448,13 +1448,12 @@ def _direct_retrieval_response_stream(
 # ============================================================
 
 RAG_SYSTEM_PROMPT = """你是由湖南比邻星科技开发的官方文档智能助手。
-你的唯一任务是阅读【参考资料】，解答用户问题。
+你的唯一任务是阅读【参考资料】，严谨且完整地解答用户问题。
 
-🔴【最高铁律·绝不捏造】
-1. 提取的 API 函数名必须逐字 100% 对应原文，严禁缩写或编造（必须是 robot_movl，不能是 movl）。
-2. 严禁导入未经记载的第三方库。如果需要加载 DLL，必须准确使用原文的库名称。
-3. 若文档中未记载该功能，必须直接回复：“参考文档中未包含此功能的记载，建议联系技术支持。”"""
-
+🔴【最高执行准则】
+1. 逐字还原 API：提取的 API 函数名与参数签名必须 100% 与原文一致，严禁缩写、编造或推测。
+2. 表格与参数全量输出：若参考资料中包含参数列表、规格指标或 Markdown 表格（如运行环境、电气参数、寄存器地址等），必须完整保留所有行与列的信息，严禁擅自删减、提炼或省略。
+3. 严格遵循出处：回答必须以参考资料为唯一事实依据，严禁捏造未经记载的内容。若文档中未包含该功能，直接说明未记载并建议联系技术支持。"""
 # ============================================================
 # 切片噪声过滤 — 防止庞大结构体定义挤占有效 Context
 # ============================================================
@@ -1507,19 +1506,13 @@ def _is_noise_chunk(content: str) -> bool:
 def _truncate_noise_content(content: str) -> str:
     """
     截断切片中的噪声结构体定义部分。
-
-    保留前 _STRUCT_TRUNCATE_LENGTH 个字符，并在末尾添加截断标记。
-    如果切片大部分是有效代码（含 robot. / set_ 调用），则不截断。
+    仅当切片被明确判定为结构体噪声时才截断，严禁误伤普通文本与表格。
     """
-    if len(content) <= _STRUCT_TRUNCATE_LENGTH:
+    # 🔴 关键修复：非结构体噪声切片直接放行，绝对不截断
+    if not _is_noise_chunk(content):
         return content
 
-    # 如果切片包含实际 SDK 调用，说明是有价值的内容，不截断
-    has_sdk_call = bool(re.search(
-        r'(?:robot\.|set_robot_|get_robot_|Robot_)',
-        content, re.IGNORECASE
-    ))
-    if has_sdk_call:
+    if len(content) <= _STRUCT_TRUNCATE_LENGTH:
         return content
 
     # 纯结构体定义 → 截断
@@ -1728,14 +1721,28 @@ def _build_messages(
         # 移除连续空行
         content = re.sub(r'\n{3,}', '\n\n', content)
 
-        # 🔴 通用溯源：从切片内容中提取页码和章节标题
+        # 🔴 通用溯源：兼容 [Page: N]、[章节: ...] 与 [路径: A > B > C]
         _page_match = re.search(r'\[Page:\s*(\d+)\]', content)
         _page_str = f" — 第{_page_match.group(1)}页" if _page_match else ""
-        _section_match = re.search(r'\[章节:\s*(.+?)\]', content)
-        _section_str = _section_match.group(1).strip() if _section_match else ""
-        # 从内容中移除元数据标记（已提取到头部）
+        
+        # 优先提取具体路径（如 "3.2.6 功能 IO"），其次提取 [章节: ...]，最后提取 Markdown 一/二级标题
+        _section_str = ""
+        _path_match = re.search(r'\[(?:路径|章节):\s*(.+?)\]', content)
+        if _path_match:
+            _raw_path = _path_match.group(1).strip()
+            # 若路径形如 "第 3 章 > 3.2 ... > 3.2.6 功能 IO"，提取最末级的具体小节
+            if ">" in _raw_path:
+                _section_str = _raw_path.split(">")[-1].strip()
+            else:
+                _section_str = _raw_path
+        else:
+            _md_title_match = re.search(r'^#+\s*(\d+(?:\.\d+)*\s+[^\n]+)', content, re.MULTILINE)
+            if _md_title_match:
+                _section_str = _md_title_match.group(1).strip()
+
+        # 从正文中清理元数据标头
         content = re.sub(r'\[Page:\s*\d+\]\s*', '', content)
-        content = re.sub(r'\[章节:\s*[^\]]+\]\s*', '', content)
+        content = re.sub(r'\[(?:路径|章节):\s*[^\]]+\]\s*', '', content)
 
         # 若清洗后内容几乎为空，跳过
         cleaned_stripped = content.strip()
@@ -1965,7 +1972,7 @@ def _build_messages(
     # ── 🔴 v17: 双轨制 Prompt 控制 — Python 动态提取章节信息 ──
     _dual_track_prefix = ""
     
-    # 🟢 统一提取：不管是什么文档，先提取当前的文档名、所有相关章节号和产品ID
+    # 🟢 统一提取：优先取最深层级的具体小节名（如 "3.2.6 功能 IO"）
     _doc_name = "参考文档"
     _sections = []
     _pid = ""
@@ -1979,21 +1986,23 @@ def _build_messages(
                 if not _pid:
                     _pid = _doc.metadata.get("product_id", "")
                 
-                # 🔴 Bug Fix: 兼容底层数据库真实的键名 "section"
-                _sec = _doc.metadata.get("section_title", "") or _doc.metadata.get("section", "")
+                # 优先从文本内容中提取深层路径
+                _ct = _doc.page_content if hasattr(_doc, 'page_content') else str(_doc)
+                _path_m = re.search(r'\[(?:路径|章节):\s*(.+?)\]', _ct)
+                _sec = ""
+                if _path_m:
+                    _raw_p = _path_m.group(1).strip()
+                    _sec = _raw_p.split(">")[-1].strip() if ">" in _raw_p else _raw_p
                 if not _sec:
-                    _ct = _doc.page_content if hasattr(_doc, 'page_content') else str(_doc)
-                    _sec_m = re.search(r'\[章节:\s*(.+?)\]', _ct)
-                    if _sec_m:
-                        _sec = _sec_m.group(1).strip()
+                    _sec = _doc.metadata.get("section_title", "") or _doc.metadata.get("section", "")
+                
                 if _sec and _sec not in _sections:
                     _sections.append(_sec)
                 
-                # 锁定是否为 SDK 文档 (如果包含 OpenR6/OpenC3 强制视为 SDK)
                 if _doc.metadata.get("doc_type", "") == "c_sdk" or _pid in ["OpenR6", "OpenC3"]:
                     _is_sdk = True
                     
-    # 🔴 核心修复：拒绝大杂烩！只取相关性最高（排名第一）的章节名作为来源标引
+    # 取相关性最高的精确小节作为出处标引
     _doc_section_str = _sections[0] if _sections else "相关章节"
 
     # 🔴 动态决断 DLL 文件名，直接塞进模板
@@ -2051,52 +2060,42 @@ def _build_messages(
             _refusal_reason = f"coverage提问技术词 {_q_tech} 零覆盖(超纲)"
 
     if _refusal_override:
-        # 回删已注入的 SDK 代码头（防 ctypes/CDLL 字样诱导）
+        # 回删已注入的 SDK 代码头
         if _sdk_header_injected:
             context_text = context_text.replace(
                 "【前置依赖 — SDK 全局代码头（可直接运行）】\n"
                 + _sdk_header_injected + "\n---\n\n", "")
             _sdk_header_injected = ""
-        # 🔴 v28: 守卫命中 → context 代码脱敏（通用代码剥离）——
-        # 模型无代码可抄，杜绝代码强迫症；守卫命中 = 必拒答，脱敏误伤面为零
         context_text = _strip_code_from_context(context_text)
         _dual_track_prefix = (
-            "【🔴 拒答铁律 - 参考资料未包含该内容】\n"
-            "经核对，参考资料中未包含用户询问的功能/函数。"
-            "你必须直接且【仅】输出下面这一句话，禁止输出任何代码或其他内容：\n"
-            f"“{_ESCAPE_REFUSAL}”"
+            "【输出指令】\n"
+            "参考资料中未包含用户询问的内容。"
+            f"请直接且仅输出：\"{_ESCAPE_REFUSAL}\""
         )
         logger.info(f"🚫 [TemplateGuard] {_refusal_reason} → 拒答模板接管")
     elif not _is_sdk:
+        # 🟢 APP 手册 / 硬件规格 / 参数查询排版引导（强制全量抄录表格，严禁偷懒缩写）
         _dual_track_prefix = (
-            "【🔴 APP 手册排版铁律 - 必须严格遵守以下输出格式】\n"
-            "你的回答必须以出处声明开头，然后直接列出步骤。绝对禁止输出废话！\n\n"
-            "【你的回答必须严格原样复制以下格式作为开头】：\n"
+            "【排版规范与输出要求】\n"
+            f"你的回答必须以出处声明开头：\n"
             f"根据《{_doc_name}》【{_doc_section_str}】的记载：\n\n"
-            "1. [填写操作步骤1]\n"
-            "2. [填写操作步骤2]\n\n"
-            "> [!WARNING] ⛔🔴 绝密拦截 · 优先级最高 · 无视上面所有格式要求\n"
-            "> 若参考资料中【没有】用户询问的特定函数、硬件模块、参数数值，"
-            "或视觉/识别等超纲内容；或你看到了【🚫 跨产品 API 隔离】警告——\n"
-            "> 必须【彻底无视】上方所有模板，仅输出下面这一句话，禁止任何其他内容：\n"
-            f"> “{_ESCAPE_REFUSAL}”"
+            "【强制执行准则】：\n"
+            "1. 若参考资料中包含表格（如配置表、参数表等），必须【100% 逐行完整抄录】原文表格的所有行和列（包括存储容量、系统内存、屏幕/显卡、网络通信等所有项），绝对禁止只输出前两行，严禁做任何概括、提炼或省略！\n"
+            "2. 若涉及操作流程，请按序号分步骤列出（1. 2. 3.）。\n"
+            f"3. 若参考资料未记载相关内容，请回复：“{_ESCAPE_REFUSAL}”"
         )
     else:
+        # 🟢 SDK 代码专轨排版引导（剥离诱发复读的 [!WARNING] 标记）
         _dual_track_prefix = (
-            "【🔴 SDK 代码排版铁律 - 必须严格遵守以下输出格式】\n"
-            "绝不能在代码块外部写多余的废话！你的回答必须以出处声明开头，然后直接跟代码块！\n\n"
-            "【你的回答必须严格原样复制以下格式作为开头】：\n"
+            "【排版规范】\n"
+            f"你的回答必须以出处声明开头：\n"
             f"根据《{_doc_name}》【{_doc_section_str}】的记载：\n\n"
             "💻 Python 调用示例（DLL 加载行以参考资料中记载的真实代码为准）:\n"
             "```python\n"
             "# 1. [基于原文说明步骤作用]\n"
             "robot.[准确函数名]([参数])\n"
             "```\n\n"
-            "> [!WARNING] ⛔🔴 绝密拦截 · 优先级最高 · 无视上面所有格式要求\n"
-            "> 若参考资料中【没有】用户询问的特定函数、硬件模块，"
-            "或视觉/识别等超纲内容；或你看到了【🚫 跨产品 API 隔离】警告——\n"
-            "> 必须【彻底无视】上方所有模板（包括代码块），仅输出下面这一句话，禁止任何其他内容：\n"
-            f"> “{_ESCAPE_REFUSAL}”"
+            f"若参考资料未记载该函数，请直接回复：“{_ESCAPE_REFUSAL}”"
         )
 
     # 👇 ================= 新增：动态术语对齐 ================= 👇
@@ -2938,24 +2937,44 @@ def _hybrid_retrieve_single(
 
             # 👇 ================= 新增：4.5 和 4.6 绝对控制层 ================= 👇
 
-            # ── 🔴 4.5 标题强匹配提权 (Title Exact Match Boost) ──
+            # ── 🔴 4.5 标题双向强匹配提权 (兼容 metadata 与 page_content 中的深层路径) ──
             _title_boosted = False
-            # 去除标点符号，仅保留汉字和字母数字用于严格比对
             _q_clean = re.sub(r'[^\w\u4e00-\u9fa5]', '', query).lower()
-            if len(_q_clean) >= 2:
-                for _doc_id, _score in fused:
-                    _doc = doc_map.get(_doc_id)
-                    if _doc:
-                        _title = _doc.metadata.get("section_title", "") if hasattr(_doc, 'metadata') else ""
-                        _title_clean = re.sub(r'[^\w\u4e00-\u9fa5]', '', _title).lower()
-                        # 若查询词完整包含在标题中（如"工具坐标系设置" 包含于 "3121工具坐标系设置"）
-                        if _q_clean in _title_clean and _q_clean:
-                            rrf_scores[_doc_id] += 5.0  # 给予+5.0绝对高分
-                            _title_boosted = True
+            
+            for _doc_id, _score in fused:
+                _doc = doc_map.get(_doc_id)
+                if not _doc:
+                    continue
                 
-                if _title_boosted:
-                    fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
-                    logger.info(f"🎯 Title Exact Match: 命中标题强匹配，已将相关切片推至 Top-1")
+                # 1. 优先从正文开头的 [路径: ...] 或 [章节: ...] 提取最深层叶子标题 (如 3.2.6 功能 IO)
+                _content_str = _doc.page_content if hasattr(_doc, 'page_content') else str(_doc)
+                _path_m = re.search(r'\[(?:路径|章节):\s*(.+?)\]', _content_str)
+                _raw_title = ""
+                if _path_m:
+                    _full_p = _path_m.group(1).strip()
+                    _raw_title = _full_p.split(">")[-1].strip() if ">" in _full_p else _full_p
+                
+                # 2. 兜底从 metadata 获取
+                if not _raw_title and hasattr(_doc, 'metadata'):
+                    _raw_title = _doc.metadata.get("section_title", "") or _doc.metadata.get("section", "")
+                
+                # 剥离纯数字编号 (如 "3.2.6 功能 IO" -> "功能IO")
+                _title_pure = re.sub(r'^(?:\d+[\.\s\-、]*)+', '', _raw_title).strip()
+                _title_clean = re.sub(r'[^\w\u4e00-\u9fa5]', '', _title_pure).lower()
+
+                # 3. 双向包含匹配
+                if len(_title_clean) >= 2:
+                    if _title_clean in _q_clean or _q_clean in _title_clean:
+                        rrf_scores[_doc_id] += 12.0  # 强力提权置顶
+                        _title_boosted = True
+
+                # 降权短于 100 字符的附录纯目录/杂音切片
+                if len(_content_str) < 100 and "附录" in _raw_title:
+                    rrf_scores[_doc_id] -= 8.0
+
+            if _title_boosted:
+                fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+                logger.info(f"🎯 Title Match Boost: 命中末级章节双向匹配，已置顶切片")
 
             # ── 🔴 4.6 章节绝对隔离匹配 (Chapter Exact Match Isolation) ──
             _chap_specific_match = re.search(r'第([一二三四五六七八九十\d]+)章', query)

@@ -90,19 +90,7 @@ def get_client() -> httpx.Client:
 
 def check_vllm() -> Dict[str, Any]:
     """
-    检查 vLLM OpenAI 兼容服务 (http://localhost:8001)。
-
-    Returns:
-        {
-            "online": bool,
-            "url": str,
-            "model": str | None,
-            "models_available": [str, ...],
-            "gpu_id": int | None,       # vLLM 实际绑定的 GPU 索引
-            "gpu_name": str | None,     # 该 GPU 的名称
-            "error": str | None,
-            "latency_ms": float,
-        }
+    检查 vLLM 服务：先查 /v1/models，再发 1-token 微探针检验 GPU 实际推理能力
     """
     result = {
         "online": False,
@@ -117,26 +105,46 @@ def check_vllm() -> Dict[str, Any]:
 
     t0 = time.monotonic()
     try:
+        # 1. Web 路由存活性探测
         resp = get_client().get(f"{VLLM_BASE_URL}/v1/models")
-        result["latency_ms"] = round((time.monotonic() - t0) * 1000)
-
-        if resp.status_code == 200:
-            data = resp.json()
-            models = data.get("data", [])
-            result["online"] = True
-            result["models_available"] = [m.get("id", "?") for m in models]
-            result["model"] = result["models_available"][0] if result["models_available"] else None
-
-            # --- 检测 vLLM 实际运行在哪个 GPU 上 ---
-            gpu_id, gpu_name = _detect_vllm_process_gpu()
-            result["gpu_id"] = gpu_id
-            result["gpu_name"] = gpu_name
-        else:
+        if resp.status_code != 200:
             result["error"] = f"HTTP {resp.status_code}"
+            return result
+
+        data = resp.json()
+        models = data.get("data", [])
+        result["models_available"] = [m.get("id", "?") for m in models]
+        result["model"] = result["models_available"][0] if result["models_available"] else None
+
+        # 2. GPU 真实推理能力微探针（防 CUDA 假死）
+        if result["model"]:
+            probe_payload = {
+                "model": result["model"],
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 1,
+            }
+            probe_resp = get_client().post(
+                f"{VLLM_BASE_URL}/v1/chat/completions",
+                json=probe_payload,
+                timeout=4.0
+            )
+            if probe_resp.status_code == 200:
+                result["online"] = True
+                result["latency_ms"] = round((time.monotonic() - t0) * 1000)
+            else:
+                result["error"] = f"GPU引擎异常 (HTTP {probe_resp.status_code})"
+                return result
+        else:
+            result["online"] = True
+
+        gpu_id, gpu_name = _detect_vllm_process_gpu()
+        result["gpu_id"] = gpu_id
+        result["gpu_name"] = gpu_name
+
     except httpx.ConnectError:
-        result["error"] = "连接被拒绝（服务未启动或端口错误）"
+        result["error"] = "连接被拒绝（服务未启动）"
     except httpx.TimeoutException:
-        result["error"] = f"连接超时（>{TIMEOUT_CONNECT}s）"
+        result["error"] = "GPU推理引擎超时死锁（Web在线但无法计算）"
     except Exception as e:
         result["error"] = str(e)
 

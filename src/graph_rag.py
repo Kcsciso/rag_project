@@ -1025,62 +1025,30 @@ def _strip_hedging_tail(text: str) -> str:
 
 def extract_align_node(state: RAGState) -> dict:
     """
-    通用属性对齐校验节点 — 后处理阶段的最后防线。
-
-    【设计原则】
-    - 零特定数字补丁：不硬编码 6502、9600 等具体数值
-    - 通用属性词库 + 正则扫描：自动识别 Context 中的 KV 映射
-    - 硬改写对齐：若模型将属性词颠倒/篡改，用 Context 原文强制覆盖
-
-    【算法】
-    1. 从 state["extracted_entities"] 读取 Context 中的真实 KV 映射
-    2. 对 state["raw_llm_answer"] 中的每个数值，扫描其紧邻的属性词
-    3. 若属性词与 Context 中的属性词不匹配 → 用 Context 原词硬改写
-    4. 输出修正后的 final_answer
-
-    【示例】
-    Context:  "端口号 6502"
-    LLM 输出: "Modbus 从站地址为 6502"  ← "从站地址" ≠ "端口号"
-    → 硬改写为: "Modbus 端口号为 6502"
-
-    Args:
-        state: 当前图状态（含 extracted_entities, raw_llm_answer）
-
-    Returns:
-        {"final_answer": 修正后的回答, "route_status": "complete"}
+    通用属性对齐校验节点 — 后处理阶段防线 (修复表格防误伤版)
     """
     raw_answer = state.get("raw_llm_answer") or state.get("final_answer", "")
     kv_entities = state.get("extracted_entities", {})
-    # 🔴 v25: SDK 代码兜底（代码块闭合）——Graph 路径此前从未应用过，
-    # 非流式 ⑧ 代码截断的直接原因
+    
+    # 闭合未闭合的代码块
     raw_answer = _fix_and_close_sdk_code(raw_answer)
 
-    logger.info(f"🟢 [Node 6] ExtractAlign: {len(kv_entities)} KV entities, "
-                 f"answer_len={len(raw_answer)}")
+    logger.info(f"🟢 [Node 6] ExtractAlign: {len(kv_entities)} KV entities, answer_len={len(raw_answer)}")
 
-    # 回答为空 → 直接透传（去重/闭合需要非空文本）
     if not raw_answer:
-        logger.info("  ↳ 回答为空，透传原始回答")
-        return {
-            "final_answer": raw_answer,
-            "route_status": "complete",
-        }
+        return {"final_answer": raw_answer, "route_status": "complete"}
 
     corrected = raw_answer
 
-    # ── 对每个 Context 中的 KV 实体，检查模型输出是否正确 ──
+    # ── 1. 属性词与数值对齐校验 ──
     fixes_applied = 0
     for context_attr, context_value in kv_entities.items():
-        # 仅处理 ≥2 位数值（过滤单数字噪声）
         value_digits = re.sub(r'[^\d]', '', context_value)
         if len(value_digits) < 2:
             continue
 
-        # 在模型输出中查找该数值
         value_pattern = re.compile(
-            r'(?P<prefix>.{0,12})'           # 数值前最多 12 字符（属性词窗口）
-            + re.escape(context_value) +      # 数值本身
-            r'(?P<suffix>.{0,8})',            # 数值后最多 8 字符
+            r'(?P<prefix>.{0,12})' + re.escape(context_value) + r'(?P<suffix>.{0,8})',
         )
 
         for vm in value_pattern.finditer(corrected):
@@ -1088,88 +1056,63 @@ def extract_align_node(state: RAGState) -> dict:
             suffix = vm.group("suffix")
             nearby_text = prefix + context_value + suffix
 
-            # 检查是否存在与 Context 属性词冲突的"错误属性词"
             for candidate_attr, candidate_val in kv_entities.items():
                 if candidate_val == context_value:
-                    continue  # 跳过自己
-                # 若错误属性词出现在数值附近，且正确属性词不在附近 → 需要修正
+                    continue
                 attr_lower = candidate_attr.lower().strip()
                 ctx_attr_lower = context_attr.lower().strip()
-                if (attr_lower in nearby_text.lower()
-                        and ctx_attr_lower not in nearby_text.lower()):
-                    # ── 硬改写：用 Context 中的正确属性词替换错误属性词 ──
+                if (attr_lower in nearby_text.lower() and ctx_attr_lower not in nearby_text.lower()):
                     escaped_bad = re.escape(candidate_attr)
-                    new_nearby = re.sub(
-                        escaped_bad, context_attr,
-                        nearby_text, count=1, flags=re.IGNORECASE,
-                    )
+                    new_nearby = re.sub(escaped_bad, context_attr, nearby_text, count=1, flags=re.IGNORECASE)
                     if new_nearby != nearby_text:
                         corrected = corrected.replace(nearby_text, new_nearby, 1)
                         fixes_applied += 1
-                        logger.info(
-                            f"  🔧 属性对齐: '{candidate_attr}' → '{context_attr}' "
-                            f"(数值 {context_value})"
-                        )
 
     if fixes_applied > 0:
         logger.info(f"  ↳ 共修正 {fixes_applied} 处属性词颠倒/篡改")
 
-    # ── 🔴 v25: 精确段落去重（无条件执行）—— 复读机整段复读兜底 ──
-    # 🔴 v27: 比较前规范化（忽略空白与尾标点差异）—— 换行/标点差异的重复段也能捕获
-    # 仅移除"连续两段基本相同"的段落（≥80 字符，与 eval ② 定义一致），对代码/步骤零误伤
+    # ── 2. 精确段落级连续复读去重 ──
     def _norm_para(_p: str) -> str:
         return re.sub(r'\s+', '', _p).rstrip('。！？；;，,：:.、…')
+
     _paras = corrected.split("\n\n")
     _paras_deduped = []
     for _p in _paras:
         _p = _p.strip()
-        if (_paras_deduped and _p and len(_p) >= 80
-                and _norm_para(_p) == _norm_para(_paras_deduped[-1])):
+        if (_paras_deduped and _p and len(_p) >= 80 and _norm_para(_p) == _norm_para(_paras_deduped[-1])):
             logger.info(f"  ✂️  段落去重: 移除连续重复段落 ({len(_p)} 字符)")
             continue
         _paras_deduped.append(_p)
     corrected = "\n\n".join(_paras_deduped)
 
-    # ── 🔴 v3.0 SemanticDedup: 后处理语义去重，消除1.5B小模型段落级重复生成 ──
-    # 取消 JAKA 的豁免权，全量开启去重防御复读机
-    # 🔴 v25: 含代码块的回答跳过模糊去重（避免 trigram 误伤代码行），仅做精确段落去重
-    if "```" not in corrected:
-        import re as _re_dedup
-        _sentences = _re_dedup.split(r'(?<=[。！？\n])\s*', corrected)
-        _sentences = [s.strip() for s in _sentences if len(s.strip()) >= 8]
-
+    # ── 3. 语义去重 (针对表格、列表、代码块做绝对豁免，防止腰斩参数) ──
+    # 🔴 关键修复：只要包含 Markdown 表格符号 '|'、代码块 '```' 或逐项列表，严禁执行全局截断
+    _has_table_or_code = "|" in corrected or "```" in corrected or "\n- " in corrected or "\n* " in corrected
+    if not _has_table_or_code:
+        _sentences = [s.strip() for s in re.split(r'(?<=[。！？\n])\s*', corrected) if len(s.strip()) >= 8]
         if len(_sentences) >= 4:
-            _deduped = [_sentences[0]]  # 保留首句
-            _cut_at = len(_sentences)
+            _deduped = [_sentences[0]]
             for _i in range(1, len(_sentences)):
-                # 滑动窗口: 检查当前句是否与前面任一已保留句高度重复
-                _is_dup = False
                 _cur = _sentences[_i]
-                for _j in range(max(0, _i - 3), _i):
+                _is_dup = False
+                for _j in range(max(0, _i - 2), _i):
                     _prev = _sentences[_j]
-                    # Jaccard-like trigram overlap
-                    _cur_grams = set(_cur[i:i+3] for i in range(len(_cur) - 2))
-                    _prev_grams = set(_prev[i:i+3] for i in range(len(_prev) - 2))
+                    _cur_grams = set(_cur[k:k+3] for k in range(len(_cur) - 2))
+                    _prev_grams = set(_prev[k:k+3] for k in range(len(_prev) - 2))
                     if _cur_grams and _prev_grams:
                         _overlap = len(_cur_grams & _prev_grams) / min(len(_cur_grams), len(_prev_grams))
-                        if _overlap > 0.55:
+                        if _overlap > 0.85:  # 提高阈值至 0.85（仅拦截极度相似句子）
                             _is_dup = True
                             break
-                if _is_dup:
-                    _cut_at = _i
-                    break
-                _deduped.append(_sentences[_i])
+                if not _is_dup:
+                    _deduped.append(_cur)
+                else:
+                    logger.info(f"  ✂️  去重跳过重复句: '{_cur[:30]}...'")
+            corrected = "\n".join(_deduped)
 
-            if _cut_at < len(_sentences):
-                _trimmed_count = len(_sentences) - _cut_at
-                logger.info(
-                    f"  ✂️  SemanticDedup: 截断 {_trimmed_count} 个重复句 "
-                    f"(trigram_overlap > 0.55 @ pos {_cut_at})"
-                )
-                corrected = "\n".join(_deduped)
-
-    # 🔴 v16: 剥离末尾自相矛盾的免责套话
+    # ── 4. 剥离末尾自相矛盾的免责套话 ──
     corrected = _strip_hedging_tail(corrected)
+
     return {
         "final_answer": corrected,
         "route_status": "complete",

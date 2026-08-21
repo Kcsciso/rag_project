@@ -11,9 +11,33 @@
 
 **任何代码修改前，必须先声明该修改属于哪一层，并自检是否会破坏该层的核心特性。**
 
-### L1 — 数据摄入与切片层 (pdf_loader.py)
-| 核心特性 | 严禁破坏 |
+### L1 — 数据摄入与切片层 (src/pdf_loader.py — 🔴 Stage 1 (v32 收口) 双轨统一模块)
+
+> **Stage 1 重构**: pdf_loader.py 由 ~2,900 行收敛为 ~660 行统一模块——SDK 专轨 PyMuPDF 状态机 + JAKA 专轨 MinerU/Qwen2-VL 多模态提纯 + KV 属性库 + 统一入口 `load_all_documents_v4_dual()`。以下红线表为准；原 v23–v30.final 自研 L1 管线整体归档（见下方归档表，恢复 GUI 自研轨需参照归档行）。
+
+| 🔴 Stage 1 现行红线 | 严禁破坏 |
 |----------|---------|
+| SDK 专轨引擎 | 必须 `fitz` `get_text("text", sort=True)` 物理坐标流排序（`_extract_text_with_fitz`）——**禁止**回退 pypdf（表格/代码块断层、跨节漂移） |
+| SDK 章节严格正则 | `_SDK_CHAPTER_BOUNDARY_RE = r'(?:^|\n)(?=[ \t]*\d{1,2}\s*\.\s*[一-龥a-zA-Z])'`；禁止恢复 `^#{1,4}\s+`（Python 注释无法区分） |
+| SDK 原子闭环 | 单切片完整容纳「章节标题+函数签名+参数说明+返回值+示例代码」；`api_atomic`/`function_names` 元数据必填 |
+| Ctypes 类型名黑名单 | `_CTYPES_BLACKLIST` frozenset（c_float/c_int/c_char_p…+restype/argtypes/byref 等）——函数名提取零 CTypes 污染（实测 29/31 函数 0 污染） |
+| SDK Header 注入 | `_extract_sdk_header()` 提取 CDLL 加载行 + POSE/Joint 结构体，注入 API 切片 |
+| JAKA 专轨 | MinerU 离线解析（`src/parse_jaka_mineru.py`）→ `load_jaka_mineru_dual()`；禁止将 JAKA 手册回切自研管线 |
+| VLM 提纯注入 | :8005 Qwen2-VL-7B 提取图表参数；Prompt 严禁"未提供"类模板废话占位符；纯示意图统一标注 `仅为UI示意图` |
+| 三重图片防线 | 1. 几何过滤（边长<80px 或长宽比>8）；2. 上下文图注强校验（±100 字）；3. VLM 纯参数提纯注入 |
+| HTML 表格规整 | `clean_html_tables()` → 标准 GitHub Markdown 表格 + html/body/div 外层标签剥离 + 缺损单元格补齐（实测 34 表格→0 残留/444 行） |
+| Markdown 面包屑栈 | 仅编号章节（`# 1.1`、`# 第一章`）维护 4 槽路径；`# 注意：` 类强调行禁止重置路径 |
+| JAKA 软装箱 | 段落边界封箱（child_chunk_size=1500），表格保护块整体装入允许超标；TOC 点线特征行过滤 |
+| 多模态缓存优先 | 优先读 `data/jaka_manual_chunks.json`（含 ≥50 个 VLM 实体切片才采信），无缓存才全量重解析 |
+| KV 属性库 | `export_kv_attributes()` 摄入后自动生成 `kv_db/attribute_kv.json`；`_MANUAL_CALIBRATION`（6502/9600 等）强制覆盖 |
+| 统一入口 | `load_all_documents_v4_dual()` = JAKA 轨 + SDK 轨 + KV 导出；`src/rebuild_v4.py`/`app.py` 必须走此入口 |
+| 切片容量分配 | SDK: `SDK_CHILD_CHUNK_SIZE=400`/`SDK_PARENT_CHUNK_SIZE=1000`；GUI/JAKA: `GUI_CHILD_CHUNK_SIZE=1500`/`GUI_PARENT_CHUNK_SIZE=2000`；`CHILD_CHUNK_SIZE`/`PARENT_CHUNK_SIZE` 向下兼容别名 |
+| SDK 切片规格 | 章节原子切片实测 270~890 字符（均值 OpenC3 414 / OpenR6 540）；JAKA Child 均值 ~480、p90 ~1090、保护块超标至 ~2600 |
+
+### 🕰️ 历史归档 (v23–v30.final 自研 L1 管线 — Stage 1 已移除，恢复需参照)
+
+| 归档特性 | 原约束 |
+|----------|--------|
 | `_v4_extract_headings()` 代码注释拦截 | 8 特征词 ±120 字符上下文校验 |
 | 🔴 `_v4_extract_headings()` doc_type 动态双轨拦截 (v23) | gui_app 轨绝对禁止单数字编号(1. 2.)提权为标题，防操作步骤碎裂 |
 | 🔴 `_V4_HEADING_PATTERNS` 多级数字编号 (v23) | `{1,5}` 支持最高 6 级深度标题 (3.1.5.2.1)，末尾带点兼容 |
@@ -46,7 +70,6 @@
 | 🔴 微缩大纲上限 (v23) | Child TOC 上限 **5 条** (v22: 15)，超出显示 "... (更多章节略)" |
 | 🔴 大纲标签统一 (v23) | 全部使用 `[章节大纲参考]:`，禁止旧 `【子章节】` / `[本章/本节包含以下子内容大纲]` |
 | 🔴 数据摄入双轨制 (v31) | JAKA 手册 → MinerU 离线解析（`src/parse_jaka_mineru.py`）；SDK 文档 → 原 L1 状态机管线。两轨互不侵入；SDK 轨零触碰；gui_app 轨 L1 逻辑保留不删除 |
-| 🔴 **数据摄入双轨制 (v31)** | JAKA 手册 → MinerU 离线解析；SDK 文档 → 原 L1 状态机管线。两轨互不侵入[cite: 2] |
 | 🔴 **多模态 VLM 提纯注入 (v32)** | MinerU Markdown 切片时调用本地 :8005 Qwen2-VL-7B 提取图表参数；Prompt 严禁模板废话占位符（"未提供"等），纯示意图统一标注 `仅为UI示意图` |
 | 🔴 **多模态三重图片防线 (v32)** | 1. 物理几何过滤（边长<80px或长宽比>8）；2. 上下文图注强校验（前后100字命中图/表/参数/设置等）；3. VLM 纯参数提纯注入 |
 | 🔴 **HTML 表格规整转 Markdown (v32)** | 彻底清洗独立 `<table>` 及嵌套 HTML 表格为标准 GitHub Markdown 表格，并自动补齐缺损单元格 |
@@ -165,7 +188,8 @@ Conda `rag_agent` (Python 3.10)。**严禁 `pip install --upgrade`**：
 | 🔴 **v30** | **v30** | **AST-Lite 软装箱: 跨页表格表头向下继承 (暂存 `_table_header` → 下页注入) / OCR 标签化防稀释 (`<OCR_BLOCK>` 包裹 + `_PROTECTED_BLOCK_RE` 第二分支 + `_v4_find_protected_ranges` `type="ocr"`) / Parent 软装箱算法 (受保护块不可分割 → 整体装入允许超标, 普通文本 `\n\n` 安全切断) / OCR 子块隔离 (`_emit_ocr_child` + `chunk_type="ocr_child"` 独立切片) / 过早封箱 Bug 修复 (`_packed_len >= parent_chunk_size` 条件封箱)** | `_table_header`, `<OCR_BLOCK>`, `_PROTECTED_BLOCK_RE` 第二分支, `_emit_ocr_child()`, `chunk_type="ocr_child"` |
 | 🔴 **v30.final** | **v30.final** | **全景快照 OCR + 孤儿行合并: 孤儿行合并 (短文本 <10ch 追加到上一行表格末单元格, 修复 `Windows7及以上\n上` 碎裂) / 全景快照 OCR (`get_pixmap(Matrix(2,2))` 整页截图 → 废弃 `get_images()` 逐图抠取, 矢量图盲区归零) / 智能去重 (OCR 文本去空格后 vs `page_text` 交叉比对, 仅保留增量) / Y 轻量分组 (≤12 行/组, 防 giant block) / OCR 前置 (`page_text` 最前方插入, 旧逻辑页尾追加撕裂跨页上下文) / C-SDK 逐图跳过 (`if doc_type=="gui_app": continue`)** | `_pix = page.get_pixmap()`, `_page_text_norm` 去重, `_GROUP_SIZE=12`, OCR prepend, 孤儿行合并 `elif len(_cells)==1` |
 | 🔴 **v31** | **v31** | **数据摄入双轨制: JAKA 手册 → MinerU 离线解析 (magic-pdf 1.3.12, doclayout_yolo 版面 + rapid_table 表格 + unimernet `cache_position` 文件级补丁) 产出 `data/jaka_markdown/JAKA_Manual/auto/JAKA_Manual.md`；SDK 文档保留原 L1 状态机管线零改动。连环排雷: layout-config 缺省回退 detectron2 NoneType 崩溃 / `table-master` 非法表名 / transformers 4.49 毒药参数 (subprocess 内 monkeypatch 无效 → 文件级补丁) / modelscope 模型快照漂移 (OCR v3 det 缺失) / GPU 争抢自适应** | `src/parse_jaka_mineru.py`, `auto_patch_mbart.py`, `patch_unimernet.py` |
-| 🔴 **v32** | **v32** | **多模态 Markdown 提纯与双模型微服务架构**: 本地部署 Qwen2-VL-7B-Instruct (:8005) + 双重图片几何/语义过滤 + HTML 表格转 Markdown + 防模板化 VLM Prompt + 切片 JSON 持久化与 `inspect_chunks.py` 可视化质检 | `src/markdown_loader.py`, `src/inspect_chunks.py`, `data/jaka_manual_chunks.json` |
+| 🔴 **v32** | **v32** | **多模态 Markdown 提纯与双模型微服务架构**: 本地部署 Qwen2-VL-7B-Instruct (:8005) + 双重图片几何/语义过滤 + HTML 表格转 Markdown + 防模板化 VLM Prompt + 切片 JSON 持久化 | `src/pdf_loader.py` (v32 逻辑统一收口), `data/jaka_manual_chunks.json` (提纯缓存) |
+| 🔴 **Stage 1** | **Stage 1 (v32 收口)** | **数据摄入统一收口: SDK 专轨 PyMuPDF (fitz) 状态机重构 (pypdf 废弃, `_SDK_CHAPTER_BOUNDARY_RE` 严格章节正则, Ctypes 黑名单零污染) / JAKA 专轨 VLM 提纯 + KV 属性库自动生成 / 统一入口 `load_all_documents_v4_dual()` + `src/rebuild_v4.py` 双轨建库 / check_status vLLM 1-token 微探针 (防 CUDA 假死) / 验收: OpenC3 27 · OpenR6 30 · JAKA 225+9 · 189 截图提纯** | `load_single_sdk_pdf()`, `load_jaka_mineru_dual()`, `export_kv_attributes()`, `load_all_documents_v4_dual()`, `tests/test_stage1.py` |
 
 
 ### 当前关键配置
@@ -304,7 +328,7 @@ python app.py   # → http://localhost:8000 (比邻星 ProximaRAG) · API: /docs
 | 文件 | 功能 |
 |------|------|
 | `src/config.py` | 全局配置 — 双通道 LLM、GPU 探测、ChromaDB 路径、嵌入模型、检索参数 |
-| `src/pdf_loader.py` | PDF 加载(v4) — 状态机 SDK 解析、GUI Heading-to-Heading、Parent-Child 双层、OCR、下划线归一化、骨架过滤 |
+| `src/pdf_loader.py` | 🔴 Stage 1: 统一数据摄入与切片 (~660 行) — SDK 专轨 fitz 状态机原子切片 + JAKA 专轨 MinerU/Qwen2-VL 多模态提纯 + KV 属性库 + 统一入口 `load_all_documents_v4_dual()` |
 | `src/vector_store.py` | 向量知识库 — bge-small-zh-v1.5 + ONNX 回退、BM25 混合检索、增量 Upsert |
 | `src/rag_chain.py` | 🔴 RAG 核心管线 (~3,242 行, v25 计划拆分为 6 子模块) — 四层容灾、混合检索、HyDE、🔴 v24: Markdown 模板约束 + 极速流式穿透 |
 | `src/graph_rag.py` | 🔴 LangGraph 状态图引擎 (~1,926 行, v25 计划拆分为 4 子模块) — 9 节点 + 条件边 + SDK 自纠错 + 硬熔断 + 🔴 v24: render_node 退化 + 流式双重输出 Bug 修复 |
@@ -312,10 +336,10 @@ python app.py   # → http://localhost:8000 (比邻星 ProximaRAG) · API: /docs
 | `src/attribute_tool.py` | 动态属性意图 — LLM 提取→BM25→正则 KV |
 | `app.py` | FastAPI (:8000) — /api/chat, /api/upload, /api/status, /api/products |
 | `frontend_server.py` | 前端 UI (:8501) — Jinja2 + /api/* 反向代理 |
-| `rebuild_v4.py` | v4 向量库重建脚本 |
+| `src/rebuild_v4.py` | 🔴 Stage 1: 双轨建库脚本 — 物理清库 → `load_all_documents_v4_dual` → ChromaDB 双 Collection → 质检统计；运行 `python src/rebuild_v4.py` 或 `python -m src.rebuild_v4` |
 | `check_status.py` | 健康检查 — vLLM + FastAPI + GPU |
 | `start_services.sh` | 一键启动 — GPU 智能选择 + 就绪轮询 + 优雅退出 |
-| `audit_chunks.py` | 切片健康度审计 (Health Score) |
+| `audit_chunks.py` | ⚠️ 切片健康度审计 (Health Score) — 依赖旧 `load_pdfs_v4_dual` 入口，Stage 1 待适配 |
 | `src/parse_jaka_mineru.py` | 🔴 v31: MinerU 离线解析入口 (JAKA 手册) — modelscope 权重检查 + `~/magic-pdf.json` 生成 (doclayout_yolo + rapid_table) + GPU 自适应 + magic-pdf CLI 调用 |
 | `auto_patch_mbart.py` / `patch_unimernet.py` | 🔴 v31: unimernet × transformers 4.49 `cache_position` 文件级补丁 (site-packages 注入) |
 
@@ -323,14 +347,11 @@ python app.py   # → http://localhost:8000 (比邻星 ProximaRAG) · API: /docs
 
 | 函数 | 位置 | 用途 |
 |------|------|------|
-| `_v4_parse_sdk_state_machine()` | pdf_loader.py | SDK 轨状态机 API 块解析器（`数字标题` + `函数名称/函数说明` 两类边界） |
-| `_v4_extract_headings()` | pdf_loader.py | 标题提取 + 🔴 代码注释拦截（8 特征词上下文校验）+ 🔴 v23: doc_type 动态双轨拦截（GUI 禁止单数字编号） |
-| `_sanitize_section_title()` | pdf_loader.py | 标题清洗器 + 🔴 伪标题黑名单（10 项 frozenset） |
-| `_v4_extract_sdk_toc()` | pdf_loader.py | 🔴 Golden TOC 目录树预解析（预留回退基础设施） |
-| `_is_skeleton_chunk()` | pdf_loader.py | 离线骨架过滤 |
-| `_clean_pdf_text()` | pdf_loader.py | 7 步通用文本清洗 + 🔴 Step 6 SDK 代码换行修复 + 🔴 v25: JAKA/gui_app 数字保护特判（≥3 位参数保全） |
-| `_v4_build_parent_child_docs()` | pdf_loader.py | 🔴 v23: 父级跨级扫描 + 动态切片容量分配 (GUI=1500/2000) + 前导文字保护 + 跨级大纲扫描 |
-| `_v4_build_child_docs_v2()` | pdf_loader.py | 🔴 v23: 微缩大纲上限 5 条 + 标签统一 `[章节大纲参考]` |
+| `_v4_parse_sdk_state_machine()` | pdf_loader.py | 🔴 Stage 1: SDK 轨状态机 API 块解析器 — `_SDK_CHAPTER_BOUNDARY_RE` 严格章节正则切分（仅行首 1-2 位编号+中英文跟随），preamble → "SDK 基础配置" |
+| `_extract_text_with_fitz()` | pdf_loader.py | 🔴 Stage 1: PyMuPDF `get_text("text", sort=True)` 物理坐标流排序提取 — 废弃 pypdf，根除表格/代码块断层与跨节漂移 |
+| `_clean_sdk_pdf_text()` | pdf_loader.py | 🔴 Stage 1: SDK 文本清洗 — 表格纵向断字修复（`函数名\n称`→`函数名称`）+ 下划线/API 断行拼接 + I/O 归一化 |
+| `_v4_extract_function_names()` | pdf_loader.py | 🔴 Stage 1: 三模式函数名提取 + `_CTYPES_BLACKLIST` 黑名单（c_float/c_int/restype/byref…零 CTypes 污染） |
+| （v23–v30.final 归档） | pdf_loader.py | `_v4_extract_headings`/`_sanitize_section_title`/`_v4_extract_sdk_toc`/`_is_skeleton_chunk`/`_clean_pdf_text`/`_v4_build_parent_child_docs`/`_v4_build_child_docs_v2` 已随 Stage 1 重构移除（见 L1 历史归档表） |
 | `_hybrid_retrieve()` | rag_chain.py | BM25+向量 RRF 混合检索 + 🔴 v23: 六大提权引擎 |
 | `_decompose_compound_query()` | rag_chain.py | 复合查询拆解 (顺序连接词) |
 | `_rewrite_query_with_llm()` | rag_chain.py | 🔴 ADR-19: LLM 意图重写引擎 (代词消解+产品补全) + 🔴 v26: always-on + 纠错/补全规则与 Few-Shot (max_tokens=128) |
@@ -343,35 +364,27 @@ python app.py   # → http://localhost:8000 (比邻星 ProximaRAG) · API: /docs
 | `extract_align_node()` | graph_rag.py | 🔴 v24: 简化版属性对齐校验 + SemanticDedup + 静默斩尾（移除屠魔版正则）+ 🔴 v25: 无条件精确段落去重 + 代码块跳过模糊去重 + `_fix_and_close_sdk_code` 入口接入 |
 | `run_graph_stream()` | graph_rag.py | 🔴 v24: 流式图执行 + SDK 自纠错回路 + 双重输出 Bug 修复 |
 | `_tokenize_for_bm25()` | vector_store.py | BM25 分词器 — jieba + 标识符保护 + CODE 标签三倍写入 + 🔴 v26: 复合词原子化（`_COMPOUND_RE` 排除 `.`）与空格归一化（`_SPACE_SEP_RE`） |
-| `_ocr_kv_normalize_row()` | pdf_loader.py | 🔴 v29: OCR 行内键值归一化 — `端口：\| 6502` → `端口：6502`（`\|` 离散分隔转 Dense 友好键值语义） |
-| `_ocr_merge_cross_line()` | pdf_loader.py | 🔴 v29: OCR 跨行键值配对 — `从站节点号：` + 纯数值 → `从站节点号：1`（防页码 ±1 误伤） |
-| `_emit_ocr_child()` | pdf_loader.py | 🔴 v30: OCR 子块独立 emit — `_split_text_into_children` gui_app 路径内定义，`chunk_type="ocr_child"`，不提取 function_names |
-| `_v4_extract_text_universal()` 全景 OCR | pdf_loader.py | 🔴 v30.final: gui_app 轨 `get_pixmap(Matrix(2,2))` 整页截图 + 智能去重（vs `page_text`）+ Y 轻量分组（`_GROUP_SIZE=12`）+ OCR 前置插入 |
-| `_v4_build_parent_child_docs()` 软装箱 | pdf_loader.py | 🔴 v30: AST-Lite 软装箱替代暴力腰斩 — `_PROTECTED_BLOCK_RE` 交替序列 + 受保护块整体装入 (允许超标) + 普通文本 `\n\n` 安全切断 + 🔴 v30.final: 条件封箱 (`_packed_len >= parent_chunk_size`) |
+| （v29–v30.final OCR 归档） | pdf_loader.py | `_ocr_kv_normalize_row`/`_ocr_merge_cross_line`/`_emit_ocr_child`/`_v4_extract_text_universal`/AST-Lite 软装箱 已随 Stage 1 移除 — JAKA 参数提纯由 Qwen2-VL 多模态管线替代 |
 | `_strip_code_from_context()` | rag_chain.py | 🔴 v28: 通用代码脱敏 — ``` 代码块 → `[代码内容省略]`、DLL 加载行 → `[DLL加载代码省略]`（仅守卫命中路径） |
 | `_resolve_product_from_history()` | rag_chain.py | 🔴 v27: 多轮产品解析第三兜底 — PRODUCT_ROUTER_RULES 扫最近 6 条历史锁定产品 |
 | `_extract_sdk_header()` | pdf_loader.py | SDK 全局代码头提取 — 🔴 v27: 兼容裸 `CDLL(r"...")`（`from ctypes import *` 前缀省略）与 raw 前缀 |
-| `clean_html_tables()` | markdown_loader.py | 🔴 v32: HTML 表格无损转 Markdown 表格并自动对齐列宽 |
-| `call_vlm_for_image_extraction()` | markdown_loader.py | 🔴 v32: 对接 :8005 Qwen2-VL 服务提取 IP、端口、坐标等高信噪比实体 |
-| `process_and_filter_images()` | markdown_loader.py | 🔴 v32: 三重图片过滤（几何过滤 + 图注校验 + VLM 注入）与正文精准匹配替换 |
-| `parse_mineru_markdown()` | markdown_loader.py | 🔴 v32: MinerU Markdown 软装箱切片器（章节层级维护 + 1000ch 语义封箱） |
-| `inspect_chunks.py` | inspect_chunks.py | 🔴 v32: 切片可视化质检工具（总览目录表、参数搜索、单卡片详情展开） |
+| `clean_html_tables()` | pdf_loader.py | 🔴 Stage 1/v32: HTML 表格无损转 Markdown 表格 + 外层标签剥离 + 缺损单元格补齐（实测 34 表格→0 残留/444 行） |
+| `_preprocess_all_images()` / `_call_vlm_worker()` | pdf_loader.py | 🔴 Stage 1/v32: 三重图片防线（几何/图注/VLM）6 线程并发提纯 — 对接 :8005 Qwen2-VL，Prompt 禁模板废话占位符，空结果标 `仅为UI示意图` |
+| `load_jaka_mineru_dual()` | pdf_loader.py | 🔴 Stage 1/v32: JAKA 专轨切片器 — 提纯缓存优先 (`data/jaka_manual_chunks.json`) + 章节面包屑栈 + 1500ch 软装箱 + TOC 点线过滤 |
+| `load_single_sdk_pdf()` | pdf_loader.py | 🔴 Stage 1: SDK 专轨入口 — fitz sort=True 提取 → 清洗 → 章节原子切片 + SDK Header 注入 |
+| `export_kv_attributes()` / `load_all_documents_v4_dual()` | pdf_loader.py | 🔴 Stage 1: KV 属性库自动生成 (`kv_db/attribute_kv.json` + 人工校准覆盖) / 统一摄入入口（JAKA 轨 + SDK 轨 + KV 导出） |
 
-### 🔴 PDF 切片规则 (v23)
+### 🔴 PDF 切片规则 (Stage 1 / v32 收口)
 
-#### SDK 状态机边界触发条件 (`_SDK_BLOCK_BOUNDARY_RE`)
+#### SDK 专轨章节边界 (`_SDK_CHAPTER_BOUNDARY_RE`)
 
 ```
-仅两路可验证边界:
-  ① ^\d{1,2}[\.\、\s]\s*\S+       → "28. 机械臂电源上电" / "4. 机械臂上电"
-  ② ^(?:函数名称|函数说明)\s*      → OpenC3/OpenR6 两种 API 表头格式
+r'(?:^|\n)(?=[ \t]*\d{1,2}\s*\.\s*[一-龥a-zA-Z])'   # re.MULTILINE
 ```
-
-**严格禁止**匹配的模式：`^#{1,4}\s+`（Python 注释 `# 时间等待3秒` 与 Markdown 标题无法区分，已从边界正则中永久移除）。
-
-#### 🔴 v23: 标题正则深度扩展
-
-多级数字编号 `{1,5}` 支持最高 6 级深度标题（如 `3.1.5.2.1`），兼容末尾带点和数字汉字粘连的极端排版。
+- 仅匹配行首 1-2 位编号 + 可选空格 + `.` + 空格 + 中文/英文字符跟随（如 `28. 机械臂电源上电`）→ 整章原子闭环切片（OpenC3 27 / OpenR6 30 章节）。
+- `\d{1,2}` 上限 2 位 — 浮点数（`3.14`）与长数字不误切；<20 字符碎片块由加载器丢弃兜底。
+- **严格禁止**匹配的模式：`^#{1,4}\s+`（Python 注释 `# 时间等待3秒` 与 Markdown 标题无法区分）。
+- 历史 `_SDK_BLOCK_BOUNDARY_RE` 双边界（数字标题 + 函数名称/函数说明）与 v23 多级编号 `{1,5}` 深度扩展随 Stage 1 归档（见 L1 历史归档表）。
 
 ---
 
@@ -380,9 +393,10 @@ python app.py   # → http://localhost:8000 (比邻星 ProximaRAG) · API: /docs
 ```python
 # LLM
 BASE_URL     = "http://localhost:8001/v1"
-MODEL_NAME   = "Qwen/Qwen2.5-7B-Instruct-AWQ"
+MODEL_NAME   = env LLM_MODEL_NAME, 默认本地快照 /home/kasm-user/LLM/mo/models/Qwen--Qwen2.5-7B-Instruct-AWQ/snapshots/master
 DEEPSEEK_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 DEEPSEEK_MODEL    = "glm-4.7-flash"
+# VLM (Stage 1/v32): VLM_BASE_URL="http://localhost:8005/v1" / VLM_MODEL_NAME="Qwen/Qwen2-VL-7B-Instruct"
 # max_tokens=1024 (v16: 代码+步骤完全充裕，从源头消解 vLLM 400)
 LLM_INFERENCE_TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=15.0, pool=5.0)
 
@@ -390,7 +404,7 @@ LLM_INFERENCE_TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=15.0, pool
 CHUNK_SIZE=300 / CHUNK_OVERLAP=50 / RETRIEVAL_K=10 / SIMILARITY_THRESHOLD=0.68
 _AUTOCUT_MIN_K=8 / _AUTOCUT_MAX_K=15  # SDK 检索时 MIN_K 动态提升至 10
 _MIN_SUB_QUERY_LEN=2  # v22: 复合查询最小子句长度，两字动词不丢弃
-CHUNK_MODE = "v4_dual"  # Parent(1000) + Child(400), GUI: Parent(2000) + Child(1500)
+CHUNK_MODE = "v4_dual"  # Stage 1: SDK_PARENT=1000/SDK_CHILD=400, GUI_PARENT=2000/GUI_CHILD=1500 (兼容别名 PARENT_CHUNK_SIZE/CHILD_CHUNK_SIZE)
 _MAX_CONTEXT_CHARS = 4000  # SDK 检索时动态提升至 8000
 
 # 嵌入
@@ -405,8 +419,10 @@ EMBEDDING_MODEL_NAME = "BAAI/bge-small-zh-v1.5"  # 512维, HF→ONNX 回退
 ```bash
 ./start_services.sh              # 一键启动
 pkill -f "app.py"; pkill -f "vllm"  # 一键停止
-python check_status.py           # 健康检查
-python tests/run_eval.py --verbose  # 回归评测
-python audit_chunks.py           # 切片健康度审计
+python check_status.py           # 健康检查 (vLLM 1-token 微探针)
+python tests/run_eval.py --verbose  # 回归评测 (8 硬断言)
+python tests/test_stage1.py      # 🔴 Stage 1: 数据摄入/双轨切片离线冒烟测试
+python src/rebuild_v4.py         # 🔴 Stage 1: 双轨全量建库 (或 python -m src.rebuild_v4)
 python src/parse_jaka_mineru.py  # v31: JAKA 手册 MinerU 离线解析
+# ⚠️ audit_chunks.py 依赖旧 pdf_loader 入口，Stage 1 待适配
 ```

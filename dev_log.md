@@ -1,4 +1,51 @@
 # 比邻星 (ProximaRAG) — 开发日志
+
+> **日期**: 2026-08-21 | **版本**: Stage 1 结项 (v32 收口) | **类型**: 数据摄入、双轨切片与多模态提纯统一收口
+
+### Stage 1 结项 — 统一双轨摄入管线 (pdf_loader.py 重构 + src/rebuild_v4.py 双轨建库)
+
+**范围**: SDK 专轨 PyMuPDF 重构 + JAKA 多模态专轨 + KV 属性库 + 向量库重建与配置兼容。`src/pdf_loader.py` 由 ~2,900 行收敛为 ~660 行统一模块，原 v23–v30.final 自研 L1 管线（OCR 归位/软装箱/标题状态机等）整体归档移除；`markdown_loader.py`/`multimodal_loader.py`/`kv_extractor.py` 三个独立模块合并入统一模块后删除。
+
+#### 1. SDK 专轨切片重构 (OpenC3/OpenR6)
+
+- **底层引擎替换**: 废弃 pypdf → PyMuPDF (`fitz`) `get_text("text", sort=True)` 物理坐标流排序，彻底解决表格与代码块断层、跨节漂移（典型缺陷一）。
+- **章节严格正则**: `_SDK_CHAPTER_BOUNDARY_RE = r'(?:^|\n)(?=[ \t]*\d{1,2}\s*\.\s*[一-龥a-zA-Z])'` 精准章节切分（`\d{1,2}` 上限 2 位，浮点数/长数字不误切）。
+- **原子闭环与元数据清洗**: 单切片容纳「章节标题+函数签名+参数说明+返回值+示例代码」；`_CTYPES_BLACKLIST`（c_float/c_int/c_char_p…+restype/argtypes/byref 等）解决 Ctypes 类型名污染 function_names 的典型缺陷二（实测 29/31 函数 0 污染）。
+- **SDK Header**: `_extract_sdk_header()` 提取 CDLL 加载行 + POSE/Joint 结构体，注入 API 切片。
+
+#### 2. JAKA 多模态与表格专轨
+
+- **表格无损转换与标签清洗**: `clean_html_tables()` 将 MinerU 输出的 34 处 HTML `<table>` 转标准 GitHub Markdown 表格（补齐缺损单元格）并剥离 `<html>/<body>/<div>` 外层标签——解决 HTML 残留与表格跨切片截断的典型缺陷三（实测 0 残留 / 444 行表格行）。
+- **VLM 多模态注入**: 三重图片防线（几何过滤 <80px/长宽比>8 → 图注校验 ±100 字 → Qwen2-VL 提纯）从 262 张图片中筛出 189 张界面截图并发提取；Prompt 禁"未提供"类模板废话占位符，空结果统一标 `仅为UI示意图`；提纯结果持久化 `data/jaka_manual_chunks.json` 供秒级恢复。
+- **KV 属性库生成**: `export_kv_attributes()` 摄入后自动抽取生成 `kv_db/attribute_kv.json`，`_MANUAL_CALIBRATION` 人工校准值（Modbus TCP 6502 / RTU 9600 / 默认密码）强制覆盖。
+
+#### 3. 向量库重建与配置兼容
+
+- `src/rebuild_v4.py` 对接统一入口 `load_all_documents_v4_dual()`：物理清库 → 双轨切片 → KV 导出 → BGE 嵌入 → ChromaDB 双 Collection → 质检统计（双入口兼容 `python src/rebuild_v4.py` / `python -m src.rebuild_v4`）。
+- `src/config.py` 补 `PORT`/`FASTAPI_PORT`/`CHILD_CHUNK_SIZE`/`PARENT_CHUNK_SIZE` 向下兼容别名，新增 `VLM_BASE_URL`/`VLM_MODEL_NAME` (:8005)。
+- **vLLM 探针加固** (`check_status.py`): `/v1/models` 存活探测 + 1-token 微探针检验 GPU 实际推理能力（防 CUDA 假死），超时语义区分连接拒绝/推理死锁。
+
+#### 4. 第一阶段验收数据 (2026-08-21 实测)
+
+| 产品轨 | 验收项 | 结果 |
+|--------|--------|------|
+| OpenC3 | 章节原子切片 | ✅ 27 chunks（长度 270~720，均值 414） |
+| OpenR6 | 章节原子切片 | ✅ 30 真实章节（实测 32 块，含 2 个目录页 TOC 噪声块待过滤） |
+| SDK 双轨 | api_atomic / function_names | ✅ API 章节 100% 命中，CTypes 零污染 |
+| JAKA | Parent / Child | ✅ 9 parents（5 章+4 附录）+ 225 children（VLM 注入后 226+，早期版本记录 244） |
+| JAKA | 多模态参数注入 | ✅ 189 张截图经 Qwen2-VL 提纯，注入切片 120+（缓存 `data/jaka_manual_chunks.json`） |
+| JAKA | HTML 表格 | ✅ 34 处 table → 0 HTML 残留 / 444 行 Markdown 表格 |
+
+#### 5. 已知遗留 (代码审查发现，建议 Stage 2 处理)
+
+1. **`/api/upload` 增量链路断裂**: `vector_store.upsert_product_documents()` 仍 import 旧 pdf_loader 函数（`_v4_extract_text_universal`/`_v4_build_parent_child_docs`/`_clean_pdf_text`，已删除）→ 上传必 500。
+2. **kv_extractor.py 删除后 4 处懒加载引用悬空**: graph_rag.py/rag_chain.py 的数字 KV 注入路径静默失效（try/except 吞掉 ImportError）——E05/E07 确定性注入需重接读取 `kv_db/attribute_kv.json`。
+3. **OpenR6 TOC 噪声块**: 章节正则会匹配目录页编号行（"29.机械臂通讯关闭" 类重复块），需补 TOC 点线特征过滤。
+4. **KV 正则值域缺陷**: `[^\s，。,.\n]` 值域排除 `.`/空格 → "IP地址" 截断为 "192"、混入 "填写端口号" 等 UI 标签噪声；当前人工校准 6 条为唯一可靠来源。
+5. **audit_chunks.py / tests/test_stability.py**: 依赖旧 `load_pdfs_v4_dual`/`load_pdfs_from_directory` 入口，当前不可用，待适配统一入口。
+
+---
+
 > **日期**: 2026-08-21 | **版本**: v31 → v32 | **类型**: 多模态 Markdown 切片提纯与双模型微服务架构落地
 
 ### v32 变更 (Multimodal Markdown Extraction: Qwen2-VL Ingestion + Table Conversion + Anti-Fluff Prompting)
