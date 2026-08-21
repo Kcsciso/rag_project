@@ -16,3 +16,5 @@ rag_index/
 
 # MinerU 解析输出的临时与 Markdown 产物目录
 data/
+
+src/models

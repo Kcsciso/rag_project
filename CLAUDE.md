@@ -46,6 +46,11 @@
 | 🔴 微缩大纲上限 (v23) | Child TOC 上限 **5 条** (v22: 15)，超出显示 "... (更多章节略)" |
 | 🔴 大纲标签统一 (v23) | 全部使用 `[章节大纲参考]:`，禁止旧 `【子章节】` / `[本章/本节包含以下子内容大纲]` |
 | 🔴 数据摄入双轨制 (v31) | JAKA 手册 → MinerU 离线解析（`src/parse_jaka_mineru.py`）；SDK 文档 → 原 L1 状态机管线。两轨互不侵入；SDK 轨零触碰；gui_app 轨 L1 逻辑保留不删除 |
+| 🔴 **数据摄入双轨制 (v31)** | JAKA 手册 → MinerU 离线解析；SDK 文档 → 原 L1 状态机管线。两轨互不侵入[cite: 2] |
+| 🔴 **多模态 VLM 提纯注入 (v32)** | MinerU Markdown 切片时调用本地 :8005 Qwen2-VL-7B 提取图表参数；Prompt 严禁模板废话占位符（"未提供"等），纯示意图统一标注 `仅为UI示意图` |
+| 🔴 **多模态三重图片防线 (v32)** | 1. 物理几何过滤（边长<80px或长宽比>8）；2. 上下文图注强校验（前后100字命中图/表/参数/设置等）；3. VLM 纯参数提纯注入 |
+| 🔴 **HTML 表格规整转 Markdown (v32)** | 彻底清洗独立 `<table>` 及嵌套 HTML 表格为标准 GitHub Markdown 表格，并自动补齐缺损单元格 |
+| 🔴 **Markdown 层级面包屑栈 (v32)** | 仅带编号的章节（`# 1.1`, `# 第一章`）维护层级路径；普通强调行（如 `# 注意：`）禁止重置路径与过度打碎切片 |
 
 ### L2 — 检索与重排层 (vector_store.py + rag_chain.py `_hybrid_retrieve`)
 | 核心特性 | 严禁破坏 |
@@ -160,6 +165,8 @@ Conda `rag_agent` (Python 3.10)。**严禁 `pip install --upgrade`**：
 | 🔴 **v30** | **v30** | **AST-Lite 软装箱: 跨页表格表头向下继承 (暂存 `_table_header` → 下页注入) / OCR 标签化防稀释 (`<OCR_BLOCK>` 包裹 + `_PROTECTED_BLOCK_RE` 第二分支 + `_v4_find_protected_ranges` `type="ocr"`) / Parent 软装箱算法 (受保护块不可分割 → 整体装入允许超标, 普通文本 `\n\n` 安全切断) / OCR 子块隔离 (`_emit_ocr_child` + `chunk_type="ocr_child"` 独立切片) / 过早封箱 Bug 修复 (`_packed_len >= parent_chunk_size` 条件封箱)** | `_table_header`, `<OCR_BLOCK>`, `_PROTECTED_BLOCK_RE` 第二分支, `_emit_ocr_child()`, `chunk_type="ocr_child"` |
 | 🔴 **v30.final** | **v30.final** | **全景快照 OCR + 孤儿行合并: 孤儿行合并 (短文本 <10ch 追加到上一行表格末单元格, 修复 `Windows7及以上\n上` 碎裂) / 全景快照 OCR (`get_pixmap(Matrix(2,2))` 整页截图 → 废弃 `get_images()` 逐图抠取, 矢量图盲区归零) / 智能去重 (OCR 文本去空格后 vs `page_text` 交叉比对, 仅保留增量) / Y 轻量分组 (≤12 行/组, 防 giant block) / OCR 前置 (`page_text` 最前方插入, 旧逻辑页尾追加撕裂跨页上下文) / C-SDK 逐图跳过 (`if doc_type=="gui_app": continue`)** | `_pix = page.get_pixmap()`, `_page_text_norm` 去重, `_GROUP_SIZE=12`, OCR prepend, 孤儿行合并 `elif len(_cells)==1` |
 | 🔴 **v31** | **v31** | **数据摄入双轨制: JAKA 手册 → MinerU 离线解析 (magic-pdf 1.3.12, doclayout_yolo 版面 + rapid_table 表格 + unimernet `cache_position` 文件级补丁) 产出 `data/jaka_markdown/JAKA_Manual/auto/JAKA_Manual.md`；SDK 文档保留原 L1 状态机管线零改动。连环排雷: layout-config 缺省回退 detectron2 NoneType 崩溃 / `table-master` 非法表名 / transformers 4.49 毒药参数 (subprocess 内 monkeypatch 无效 → 文件级补丁) / modelscope 模型快照漂移 (OCR v3 det 缺失) / GPU 争抢自适应** | `src/parse_jaka_mineru.py`, `auto_patch_mbart.py`, `patch_unimernet.py` |
+| 🔴 **v32** | **v32** | **多模态 Markdown 提纯与双模型微服务架构**: 本地部署 Qwen2-VL-7B-Instruct (:8005) + 双重图片几何/语义过滤 + HTML 表格转 Markdown + 防模板化 VLM Prompt + 切片 JSON 持久化与 `inspect_chunks.py` 可视化质检 | `src/markdown_loader.py`, `src/inspect_chunks.py`, `data/jaka_manual_chunks.json` |
+
 
 ### 当前关键配置
 
@@ -344,6 +351,11 @@ python app.py   # → http://localhost:8000 (比邻星 ProximaRAG) · API: /docs
 | `_strip_code_from_context()` | rag_chain.py | 🔴 v28: 通用代码脱敏 — ``` 代码块 → `[代码内容省略]`、DLL 加载行 → `[DLL加载代码省略]`（仅守卫命中路径） |
 | `_resolve_product_from_history()` | rag_chain.py | 🔴 v27: 多轮产品解析第三兜底 — PRODUCT_ROUTER_RULES 扫最近 6 条历史锁定产品 |
 | `_extract_sdk_header()` | pdf_loader.py | SDK 全局代码头提取 — 🔴 v27: 兼容裸 `CDLL(r"...")`（`from ctypes import *` 前缀省略）与 raw 前缀 |
+| `clean_html_tables()` | markdown_loader.py | 🔴 v32: HTML 表格无损转 Markdown 表格并自动对齐列宽 |
+| `call_vlm_for_image_extraction()` | markdown_loader.py | 🔴 v32: 对接 :8005 Qwen2-VL 服务提取 IP、端口、坐标等高信噪比实体 |
+| `process_and_filter_images()` | markdown_loader.py | 🔴 v32: 三重图片过滤（几何过滤 + 图注校验 + VLM 注入）与正文精准匹配替换 |
+| `parse_mineru_markdown()` | markdown_loader.py | 🔴 v32: MinerU Markdown 软装箱切片器（章节层级维护 + 1000ch 语义封箱） |
+| `inspect_chunks.py` | inspect_chunks.py | 🔴 v32: 切片可视化质检工具（总览目录表、参数搜索、单卡片详情展开） |
 
 ### 🔴 PDF 切片规则 (v23)
 

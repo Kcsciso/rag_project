@@ -1,6 +1,7 @@
 # 📰 比邻星 (ProximaRAG) — 湖南比邻星科技文档智能问答系统
 
 基于 **RAG（Retrieval-Augmented Generation）** 架构的官方技术文档与使用手册智能问答系统。专为**湖南比邻星科技有限公司**的开发者与用户打造，采用双 A100 GPU 算力底座，底层搭载 **vLLM + Qwen2.5-7B-Instruct-AWQ** 实现完全私有化、低延迟的本地推理。
+> **🔴 v32 多模态切片提纯与双模型微服务 (2026-08-21)**: 部署 **Qwen2-VL-7B-Instruct** 视觉语言模型服务 (:8005)；开发 `markdown_loader.py` 实现 HTML 表格无损规整、三重图片几何/图注过滤与防模板废话参数提取；产出 244 个高质量 JAKA 结构化切片并提供 `inspect_chunks.py` 可视化质检工具。
 
 > **🔴 v24 架构升级 (2026-08-04)**: 全面转向 **Markdown 模板强约束 (Template Masking) + 极速流式穿透** 架构。废弃了此前的 JSON 提取+正则清洗后处理管线，System Prompt 从 210 行压缩至 ~15 行（Token 节省 83%），TTFB 从 60-90s 降至 <2s。
 
@@ -246,6 +247,9 @@ chmod +x start_services.sh
 ./start_services.sh --vllm-only        # 仅 vLLM
 ./start_services.sh --fastapi-only     # 仅 FastAPI
 ./start_services.sh --gpu 0            # 手动指定 GPU
+# 多模态切片与质检 (v32)
+python src/markdown_loader.py      # 执行 JAKA Markdown 切片与 VLM 多模态提取
+python src/inspect_chunks.py       # 切片可视化目录总览与实体参数质检
 ```
 
 ### 3. 手动启动
