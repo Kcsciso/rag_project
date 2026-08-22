@@ -1,5 +1,61 @@
 # 比邻星 (ProximaRAG) — 开发日志
 
+> **日期**: 2026-08-22 | **版本**: Stage 2-4 收口 | **类型**: 全量架构审查 + 六项 Bug 修复 + 端到端验证
+
+### Stage 2-4 收口 — 向量库单例化 / BM25 增量索引 / KV 侧信道 / OpenR6 目录噪声剔除
+
+**范围**: 对 Stage 1 结项后的存量遗留做全量架构审查（L1-L4 + 服务入口 + 测试套件，4 路并行代码走查 + git diff 深度审计 + 三套测试离线实测），完成 Stage 2/3/4 收口修复，审查报告落盘 [ARCHITECTURE_AUDIT.md](./ARCHITECTURE_AUDIT.md)，并同步 CLAUDE.md / README.md。
+
+#### 1. 架构同步（Stage 1-4 落地盘点）
+
+1. **Stage 1 双轨解析（已结项）**: SDK 专轨 PyMuPDF fitz `sort=True` 物理坐标流 + 章节状态机原子切片；JAKA 专轨 MinerU × Qwen2-VL (:8005) 多模态提纯 + HTML 表格规整。
+2. **Stage 2 ChromaDB LangChain 单例 + Parent-Child 双集合**: `create_dual_collections()` / `upsert_product_documents()` 统一改走 LangChain `Chroma` 包装器（`persist_directory`），Parent/Child 双集合写入后同步构建 BM25；嵌入函数 `get_embedding_function()` 懒加载单例（HF bge-small-zh → ONNX 回退）。
+3. **Stage 2 BM25Okapi 增量分词索引**: 内存索引按 product_id 分组；建库全量构建 + `bm25_upsert_product` 增量重建 IDF + `app.py` startup `build_bm25_from_chromadb()` 恢复。
+4. **Stage 3 KV 确定性属性侧信道**: 新建 `src/kv_extractor.py` `lookup_attribute()` 读取 `kv_db/attribute_kv.json`（两级嵌套 + 人工校准 6502/9600），4 注入点（run_graph / run_graph_stream / rag_chat / rag_chat_stream）在 `_build_messages` 后、LLM 前前置注入；触发 `_last_numeric_context_missing or _NUMERIC_QUERY_RE`。
+5. **Stage 1 OpenR6 目录噪声剔除**: `_strip_openr6_toc()` 剥离文档开头 1~29 项目录文本块与星号分隔线。
+
+#### 2. Bug 修复记录（本次）
+
+| # | Bug | 根因 | 修复 | 验证 |
+|---|-----|------|------|------|
+| BUG-1 | 参数缺失 | `load_single_sdk_pdf` / `upsert_product_documents` 无法显式传入 product_id/file_path，只能靠文件名推断 | 新增显式参数 + `FileNotFoundError` 前置校验 | OpenC3 显式 product_id 增量摄入 1P+27C ✅ |
+| BUG-2 | 文件锁冲突 | `create_dual_collections` 用原生 `chromadb.PersistentClient`（自定义 Settings）与 LangChain 包装器（默认 Settings）并发打开同一 persist 目录 → ChromaDB Settings 冲突 / SQLite 锁冲突 | 废除原生客户端，统一 LangChain Chroma 包装器；「禁止 PersistentClient 混用」写入 CLAUDE.md 红线（仅保留 3 处只读例外） | 全量重建 + upsert 写入无锁冲突 ✅ |
+| BUG-3 | 空 ID 拦截 | 文档 ID 生成 `metadata.get(key, default)` 对空字符串不触发默认值 → 空 ID 导致 ChromaDB `add` 写入异常 | `or` 链兜底（`get("chunk_id") or f"c_{pid}_{i}"`，4 处） | 空 metadata 切片写入不再抛异常 ✅ |
+| BUG-4 | TOC 噪声过滤失效 | `_strip_openr6_toc` 分隔线正则 `[\*]{5,}` 与真实文档 ☆ (U+2606) 不匹配 → **实测剥离 0 字符** | 正则修正 `[☆★\*]{5,}` | 剥离 465 字符；状态机块 119→61；OpenR6 切片 32→31（30 真实章节 + SDK 基础配置块），test_stage1 断言 30≤n≤32 ✅ |
+| BUG-5 | /api/upload 双轨路由断裂 | upsert 仍 import 已删除的 `_v4_extract_text_universal` 等旧函数（Stage 1 遗留#1）→ 上传必 500 | 按扩展名路由 `.md`→`load_jaka_mineru_dual` / `.pdf`→`load_single_sdk_pdf` + metadata 清洗 | OpenC3 PDF 增量摄入 success ✅ |
+| BUG-6 | KV 注入路径悬空 | kv_extractor.py 曾合并入统一模块后删除，4 处懒加载 try/except 吞掉 ImportError（Stage 1 遗留#2）→ 确定性数值注入静默失效 | 重建 `src/kv_extractor.py`，恢复 4 注入点 | lookup_attribute 6502/9600 双命中；run_graph 端到端回答含 6502 ✅ |
+
+#### 3. 端到端验证结论 (2026-08-22)
+
+| 验证项 | 命令 | 结果 |
+|--------|------|------|
+| Stage 1 离线验收 | `python tests/test_stage1.py` | ✅ **18/18 通过**（SDK 专轨 9 / JAKA 专轨 6 / KV 校准 1 / 统一入口 2）|
+| 向量库白盒质检 | `python tests/audit_ingestion.py` | ⚠️ 未通过：规则 3b/4a/4b 口径与 Stage 1 脱节（6502 走 KV 侧信道而非切片、`[OCR补漏:]` 标记被 VLM 注入替代、Parent `[章节大纲参考]` 注入 0/12）|
+| 回归评测 | `python tests/run_eval.py --verbose` | ⚠️ **71.4% (25/35)，10 用例失败**（8 项硬断言逐例执行）|
+| KV 注入单测 (test.ipynb) | `lookup_attribute` | ✅ "JAKA Modbus 端口" / "默认波特率" 双命中（含 6502/9600）|
+| 增量 upsert (test.ipynb) | `upsert_product_documents(OpenC3)` | ✅ `{'status': 'success', 1P, 27C}` |
+| 全量重建 (test.ipynb) | `load_all_documents_v4_dual` + `create_dual_collections` | ✅ 11P+284C（当时；TOC 修复后重解析预期 12P+284C，OpenR6 31）|
+| 三产品线 run_graph (test.ipynb) | JAKA 功能IO 表格 / OpenR6 set_move_line / KV 端口 | ✅ 出处声明 + Markdown 表格 + SDK 代码 + 6502 全部命中 |
+
+**run_eval 10 例失败归因**（详见 ARCHITECTURE_AUDIT）:
+- **数字参数 3 例 (GT-1 / GT-6 / E05)**: KV 注入粒度缺陷——产品级键命中时整体倾倒含噪声的整字典（"端口号: 填写端口号"与"Modbus TCP 端口号: 6502"同时注入），模型受噪声干扰。修复方向: `lookup_attribute` 对 value 为 dict 时做键级匹配，仅返回与 query 相关的具体键值对。
+- **拒答类 3 例 (E09 / E21 / E25)**: 模板守卫/逃生舱未按预期触发，待逐案复核（当前库 OpenR6 TOC 噪声 + ROS General 噪声块污染检索可能相关）。
+- **召回/合成类 4 例 (GT-4 / E13 / E22 / E26)**: E26 根因明确——Stage 1 JAKA 轨未迁移 `[章节大纲参考]` 微缩大纲注入（旧 L1 特性，audit 实测 0/12 Parent），宏观提权失去锚点；E13 "安全区域" 依赖 VLM 多模态注入，当前 `data/jaka_manual_chunks.json` 缓存缺失且 :8005 离线（重建时 189 图全部快速失败被过滤）。
+
+#### 4. 审查新发现（已编号入 ARCHITECTURE_AUDIT，共 13 项）
+
+- 数据目录噪声: `data/ROS机器实践应用.pdf`（ROS 书籍）被统一入口误摄入为 `General` 产品线 1P+1C。
+- 增量 upsert 无旧切片级联删除（下标式 ID 收缩时尾部旧 ID 残留）。
+- `frontend_server.py` / `streamlit_app.py` 反向代理目标 7860 与 FastAPI 实际端口 8000 失配。
+- `start_services.sh` 无 `--vllm-only`/`--fastapi-only`/`--gpu` CLI 参数（早期文档记载有误，已修正）。
+- `_last_numeric_context_missing` 模块级全局并发债未销；`attribute_tool.py` 死代码（0 导入者）；BM25 corpus 类型不一致（build 存 Document / upsert 存 str）。
+
+#### 5. 下一步（写入 ARCHITECTURE_AUDIT 路线图）
+
+1. 移出 `data/ROS机器实践应用.pdf`；2. 全量重建（TOC 修复生效，重建前确保 :8005 在线或先生成 VLM 缓存）；3. `lookup_attribute` 键级匹配改造（6502 类 3 例根治）；4. JAKA 轨 `[章节大纲参考]` 迁移（E26）；5. `audit_ingestion.py` 规则 3b/4a/4b 口径适配；6. 增量 upsert 级联删除恢复。
+
+---
+
 > **日期**: 2026-08-21 | **版本**: Stage 1 结项 (v32 收口) | **类型**: 数据摄入、双轨切片与多模态提纯统一收口
 
 ### Stage 1 结项 — 统一双轨摄入管线 (pdf_loader.py 重构 + src/rebuild_v4.py 双轨建库)

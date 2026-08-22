@@ -3,7 +3,7 @@
 ## 1. 硬件与 GPU 管理（双 A100 智能自适应）
 
 - **算力底座**: 2 × NVIDIA A100-PCIE-40GB（CUDA 12.4）。
-- **GPU 自适应**: 禁止硬编码 `CUDA_VISIBLE_DEVICES`。`start_services.sh` + `src/config.py` 内置 `nvidia-smi` 扫描，自动选择空闲显存最大的 GPU（过滤 <5GB）。手动覆盖：`--gpu <id>` / `VLLM_GPU_ID`。
+- **GPU 自适应**: 禁止硬编码 `CUDA_VISIBLE_DEVICES`。`start_services.sh` + `src/config.py` 内置 `nvidia-smi` 扫描，自动选择空闲显存最大的 GPU（过滤 <5GB）。手动覆盖：**仅** `VLLM_GPU_ID` 环境变量（🔴 Stage 2-4 审查实测：`start_services.sh` 无 `--gpu`/`--vllm-only`/`--fastapi-only` CLI 参数，早期文档记载有误，禁止再写入）。
 - **默认**: GPU 1（:8001）→ vLLM Qwen2.5-7B-Instruct-AWQ (4-bit ~8GB)；GPU 0 → ChromaDB/嵌入。
 - **降级**: 空闲<5GB → 自动降级 1.5B。
 
@@ -140,6 +140,29 @@
 - **Vector Store 注入**: 通过 `set_graph_vector_store()` 统一注入，禁止节点内直接 import ChromaDB 客户端绕过
 - 🔴 **模板与后处理的边界 (v24)**: L3 模板负责**预防**格式错误，L4 后处理负责**兜底校验**。禁止在 L4 中为 L3 模板应预防的错误打补丁——发现格式错误应追溯到 L3 模板设计缺陷
 
+### 🔴 Stage 2/3/4 收口红线（2026-08-22 全量架构审查落盘）
+
+| 收口项 | 红线 |
+|--------|------|
+| **单例数据库连接规范** | ChromaDB 读写**统一走 LangChain `Chroma` 包装器**（`persist_directory=CHROMA_PERSIST_DIR`，禁止传自建 `client=`）。嵌入函数唯一入口 `get_embedding_function()`（模块级懒加载单例，HF bge-small-zh → ONNX 回退）。**仅有的两个写入口**: `create_dual_collections()`（全量重建）/ `upsert_product_documents()`（增量摄入） |
+| 🔴 **禁止原生 PersistentClient 混用** | 业务代码**禁止**直接 `chromadb.PersistentClient` 打开 `CHROMA_PERSIST_DIR`——原生客户端（自定义 `Settings`）与 LangChain 包装器（默认 Settings）并发打开同一目录 → ChromaDB Settings 冲突 / SQLite 文件锁冲突（实测建库写入失败）。**仅允许的只读例外**: `check_status.py` 健康检查、`app.py` `/api/debug/inspect_chunks` 调试接口、`vector_store.py` MD5 持久化（`_persist_md5_store`）。新增代码必须走 LangChain 包装器 |
+| 🔴 **空 ID 拦截** | 文档 ID 生成必须用 `or` 链兜底（`doc.metadata.get("chunk_id") or f"c_{product_id}_{i}"`）——`get(key, default)` 对空字符串 `""` 不触发默认值，空 ID 导致 ChromaDB `add` 写入异常。禁止用 Python 内置 `hash()` 生成 ID（进程重启盐值漂移，ID 不稳定） |
+| **BM25Okapi 增量索引** | 内存索引 `_bm25_indexes: {product_id: BM25Okapi}`；全量 `build_bm25_index()` / 增量 `bm25_upsert_product()`（corpus 扩展后整体重建重算 IDF）；进程重启由 `app.py` startup 调 `build_bm25_from_chromadb()` 恢复。⚠️ 已知债: build 路径 corpus 存 Document、upsert 路径存 str，`bm25_search` 返回类型随路径而异——禁止再引入第三种形态 |
+| 🔴 **KV 确定性属性侧信道** | `src/kv_extractor.py` `lookup_attribute(query, product_id)` 读取 `kv_db/attribute_kv.json`（两级嵌套 {产品: {键: 值}}）→ **4 个注入点**（`rag_chat`/`rag_chat_stream`/`llm_generation_node`/`run_graph_stream`，均在 `_build_messages` 之后、LLM 调用之前前置注入），触发条件 `_last_numeric_context_missing or _NUMERIC_QUERY_RE`（模块级常量 rag_chain.py:2280）。未命中 → BM25 第二机会 → 硬拒答。`attribute_tool.py` 为**死代码**（0 导入者），禁止接线 |
+| 🔴 **OpenR6 目录噪声剔除** | `_strip_openr6_toc()` 在 SDK 轨清洗后、状态机切分前执行（仅 `product_id=="OpenR6"` 或文件名含 openr6）。**分隔符正则必须为 `[☆★\*]{5,}`**——真实文档目录分隔线是 ☆ (U+2606) 非 ASCII `*`，纯 `[\*]` 实测剥离 0 字符。修复后实测: 剥离 465 字符、状态机块 119→61、切片 32→31（30 真实章节 + SDK 基础配置块） |
+| **upsert 双轨路由** | `upsert_product_documents(file_path, product_id)` 按扩展名路由: `.md` → `load_jaka_mineru_dual` / `.pdf` → `load_single_sdk_pdf(file_path, product_id=...)`。禁止恢复旧 `_v4_extract_text_universal` import（已删除，曾致 /api/upload 500）。⚠️ 已知债: 新 upsert 无旧切片级联删除（下标式 ID 收缩时尾部旧 ID 残留），产品切片数收缩后需全量重建 |
+| **数据目录纪律** | `data/` 下仅放产品文档；非产品 PDF（如 ROS 书籍）会被统一入口摄入为 `General` 产品线噪声切片（当前 DB 实测 1P+1C），入库前必须移出或配置产品映射 |
+
+### 🔴 模块调用边界（Stage 2-4 收口实测）
+
+| 模块 | 允许被调用方 | 边界 |
+|------|------------|------|
+| `pdf_loader.py` | `rebuild_v4.py` / `vector_store.upsert_product_documents` / `tests/` | 统一入口 `load_all_documents_v4_dual()`；单文件摄入用 `load_single_sdk_pdf(file_path, product_id=...)` / `load_jaka_mineru_dual()` |
+| `vector_store.py` | `app.py` / `rebuild_v4.py` / `rag_chain.py`（检索函数）/ `graph_rag.py`（`search_similar_with_threshold`）/ `tests/` | 写入口仅 `create_dual_collections` + `upsert_product_documents`；读入口 `load_vector_store` / `search_similar_with_threshold` / `bm25_search` / `get_registered_products` |
+| `kv_extractor.py` | `rag_chain.py`（2 处）/ `graph_rag.py`（2 处） | 唯一入口 `lookup_attribute`；`attribute_tool.py` 禁止接线（死代码） |
+| `rag_chain.py` | `app.py`（经 `run_graph`/`run_graph_stream`）/ `tests/` | `rag_chat`/`rag_chat_stream` 为废弃 fallback |
+| `graph_rag.py` | `app.py` / `tests/` | `set_graph_vector_store()` 统一注入，禁止节点内绕过 |
+
 ---
 
 ## 2. 核心依赖红线（严禁升级）
@@ -153,7 +176,9 @@ Conda `rag_agent` (Python 3.10)。**严禁 `pip install --upgrade`**：
 - **框架**: LangChain、LangGraph、ChromaDB。**LLM**: vLLM Qwen2.5-7B-Instruct-AWQ @ :8001；云端降级 glm-4.7-flash。
 - **嵌入**: BAAI/bge-small-zh-v1.5 (512维) → ONNX 自动回退。
 - **UI 命名**: **比邻星 (ProximaRAG)**。
-- **测试红线**: 修改 `rag_chain.py`/`graph_rag.py` 后必须运行 `python tests/run_eval.py --verbose`，8 项硬断言全部通过方为合格。
+- **测试红线**: 修改 `rag_chain.py`/`graph_rag.py` 后必须运行 `python tests/run_eval.py --verbose`，8 项硬断言（①JSON泄露 ②段落重复 ③界面套话 ④函数签名错误 ⑤提示词泄露 ⑥API幻觉 ⑦零脑补 ⑧代码截断）全部通过方为合格。
+- **Stage 1 摄入验收**: 修改 `pdf_loader.py` 后必须运行 `python tests/test_stage1.py`（18 断言 / 4 测试组：SDK 专轨 9 + JAKA 专轨 6 + KV 校准 1 + 统一入口 2），退出码 0 为合格。
+- **向量库白盒质检**: 摄入/建库后运行 `python tests/audit_ingestion.py`（4 规则：零切片 / 垃圾切片 / 高压实体存活 / 架构标记注入）。⚠️ 当前规则 3b/4a/4b 断言口径与 Stage 1 脱节（6502 走 KV 侧信道而非切片、`[OCR补漏:]` 标记被 VLM 注入替代、Parent `[章节大纲参考]` 注入 0/12）——该三项待口径适配，判定以 test_stage1.py + run_eval.py 为准。
 
 ## 4. 安全开发红线
 
@@ -305,9 +330,9 @@ Conda `rag_agent` (Python 3.10)。**严禁 `pip install --upgrade`**：
 # 🚀 本地服务启动
 
 ```bash
-./start_services.sh                    # 一键启动 (GPU 智能检测 → vLLM → FastAPI)
-./start_services.sh --vllm-only        # 仅 vLLM
-./start_services.sh --fastapi-only     # 仅 FastAPI
+./start_services.sh                    # 一键启动 (GPU 智能检测 → vLLM :8001 → FastAPI :8000)
+VLLM_GPU_ID=0 ./start_services.sh      # 手动指定 GPU (环境变量覆盖)
+# 🔴 Stage 2-4 审查实测: start_services.sh 无 --vllm-only/--fastapi-only/--gpu CLI 参数
 ```
 
 **手动**:
@@ -329,13 +354,15 @@ python app.py   # → http://localhost:8000 (比邻星 ProximaRAG) · API: /docs
 |------|------|
 | `src/config.py` | 全局配置 — 双通道 LLM、GPU 探测、ChromaDB 路径、嵌入模型、检索参数 |
 | `src/pdf_loader.py` | 🔴 Stage 1: 统一数据摄入与切片 (~660 行) — SDK 专轨 fitz 状态机原子切片 + JAKA 专轨 MinerU/Qwen2-VL 多模态提纯 + KV 属性库 + 统一入口 `load_all_documents_v4_dual()` |
-| `src/vector_store.py` | 向量知识库 — bge-small-zh-v1.5 + ONNX 回退、BM25 混合检索、增量 Upsert |
+| `src/vector_store.py` | 🔴 Stage 2: 向量知识库 — LangChain Chroma 单例规范 (Parent-Child 双集合) + BM25Okapi 增量分词索引 + bge-small-zh-v1.5 + ONNX 回退 |
+| `src/kv_extractor.py` | 🔴 Stage 3: 轻量 KV 属性事实检索 — `lookup_attribute()` 确定性侧信道注入 (替代已失效的 attribute_tool 接线) |
 | `src/rag_chain.py` | 🔴 RAG 核心管线 (~3,242 行, v25 计划拆分为 6 子模块) — 四层容灾、混合检索、HyDE、🔴 v24: Markdown 模板约束 + 极速流式穿透 |
-| `src/graph_rag.py` | 🔴 LangGraph 状态图引擎 (~1,926 行, v25 计划拆分为 4 子模块) — 9 节点 + 条件边 + SDK 自纠错 + 硬熔断 + 🔴 v24: render_node 退化 + 流式双重输出 Bug 修复 |
+| `src/graph_rag.py` | 🔴 LangGraph 状态图引擎 (~1,926 行, v25 计划拆分为 4 子模块) — 11 节点 + 条件边 + SDK 自纠错 + 硬熔断 + 🔴 v24: render_node 退化 + 流式双重输出 Bug 修复 |
 | `src/agent_state.py` | RAGState TypedDict (21 字段) |
-| `src/attribute_tool.py` | 动态属性意图 — LLM 提取→BM25→正则 KV |
-| `app.py` | FastAPI (:8000) — /api/chat, /api/upload, /api/status, /api/products |
-| `frontend_server.py` | 前端 UI (:8501) — Jinja2 + /api/* 反向代理 |
+| `src/attribute_tool.py` | ⚠️ 死代码 (0 导入者, Stage 3 审查确认) — 动态属性意图 LLM 提取→BM25→正则 KV，已被 `kv_extractor.lookup_attribute` 替代，禁止重新接线 |
+| `app.py` | FastAPI (:8000) — /api/chat, /api/upload, /api/status, /api/products；startup 加载向量库 + `build_bm25_from_chromadb` 恢复 BM25 + `set_graph_vector_store` 注入 |
+| `frontend_server.py` | 前端 UI (:8501) — Jinja2 + /api/* 反向代理；⚠️ Stage 2-4 审查发现: 代理目标 `API_BACKEND=localhost:7860` 与 FastAPI 实际端口 8000 失配，前端 API 链路待修 |
+| `tunnel.py` | 🔴 ngrok 内网穿透 — pyngrok，`python tunnel.py --token X --port 8000`（或 `NGROK_AUTHTOKEN` 环境变量，默认端口 8000） |
 | `src/rebuild_v4.py` | 🔴 Stage 1: 双轨建库脚本 — 物理清库 → `load_all_documents_v4_dual` → ChromaDB 双 Collection → 质检统计；运行 `python src/rebuild_v4.py` 或 `python -m src.rebuild_v4` |
 | `check_status.py` | 健康检查 — vLLM + FastAPI + GPU |
 | `start_services.sh` | 一键启动 — GPU 智能选择 + 就绪轮询 + 优雅退出 |
@@ -350,6 +377,7 @@ python app.py   # → http://localhost:8000 (比邻星 ProximaRAG) · API: /docs
 | `_v4_parse_sdk_state_machine()` | pdf_loader.py | 🔴 Stage 1: SDK 轨状态机 API 块解析器 — `_SDK_CHAPTER_BOUNDARY_RE` 严格章节正则切分（仅行首 1-2 位编号+中英文跟随），preamble → "SDK 基础配置" |
 | `_extract_text_with_fitz()` | pdf_loader.py | 🔴 Stage 1: PyMuPDF `get_text("text", sort=True)` 物理坐标流排序提取 — 废弃 pypdf，根除表格/代码块断层与跨节漂移 |
 | `_clean_sdk_pdf_text()` | pdf_loader.py | 🔴 Stage 1: SDK 文本清洗 — 表格纵向断字修复（`函数名\n称`→`函数名称`）+ 下划线/API 断行拼接 + I/O 归一化 |
+| `_strip_openr6_toc()` | pdf_loader.py | 🔴 Stage 2-4: OpenR6 目录噪声剔除 — 剥离文档开头 1~29 项目录块；分隔符正则 `[☆★\*]{5,}`（☆ U+2606 为真实分隔线，纯 `[\*]` 实测剥离 0 字符）；修复后实测剥离 465 字符 → 32→31 切片（30 真实章节） |
 | `_v4_extract_function_names()` | pdf_loader.py | 🔴 Stage 1: 三模式函数名提取 + `_CTYPES_BLACKLIST` 黑名单（c_float/c_int/restype/byref…零 CTypes 污染） |
 | （v23–v30.final 归档） | pdf_loader.py | `_v4_extract_headings`/`_sanitize_section_title`/`_v4_extract_sdk_toc`/`_is_skeleton_chunk`/`_clean_pdf_text`/`_v4_build_parent_child_docs`/`_v4_build_child_docs_v2` 已随 Stage 1 重构移除（见 L1 历史归档表） |
 | `_hybrid_retrieve()` | rag_chain.py | BM25+向量 RRF 混合检索 + 🔴 v23: 六大提权引擎 |
@@ -364,6 +392,9 @@ python app.py   # → http://localhost:8000 (比邻星 ProximaRAG) · API: /docs
 | `extract_align_node()` | graph_rag.py | 🔴 v24: 简化版属性对齐校验 + SemanticDedup + 静默斩尾（移除屠魔版正则）+ 🔴 v25: 无条件精确段落去重 + 代码块跳过模糊去重 + `_fix_and_close_sdk_code` 入口接入 |
 | `run_graph_stream()` | graph_rag.py | 🔴 v24: 流式图执行 + SDK 自纠错回路 + 双重输出 Bug 修复 |
 | `_tokenize_for_bm25()` | vector_store.py | BM25 分词器 — jieba + 标识符保护 + CODE 标签三倍写入 + 🔴 v26: 复合词原子化（`_COMPOUND_RE` 排除 `.`）与空格归一化（`_SPACE_SEP_RE`） |
+| `create_dual_collections()` | vector_store.py | 🔴 Stage 2: Parent-Child 双集合建/重建 — 统一 LangChain `Chroma` 包装器（`persist_directory`，禁止原生 `PersistentClient` 混用）+ 空 ID `or` 链拦截 + 写入后同步 `build_bm25_index` |
+| `upsert_product_documents()` | vector_store.py | 🔴 Stage 2: 增量摄入 — `file_path`+`product_id` 显式参数 → 按扩展名双轨路由（`.md`→JAKA 轨 / `.pdf`→SDK 轨）→ metadata 清洗 → 双集合增量写入 + BM25 增量同步 |
+| `build_bm25_index()` / `build_bm25_from_chromadb()` | vector_store.py | 🔴 Stage 2: BM25Okapi 内存索引全量构建（按 product_id 分组）/ 进程重启恢复（`app.py` startup 调用，从 ChromaDB 全量拉取重建） |
 | （v29–v30.final OCR 归档） | pdf_loader.py | `_ocr_kv_normalize_row`/`_ocr_merge_cross_line`/`_emit_ocr_child`/`_v4_extract_text_universal`/AST-Lite 软装箱 已随 Stage 1 移除 — JAKA 参数提纯由 Qwen2-VL 多模态管线替代 |
 | `_strip_code_from_context()` | rag_chain.py | 🔴 v28: 通用代码脱敏 — ``` 代码块 → `[代码内容省略]`、DLL 加载行 → `[DLL加载代码省略]`（仅守卫命中路径） |
 | `_resolve_product_from_history()` | rag_chain.py | 🔴 v27: 多轮产品解析第三兜底 — PRODUCT_ROUTER_RULES 扫最近 6 条历史锁定产品 |
@@ -373,6 +404,7 @@ python app.py   # → http://localhost:8000 (比邻星 ProximaRAG) · API: /docs
 | `load_jaka_mineru_dual()` | pdf_loader.py | 🔴 Stage 1/v32: JAKA 专轨切片器 — 提纯缓存优先 (`data/jaka_manual_chunks.json`) + 章节面包屑栈 + 1500ch 软装箱 + TOC 点线过滤 |
 | `load_single_sdk_pdf()` | pdf_loader.py | 🔴 Stage 1: SDK 专轨入口 — fitz sort=True 提取 → 清洗 → 章节原子切片 + SDK Header 注入 |
 | `export_kv_attributes()` / `load_all_documents_v4_dual()` | pdf_loader.py | 🔴 Stage 1: KV 属性库自动生成 (`kv_db/attribute_kv.json` + 人工校准覆盖) / 统一摄入入口（JAKA 轨 + SDK 轨 + KV 导出） |
+| `lookup_attribute()` | kv_extractor.py | 🔴 Stage 3: KV 确定性属性侧信道 — 读取 `kv_db/attribute_kv.json`（两级嵌套，缓存单例）→ 4 注入点（rag_chat/rag_chat_stream/llm_generation_node/run_graph_stream，均 `_build_messages` 后、LLM 前前置注入）；触发 `_last_numeric_context_missing or _NUMERIC_QUERY_RE` |
 
 ### 🔴 PDF 切片规则 (Stage 1 / v32 收口)
 
@@ -417,12 +449,14 @@ EMBEDDING_MODEL_NAME = "BAAI/bge-small-zh-v1.5"  # 512维, HF→ONNX 回退
 ### 运维命令
 
 ```bash
-./start_services.sh              # 一键启动
+./start_services.sh              # 一键启动 (GPU 智能检测 → vLLM → FastAPI)
 pkill -f "app.py"; pkill -f "vllm"  # 一键停止
 python check_status.py           # 健康检查 (vLLM 1-token 微探针)
-python tests/run_eval.py --verbose  # 回归评测 (8 硬断言)
-python tests/test_stage1.py      # 🔴 Stage 1: 数据摄入/双轨切片离线冒烟测试
+python tests/run_eval.py --verbose  # 回归评测 (35 用例 / 8 硬断言)
+python tests/test_stage1.py      # 🔴 Stage 1: 数据摄入/双轨切片离线冒烟测试 (18 断言)
+python tests/audit_ingestion.py  # 🔴 Stage 2: 向量库白盒质检 (4 规则; 规则 3b/4a/4b 口径待适配)
 python src/rebuild_v4.py         # 🔴 Stage 1: 双轨全量建库 (或 python -m src.rebuild_v4)
 python src/parse_jaka_mineru.py  # v31: JAKA 手册 MinerU 离线解析
-# ⚠️ audit_chunks.py 依赖旧 pdf_loader 入口，Stage 1 待适配
+python tunnel.py                 # ngrok 内网穿透 (--token X / NGROK_AUTHTOKEN, 默认 :8000)
+# ⚠️ audit_chunks.py 依赖旧 pdf_loader 入口，Stage 1 待适配 (以 tests/audit_ingestion.py 为准)
 ```

@@ -3,6 +3,8 @@
 基于 **RAG（Retrieval-Augmented Generation）** 架构的官方技术文档与使用手册智能问答系统。专为**湖南比邻星科技有限公司**的开发者与用户打造，采用双 A100 GPU 算力底座，底层搭载 **vLLM + Qwen2.5-7B-Instruct-AWQ** 实现完全私有化、低延迟的本地推理。
 > **🔴 Stage 1 结项 — 数据摄入统一收口 (2026-08-21)**: **SDK 专轨 PyMuPDF 状态机重构**（废弃 pypdf，`sort=True` 版面排序，OpenC3 27 / OpenR6 30 章节原子切片，Ctypes 零污染）+ **JAKA 专轨 MinerU × Qwen2-VL (:8005) 多模态提纯**（三重图片防线筛出 189 张截图，IP / Modbus 6502 / 波特率 9600 参数文本化，226+ 切片，KV 属性库自动生成）+ 统一建库入口 `python src/rebuild_v4.py` 与离线验收 `python tests/test_stage1.py`。
 
+> **🔴 Stage 2-4 收口 (2026-08-22)**: **ChromaDB LangChain 单例规范**（Parent-Child 双集合写入统一走 LangChain `Chroma` 包装器，根除原生 `PersistentClient` 混用引发的 Settings/文件锁冲突）+ **BM25Okapi 增量分词索引**（建库全量构建 + upsert 增量重建 IDF + 启动时从 ChromaDB 恢复）+ **KV 确定性属性侧信道**（`kv_extractor.lookup_attribute()` 读取 `kv_db/attribute_kv.json`，4 注入点前置注入，6502/9600 端到端实测命中）+ **OpenR6 目录噪声剔除**（`_strip_openr6_toc()`，分隔线 ☆ 正则修复，切片 32→31）+ 空 ID 拦截与显式参数修复。详见 [ARCHITECTURE_AUDIT.md](./ARCHITECTURE_AUDIT.md)。
+
 > **🔴 v24 架构升级 (2026-08-04)**: 全面转向 **Markdown 模板强约束 (Template Masking) + 极速流式穿透** 架构。废弃了此前的 JSON 提取+正则清洗后处理管线，System Prompt 从 210 行压缩至 ~15 行（Token 节省 83%），TTFB 从 60-90s 降至 <2s。
 
 > **🔴 v25 回归攻坚 (2026-08-05)**: 代码围栏闭合状态机（`_stream_guardrail` 透传+奇偶计数自动补 ```` ``` ````）+ 双轨模板【逃生舱条款】（拒答交由 LLM 自主判定，零业务正则）+ JAKA/gui_app 数字保护特判（≥3 位参数保全）+ KV 属性注入放宽（E05/E07 确定性数值）+ SemanticDedup 无条件精确段落去重。
@@ -92,6 +94,7 @@
 | 🔴 KV 属性库 | `export_kv_attributes()` 摄入后自动生成 `kv_db/attribute_kv.json` + 人工校准强制覆盖 (6502/9600) |
 | 🔴 统一入口 | `load_all_documents_v4_dual()` = JAKA 轨 + SDK 轨 + KV 导出；`src/rebuild_v4.py` 全量重建对接点 |
 | 切片规格 | SDK 章节原子 270~890 字符 (均值 414/540)；JAKA Child 均值 ~480、p90 ~1090、保护块超标至 ~2600 |
+| 🔴 OpenR6 目录噪声剔除 | `_strip_openr6_toc()` 剥离文档开头 1~29 项目录文本块 + 星号分隔线（仅 OpenR6 轨）；分隔线为 ☆ (U+2606)——修复前纯 `[\*]` 正则剥离 0 字符，修复后剥离 465 字符、切片 32→31（30 真实章节） |
 | 历史归档 | v23–v30.final 自研 L1 管线（OCR 归位/软装箱/标题状态机等）随 Stage 1 归档移除，详见 CLAUDE.md 归档表 |
 
 ### L2 — 检索与重排层 (rag_chain.py + vector_store.py)
@@ -100,7 +103,8 @@
 
 | 能力 | 说明 |
 |------|------|
-| 向量检索 | ChromaDB cosine (bge-small-zh-v1.5, 512维) — 候选池放大 fetch_factor=5×, SDK 查询 8× |
+| 向量检索 | ChromaDB cosine (bge-small-zh-v1.5, 512维) — 🔴 Stage 2: LangChain `Chroma` 包装器单例规范（禁止原生 `PersistentClient` 混用同一 persist 目录）+ Parent-Child 双集合；候选池放大 fetch_factor=5×, SDK 查询 8× |
+| 🔴 BM25Okapi 增量索引 | 内存索引按 product_id 分组 (`_bm25_indexes`)；建库全量构建 + `bm25_upsert_product` 增量重建 IDF + FastAPI startup `build_bm25_from_chromadb` 恢复 |
 | BM25 检索 | jieba + 标识符保护 — snake_case 函数名不被切碎; v26: 复合词原子化（`Ethernet/IP`→整体 token，排除 `.`）+ 分隔符空格归一化（双侧对称）; v27: 短文本(≤8字)/复合词查询 BM25 权重动态 3.0 |
 | RRF 六大提权引擎 | Entity Anchor (+5.0) / Function Names (+0.08) / Text Rebalance (+0.03) / CODE BM25 三倍写入 / Title Exact Match (+5.0) / Chapter Isolation (+20.0/-10.0) |
 | Autocut 动态截断 | `_autocut_knee()` 断崖检测 — 找 RRF 分数相邻差值最大点; SDK 场景 min_k=10 |
@@ -134,6 +138,7 @@
 | Context Cap | 非SDK 4000 / SDK 8000 字符整块剔除 — Parent 背景优先丢弃 |
 | 历史净化 | `sanitize_chat_history()` 5 步清洗 — Citation 剥离/代码块替换/拒答过滤/尾部套话擦除 |
 | 柔性 Grounding | `_NUMERIC_QUERY_RE` 动态检测 — Context 无数值 → 追加诚实提示 |
+| 🔴 Stage 3: KV 确定性侧信道 | `kv_extractor.lookup_attribute(query, product_id)` 读 `kv_db/attribute_kv.json`（两级嵌套 + 人工校准 6502/9600）→ 4 注入点（run_graph / run_graph_stream / rag_chat / rag_chat_stream，均在 `_build_messages` 后、LLM 前）前置注入；触发 `_last_numeric_context_missing or _NUMERIC_QUERY_RE`；未命中 → BM25 第二机会 → 硬拒答 |
 
 ### L4 — 生成控制与后处理层 (graph_rag.py 后处理节点 + rag_chain.py LLM 调用)
 
@@ -151,6 +156,19 @@
 | 代码块闭合 | `_fix_and_close_sdk_code()` 过渡期兜底 — Markdown ``` 自动闭合 + CDLL 补全 + 函数名修正表; v25: 接入 extract_align_node 覆盖 Graph 全路径 |
 | SemanticDedup | trigram overlap > 0.55 截断 — v25: 无条件精确段落去重 (连续相同 ≥80ch) + 代码块跳过模糊去重 |
 | Temperature | 非流式 0.2 / 流式 0.01 — 代码生成近确定性输出 |
+
+---
+
+## 📦 支持产品线
+
+| 产品线 | 文档源 | 解析专轨 | 当前库量 (2026-08-22 实测) |
+|--------|--------|---------|---------------------------|
+| **JAKA 六轴机器人** | `data/JAKA_Manual.pdf` → MinerU Markdown (`data/jaka_markdown/`) | 🔴 JAKA 专轨: MinerU + Qwen2-VL 多模态提纯 + HTML 表格规整 + 1500ch 软装箱 | Parent 9 / Child 225 |
+| **OpenC3 六轴机械臂** | `data/OpenC3六轴机械臂SDK说明文档_win.pdf` | 🔴 SDK 专轨: fitz `sort=True` 物理坐标流 + 章节状态机原子切片 | Parent 1 / Child 27 |
+| **OpenR6 六轴机械臂** | `data/windows系统OpenR6_sdk使用文档.pdf` | 🔴 SDK 专轨 + OpenR6 目录噪声剔除 (`_strip_openr6_toc`) | Parent 1 / Child 32* |
+| ⚠️ General（噪声） | `data/ROS机器实践应用.pdf`（ROS 书籍，非产品文档） | 统一入口扫描误摄入 | Parent 1 / Child 1 |
+
+\* OpenR6 当前库中 32 切片含 2 个目录页 TOC 噪声块；`_strip_openr6_toc` 修复后重解析实测 31 切片（30 真实章节 + SDK 基础配置前置块），**需全量重建后入库生效**。ROS 书籍 PDF 属数据目录噪声，建议移出 `data/` 或配置产品映射。
 
 ---
 
@@ -192,7 +210,7 @@ python src/parse_jaka_mineru.py     # 权重检查 → magic-pdf.json 生成 →
 | **云端降级** | 智谱 GLM-4.7-Flash (`open.bigmodel.cn`) |
 | **嵌入模型** | `BAAI/bge-small-zh-v1.5` (512 维，中文专优) → ONNX 自动回退 |
 | **Web 框架** | FastAPI (`8000`) + Jinja2 + 前端 UI (`8501`) |
-| **当前向量库 (Stage 1 实测)** | 11 Parent + 284 Child（OpenC3 27 + OpenR6 32* + JAKA 225；\*含 2 个待过滤 TOC 噪声块；VLM 注入后 JAKA 226+） |
+| **当前向量库 (2026-08-22 实测)** | 12 Parent + 285 Child（JAKA 9/225 · OpenC3 1/27 · OpenR6 1/32* · General 1/1）——\*OpenR6 含 2 个目录页 TOC 噪声块，`_strip_openr6_toc` 修复后全量重建预期 12P+284C（OpenR6 31）；General 来自 `ROS机器实践应用.pdf` 误摄入，建议移出 `data/` |
 
 ### 关键配置参数
 
@@ -225,19 +243,23 @@ python src/parse_jaka_mineru.py     # 权重检查 → magic-pdf.json 生成 →
 
 将 PDF 文档放入 **`data/`** 目录。
 
-### 2. 一键启动（推荐）
+### 2. 一键部署与 Web 启动（start_services.sh / app.py）
 
 ```bash
 chmod +x start_services.sh
 
-./start_services.sh                    # 完整启动 (GPU 智能检测 → vLLM → FastAPI)
-./start_services.sh --vllm-only        # 仅 vLLM
-./start_services.sh --fastapi-only     # 仅 FastAPI
-./start_services.sh --gpu 0            # 手动指定 GPU
+./start_services.sh                    # 一键部署 (GPU 智能检测 → vLLM :8001 → FastAPI :8000)
+VLLM_GPU_ID=0 ./start_services.sh      # 手动指定 GPU (环境变量覆盖)
+
+python app.py                          # 仅启动 Web 后端 FastAPI (:8000)
+python frontend_server.py              # 前端 UI (:8501)
+
 # Stage 1 双轨建库与验收 (v32 收口)
 python src/rebuild_v4.py           # 双轨切片 + VLM 提纯 + ChromaDB 全量重建
 python tests/test_stage1.py        # Stage 1 离线验收测试 (切片/表格/KV 断言)
 ```
+
+> 🔴 注 (2026-08-22 审查实测): `start_services.sh` **无** `--vllm-only`/`--fastapi-only`/`--gpu` CLI 参数（早期文档记载有误），GPU 覆盖仅支持 `VLLM_GPU_ID` 环境变量；项目根目录**无 run.sh**，唯一一键脚本为 `start_services.sh`。
 
 ### 3. 手动启动
 
@@ -273,7 +295,7 @@ python frontend_server.py
 conda run -n rag_agent python src/rebuild_v4.py
 # 或: python -m src.rebuild_v4
 
-# 增量上传 (MD5 去重 + 级联清理) — ⚠️ 待 Stage 1 收尾适配统一入口
+# 增量摄入 (按扩展名双轨路由: .pdf → SDK 专轨 / .md → JAKA 专轨)
 curl -X POST -F "file=@your_document.pdf" http://localhost:8000/api/upload
 ```
 
@@ -290,21 +312,37 @@ pkill -f "vllm.entrypoints"      # vLLM
 ```bash
 python check_status.py                # 一次性完整报告
 python check_status.py --watch 10     # 每 10 秒刷新
-python audit_chunks.py                # 切片健康度审计
+python tests/audit_ingestion.py       # 向量库白盒质检 (4 规则)
 ```
+
+### 7. ngrok 内网穿透（tunnel.py）
+
+基于 pyngrok 的公网映射脚本，将本地 FastAPI 后端暴露到外网：
+
+```bash
+python tunnel.py                          # 匿名模式 (有速率限制), 默认映射 http://localhost:8000
+python tunnel.py --token <NGROK_TOKEN>    # 官方 token (推荐)
+export NGROK_AUTHTOKEN=<NGROK_TOKEN> && python tunnel.py   # 环境变量方式
+python tunnel.py --port 8501              # 映射其它端口 (如前端 UI)
+```
+
+- 默认目标: `http://localhost:8000`（FastAPI 后端）；前端 UI 需 `--port 8501`。
+- 隧道建立后脚本保持运行，`Ctrl+C` 断开；免费版 URL 每次重启变化，需重新获取。
+- 传统端口映射对照（内网 → 外网）：FastAPI `8000` → `50003`；前端 UI `8501` → `50004`；vLLM `8001` 仅内网。
 
 ---
 
 ## 🧪 自动化测试
 
-**统一评测入口**: `python tests/run_eval.py --verbose`（33 用例，8 硬断言）
+**统一评测入口**: `python tests/run_eval.py --verbose`（35 用例 × 8 硬断言）
 
 | 脚本 | 覆盖范围 | 命令 |
 |------|---------|------|
-| `tests/run_eval.py` | 33 用例 (GT + SDK 函数 + 安全注入 + 多轮指代 + 错别字容错 + v23: 微观防泛化/短文本召回/特殊符号) | `python tests/run_eval.py --verbose` |
-| `tests/test_stage1.py` | 🔴 Stage 1 离线验收 (SDK 章节数 / Ctypes 零污染 / JAKA 表格零残留 / KV 校准 / 统一入口) | `python tests/test_stage1.py` |
-| `test_stability.py` | ⚠️ 多轮对话 + 并发保护 (Stage 1 后待适配旧 pdf_loader 入口) | — |
-| `audit_chunks.py` | ⚠️ 切片 8 维健康度审计 (Stage 1 后待适配旧入口) | — |
+| `tests/run_eval.py` | 35 用例 (GT-1~6 + E01~E29) × 8 硬断言 (①JSON泄露 ②段落重复 ③界面套话 ④函数签名 ⑤提示词泄露 ⑥API幻觉 ⑦零脑补 ⑧代码截断)；`--quick` 仅检索不调 LLM、`-f <用例ID>` 过滤 | `python tests/run_eval.py --verbose` |
+| `tests/test_stage1.py` | 🔴 Stage 1 离线验收 — 18 断言 / 4 组 (SDK 章节数+Ctypes 零污染 / JAKA 表格零残留+附录四 / KV 校准 6502·9600 / 统一入口三产品线) | `python tests/test_stage1.py` |
+| `tests/audit_ingestion.py` | 🔴 Stage 2 向量库白盒质检 — 4 规则 (零切片 / 垃圾切片 / 高压实体存活 / 架构标记注入)；⚠️ 规则 3b/4a/4b 口径待适配 Stage 1 (6502 走 KV 侧信道等) | `python tests/audit_ingestion.py` |
+| `tests/test_stability.py` | ⚠️ 多轮对话 + 并发保护 (依赖旧 rag_chat 入口, 待适配) | — |
+| `audit_chunks.py` | ⚠️ 切片 8 维健康度审计 (依赖旧 pdf_loader 入口, 已被 `tests/audit_ingestion.py` 取代) | — |
 
 ---
 
@@ -314,7 +352,7 @@ python audit_chunks.py                # 切片健康度审计
 |------|------|------|
 | `GET` | `/` | 渲染 比邻星 (ProximaRAG) 主页面 |
 | `POST` | `/api/chat` | RAG 对话 (SSE 流式)。`query`(必填) / `history`(JSON可选) / `stream`(默认true) / `product_id`(可选) |
-| `POST` | `/api/upload` | 上传 PDF 并增量更新向量库 (MD5 去重 + 级联清理) |
+| `POST` | `/api/upload` | 上传 PDF/MD 并增量更新向量库 (按扩展名双轨路由至 Stage 1 解析引擎) |
 | `GET` | `/api/status` | 向量库就绪状态与文档片段数 |
 | `GET` | `/api/products` | 已入库产品 ID 列表 |
 | `GET` | `/api/debug/inspect_chunks` | 切片检查器 (按产品/关键词过滤) |
@@ -332,7 +370,7 @@ python audit_chunks.py                # 切片健康度审计
 
 ## 📝 开发日志与架构审计
 
-- **[dev_log.md](./dev_log.md)**: 从 2026-07-20 至今共 34 章完整开发记录与架构决策（最新: Stage 1 结项 (v32 收口) — SDK 专轨 PyMuPDF 重构 + JAKA 多模态提纯 + 双轨统一建库）
-- **[ARCHITECTURE_AUDIT.md](./ARCHITECTURE_AUDIT.md)**: v24 全盘四层架构审计报告（含模板约束理论分析/代码结构体检/拆分方案/未来升级推演）
+- **[dev_log.md](./dev_log.md)**: 从 2026-07-20 至今完整开发记录与架构决策（最新: Stage 2-4 收口 — 向量库单例化 + BM25 增量 + KV 侧信道 + OpenR6 目录噪声剔除 + 端到端验证）
+- **[ARCHITECTURE_AUDIT.md](./ARCHITECTURE_AUDIT.md)**: 🔴 Stage 1→4 全量架构审查报告 (2026-08-22)（四层评分 / 六项 Bug 根因 / 13 项新识别架构债；历史 v24/v30 审计归档于附录）
 - **[CLAUDE.md](./CLAUDE.md)**: AI 协同开发规范（含 v24 四层架构排雷法思想钢印：System Prompt 极简/模板底端锚定/流式零缓冲/render_node 纯透传/L4 正则最小化；v25: 逃生舱条款/围栏闭合状态机/JAKA 数字保护特判；v26: OCR Y 归位/复合词原子化/重写器 always-on；v27: 路由责任切分/模板选择守卫/OCR 回退；v28: 区域状态机标题提取/line 级表格重建/last_header 层级栈；v29: OCR 键值法/Fast-Path 确定性拒答/数字守卫豁免/重写中立性；v30/v30.final: AST-Lite 软装箱/全景快照 OCR/孤儿行合并；v31: 数据摄入双轨制 — JAKA→MinerU / SDK→原管线；Stage 1: SDK 专轨 fitz 状态机 + JAKA VLM 提纯 + KV 属性库 + 统一入口）
 - **[tests/TEST_REPORT.md](./tests/TEST_REPORT.md)**: 评测报告归档

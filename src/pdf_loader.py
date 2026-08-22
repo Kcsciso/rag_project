@@ -444,6 +444,22 @@ def _clean_sdk_pdf_text(text: str) -> str:
     
     return cleaned
 
+def _strip_openr6_toc(text: str) -> str:
+    """
+    清洗 OpenR6 文档开头的 1~29 项纯目录文本块与星号分隔线。
+    保留介绍说明、关于运动指令消息返回值的全局定义块以及正文 API 章节。
+    """
+    # 匹配从 "比邻星六轴机器人Python接口文档" 或连续单行编号目录项，直到星号分隔线
+    # 🔴 实测: OpenR6 目录分隔线为 ☆ (U+2606) 非 ASCII *，必须同时纳入匹配
+    toc_pattern = re.compile(
+        r'(?:比邻星六轴机器人Python接口文档\s*)?'
+        r'(?:^[ \t]*\d{1,2}\s*[\.、][^\n]+\s*){10,}'
+        r'[☆★\*]{5,}\s*',
+        re.MULTILINE
+    )
+    cleaned = toc_pattern.sub('', text, count=1)
+    return cleaned
+
 def _extract_sdk_header(full_text: str) -> str:
     """提取 CDLL 加载与 POSE/Joint 结构体定义"""
     header_parts = []
@@ -514,15 +530,35 @@ def _v4_parse_sdk_state_machine(text: str) -> List[Tuple[int, int, str]]:
             blocks.append((s, e, titles[i]))
     return blocks
 
-def load_single_sdk_pdf(file_path: str) -> Tuple[List[Document], List[Document]]:
-    """统一 SDK PDF 加载与切片"""
+def load_single_sdk_pdf(
+    file_path: str,
+    product_id: Optional[str] = None,
+) -> Tuple[List[Document], List[Document]]:
+    """
+    单文件 SDK PDF 解析入口：支持物理坐标流解析与 API 状态机切片。
+
+    Args:
+        file_path: PDF 文件的绝对/相对路径
+        product_id: 可选的产品线 ID（如 "OpenC3", "OpenR6"），未传则根据文件名推断
+    """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"PDF 文件不存在: {file_path}")
+
     filename = os.path.basename(file_path)
-    product_id = _resolve_product_id_from_filename(filename)
+    if not product_id:
+        product_id = _resolve_product_id_from_filename(filename)
+
+    logger.info(f"📄 开始解析 SDK PDF: {filename} (product_id={product_id})")
     
-    # 🔴 关键改造：使用 PyMuPDF 版面排序提取
+    # 1. 提取与清洗文本
     full_text = _extract_text_with_fitz(file_path)
     full_text = _clean_sdk_pdf_text(full_text)
     
+    # 2. 🔴 OpenR6 专属性目录噪声剔除
+    if product_id == "OpenR6" or "openr6" in filename.lower():
+        full_text = _strip_openr6_toc(full_text)
+    
+    # 3. 提取全局 SDK 代码头与按章节状态机切分
     sdk_header = _extract_sdk_header(full_text)
     sdk_blocks = _v4_parse_sdk_state_machine(full_text)
     

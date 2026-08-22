@@ -943,80 +943,66 @@ def create_dual_collections(
     embedding_fn=None,
 ) -> Tuple[Chroma, Chroma]:
     """
-    创建 Parent-Child 双层 ChromaDB Collection（网络免疫版）。
-
-    流程: HF 手动嵌入 → ChromaDB 原生 collection.add(embeddings=...) 写入。
-    ChromaDB 收到预计算向量后不再触发任何嵌入逻辑，彻底绕开 ONNX 下载。
+    创建 Parent-Child 双层 ChromaDB Collection 并同步构建 BM25 索引。
+    统一使用 LangChain Chroma 包装器复用客户端连接，避免底层 Settings 冲突。
     """
-    import chromadb
-    from chromadb.config import Settings
-
     if embedding_fn is None:
-        embedding_fn = _create_embedding_function()
+        embedding_fn = get_embedding_function()
 
-    client = chromadb.PersistentClient(
-        path=persist_dir,
-        settings=Settings(anonymized_telemetry=False),
-    )
+    # 1. 清洗 Metadata，防止 None 导致主键生成异常
+    for d in parent_docs:
+        d.metadata = _sanitize_metadata(d.metadata)
+    for d in child_docs:
+        d.metadata = _sanitize_metadata(d.metadata)
 
-    # ── 删除旧 v4 Collection ──
-    for name in ["rag_v4_parent", "rag_v4_child"]:
-        try:
-            client.delete_collection(name)
-            logger.info(f"🗑️  已删除旧 Collection: {name}")
-        except Exception:
-            pass
-
-    # ── 手动批量嵌入（HF 本地模型，无 ONNX 下载）──
-    logger.info(f"🧮 计算 Parent 嵌入向量 ({len(parent_docs)} docs, batch=64)...")
-    parent_texts = [d.page_content for d in parent_docs]
-    parent_embeddings = _embed_batched(parent_texts, embedding_fn, batch_size=64)
-
-    logger.info(f"🧮 计算 Child 嵌入向量 ({len(child_docs)} docs, batch=64)...")
-    child_texts = [d.page_content for d in child_docs]
-    child_embeddings = _embed_batched(child_texts, embedding_fn, batch_size=64)
-
-    # ── 写入 Parent Collection（原生 API，传预计算向量）──
-    parent_coll = client.create_collection(
-        name="rag_v4_parent",
-        metadata={"hnsw:space": "cosine"},
-    )
-    parent_ids = [f"p_{d.metadata.get('product_id','?')}_{i}" for i, d in enumerate(parent_docs)]
-    parent_metadatas = [_sanitize_metadata(d.metadata) for d in parent_docs]
-    if parent_texts:
-        parent_coll.add(
-            ids=parent_ids,
-            documents=parent_texts,
-            embeddings=parent_embeddings,
-            metadatas=parent_metadatas,
-        )
-    logger.info(f"✅ v4 Parent Collection: {parent_coll.count()} chunks")
-
-    # ── 写入 Child Collection ──
-    child_coll = client.create_collection(
-        name="rag_v4_child",
-        metadata={"hnsw:space": "cosine"},
-    )
-    child_ids = [f"c_{d.metadata.get('product_id','?')}_{i}" for i, d in enumerate(child_docs)]
-    child_metadatas = [_sanitize_metadata(d.metadata) for d in child_docs]
-    if child_texts:
-        child_coll.add(
-            ids=child_ids,
-            documents=child_texts,
-            embeddings=child_embeddings,
-            metadatas=child_metadatas,
-        )
-    logger.info(f"✅ v4 Child Collection: {child_coll.count()} chunks")
-
-    # ── 包装为 LangChain Chroma ──
+    # 2. 初始化并重置 Parent Collection
     parent_vs = Chroma(
-        client=client, collection_name="rag_v4_parent",
+        persist_directory=persist_dir,
+        collection_name="rag_v4_parent",
         embedding_function=embedding_fn,
+        collection_metadata={"hnsw:space": "cosine"}
     )
+    try:
+        existing_p = parent_vs._collection.get()
+        if existing_p and existing_p.get("ids"):
+            parent_vs._collection.delete(ids=existing_p["ids"])
+            logger.info(f"🗑️ 已清空旧 Parent 数据: {len(existing_p['ids'])} 条")
+    except Exception as e:
+        logger.debug(f"Parent 重置跳过: {e}")
+
+    if parent_docs:
+        p_ids = [
+            doc.metadata.get("parent_id") or doc.metadata.get("chunk_id") or f"p_{doc.metadata.get('product_id', 'General')}_{i}"
+            for i, doc in enumerate(parent_docs)
+        ]
+        parent_vs.add_documents(documents=parent_docs, ids=p_ids)
+        logger.info(f"✅ v4 Parent Collection 已入库: {len(parent_docs)} 个切片")
+
+    # 3. 初始化并重置 Child Collection
     child_vs = Chroma(
-        client=client, collection_name="rag_v4_child",
+        persist_directory=persist_dir,
+        collection_name="rag_v4_child",
         embedding_function=embedding_fn,
+        collection_metadata={"hnsw:space": "cosine"}
     )
+    try:
+        existing_c = child_vs._collection.get()
+        if existing_c and existing_c.get("ids"):
+            child_vs._collection.delete(ids=existing_c["ids"])
+            logger.info(f"🗑️ 已清空旧 Child 数据: {len(existing_c['ids'])} 条")
+    except Exception as e:
+        logger.debug(f"Child 重置跳过: {e}")
+
+    if child_docs:
+        c_ids = [
+            doc.metadata.get("chunk_id") or f"c_{doc.metadata.get('product_id', 'General')}_{i}"
+            for i, doc in enumerate(child_docs)
+        ]
+        child_vs.add_documents(documents=child_docs, ids=c_ids)
+        logger.info(f"✅ v4 Child Collection 已入库: {len(child_docs)} 个切片")
+
+    # 4. 同步构建 BM25 内存索引（全产品分词索引）
+    build_bm25_index(child_docs, persist_dir)
 
     return parent_vs, child_vs
 
@@ -1237,99 +1223,94 @@ def bm25_remove_product(product_id: str):
 
 
 def upsert_product_documents(
-    pdf_path: str,
-    product_id: str = "",
-    child_chunk_size: int = 400,
-    parent_chunk_size: int = 1000,
-    persist_dir: str = CHROMA_PERSIST_DIR,
-) -> dict:
+    file_path: str,
+    product_id: Optional[str] = None,
+    child_chunk_size: int = 500,
+    parent_chunk_size: int = 1500,
+) -> Dict[str, Any]:
     """
-    增量更新单个产品的文档切片（ADR-16 核心入口）。
-
-    Returns:
-        {"status": "updated"|"skipped"|"new", "parents": N, "children": M}
+    增量摄入单个产品文档（PDF 或 Markdown），自动路由至 Stage 1 双轨解析引擎并持久化。
     """
-    import hashlib, os
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"文件不存在: {file_path}")
 
-    # ── Step 1: MD5 去重 ──
-    try:
-        with open(pdf_path, "rb") as f:
-            file_md5 = hashlib.md5(f.read()).hexdigest()
-    except Exception:
-        file_md5 = ""
+    from langchain_chroma import Chroma
+    from .pdf_loader import (
+        load_single_sdk_pdf,
+        load_jaka_mineru_dual,
+        _resolve_product_id_from_filename,
+    )
 
-    if not _product_md5_store:
-        _init_md5_store_from_chroma(persist_dir)
-
+    filename = os.path.basename(file_path)
     if not product_id:
-        from .pdf_loader import _resolve_product_id_from_filename
-        product_id = _resolve_product_id_from_filename(os.path.basename(pdf_path))
+        product_id = _resolve_product_id_from_filename(filename)
 
-    if product_id in _product_md5_store and _product_md5_store[product_id] == file_md5:
-        logger.info(f"⏭️  MD5 相同，跳过: {product_id} ({file_md5[:8]}...)")
-        return {"status": "skipped", "parents": 0, "children": 0, "ocr_images": 0}
+    logger.info(f"📥 开始增量解析文档: {filename} (目标产品线: {product_id})")
 
-    # ── Step 2: 级联删除旧数据 ──
-    deleted = delete_product_chunks(product_id, persist_dir)
-    bm25_remove_product(product_id)
+    # 1. 双轨解析路由
+    parent_docs = []
+    child_docs = []
 
-    # ── Step 3: 重新解析 ──
-    from .pdf_loader import _v4_extract_text_universal, _v4_build_parent_child_docs, _clean_pdf_text
-    text, total_pages, ocr_pages = _v4_extract_text_universal(pdf_path)
-    if not text.strip():
-        return {"status": "error", "error": "no_text"}
+    if file_path.lower().endswith(".md"):
+        parent_docs, child_docs = load_jaka_mineru_dual(file_path)
+    elif file_path.lower().endswith(".pdf"):
+        parent_docs, child_docs = load_single_sdk_pdf(file_path, product_id=product_id)
+    else:
+        raise ValueError(f"不支持的文件格式: {filename}，仅支持 .pdf 与 .md")
 
-    ocr_count = ocr_pages
+    if not child_docs:
+        logger.warning(f"⚠️ 文档未解析出任何有效子切片: {filename}")
+        return {
+            "status": "warning",
+            "message": "文档解析为空",
+            "parent_chunks": 0,
+            "child_chunks": 0,
+        }
 
-    # ── 🔴 PDF 文本清洗: 连字替换 + 括号空格规范化 ──
-    text = _clean_pdf_text(text)
+    # 2. 清洗 Metadata (防止包含 list/dict 引发 Chroma 写入异常)
+    for doc in parent_docs:
+        doc.metadata = _sanitize_metadata(doc.metadata)
+    for doc in child_docs:
+        doc.metadata = _sanitize_metadata(doc.metadata)
 
-    # Parent-Child 构建
-    source = os.path.basename(pdf_path)
-    parents, children = _v4_build_parent_child_docs(
-        text, source, product_id,
-        child_chunk_size=child_chunk_size,
-        parent_chunk_size=parent_chunk_size,
-    )
+    # 3. 使用 LangChain Chroma 包装器安全复用单例客户端进行写入
+    embedding_fn = get_embedding_function()
 
-    # ── Step 4: 手动嵌入 + 原生 add（网络免疫，无 ONNX 下载）──
-    embedding_fn = _create_embedding_function()
+    # 增量写入 Parent Collection
+    if parent_docs:
+        parent_vs = Chroma(
+            persist_directory=CHROMA_PERSIST_DIR,
+            collection_name="rag_v4_parent",
+            embedding_function=embedding_fn,
+            collection_metadata={"hnsw:space": "cosine"}
+        )
+        # 🔴 关键防御：使用 or 替代 get(key, default)，空字符串 "" 会被 or 识别为 False 从而触发兜底 ID
+        p_ids = [doc.metadata.get("parent_id") or doc.metadata.get("chunk_id") or f"p_{product_id}_{i}" for i, doc in enumerate(parent_docs)]
+        parent_vs.add_documents(documents=parent_docs, ids=p_ids)
+        logger.info(f"✅ 父切片增量入库: {len(parent_docs)} 个")
 
-    # Parent Collection — 增量追加
-    parent_texts = [d.page_content for d in parents]
-    parent_embeddings = _embed_batched(parent_texts, embedding_fn, batch_size=64)
-    parent_vs = _add_to_existing_collection(
-        "rag_v4_parent", parents, parent_texts, parent_embeddings,
-        persist_dir, embedding_fn,
-    )
+    # 增量写入 Child Collection
+    if child_docs:
+        child_vs = Chroma(
+            persist_directory=CHROMA_PERSIST_DIR,
+            collection_name="rag_v4_child",
+            embedding_function=embedding_fn,
+            collection_metadata={"hnsw:space": "cosine"}
+        )
+        # 🔴 关键防御：同理，拦截空字符串
+        c_ids = [doc.metadata.get("chunk_id") or f"c_{product_id}_{i}" for i, doc in enumerate(child_docs)]
+        child_vs.add_documents(documents=child_docs, ids=c_ids)
+        logger.info(f"✅ 子切片增量入库: {len(child_docs)} 个")
 
-    # Child Collection — 增量追加
-    child_texts = [d.page_content for d in children]
-    child_embeddings = _embed_batched(child_texts, embedding_fn, batch_size=64)
-    child_vs = _add_to_existing_collection(
-        "rag_v4_child", children, child_texts, child_embeddings,
-        persist_dir, embedding_fn,
-    )
-
-    # ── Step 5: BM25 同步 ──
-    bm25_upsert_product(product_id, parents + children)
-
-    # ── Step 6: 持久化 MD5 ──
-    _product_md5_store[product_id] = file_md5
-    _persist_md5_store(persist_dir)
-
-    logger.info(
-        f"✅ Upsert: {product_id} → {len(parents)}P + {len(children)}C "
-        f"(删除旧 {deleted} 条, OCR {ocr_count} 图片)"
-    )
+    # 4. BM25 内存索引增量同步
+    bm25_upsert_product(product_id, child_docs)
 
     return {
-        "status": "updated" if deleted > 0 else "new",
+        "status": "success",
         "product_id": product_id,
-        "parents": len(parents),
-        "children": len(children),
-        "ocr_images": ocr_count,
-        "deleted_old": deleted,
+        "parent_chunks": len(parent_docs),
+        "child_chunks": len(child_docs),
+        "source": filename,
     }
 
 
@@ -1687,19 +1668,9 @@ def cleanup_vector_store():
 # 命令行测试入口
 # ============================================================
 if __name__ == "__main__":
-    from .pdf_loader import load_pdfs_from_directory
-    from .config import PDF_DATA_DIR, CHUNK_SIZE, CHUNK_OVERLAP
+    from .pdf_loader import load_all_documents_v4_dual
+    from .config import PDF_DATA_DIR, JAKA_MARKDOWN_PATH
 
-    # 1. 独立测试加载 PDF 文本块
-    test_docs = load_pdfs_from_directory(PDF_DATA_DIR, CHUNK_SIZE, CHUNK_OVERLAP)
-
-    if test_docs:
-        # 2. 创建或加载向量库
-        store = create_vector_store(test_docs)
-        debug_print_vector_store_info(store)
-
-        # 3. 模拟一条测试查询语句，验证余弦距离与召回得分
-        test_query = "核心业务是什么？"
-        debug_search_similar_with_scores(store, query=test_query, k=3)
-    else:
-        print("未能读取到测试文档，无法测试向量库 CRUD 功能。")
+    print("=== 正在测试 Stage 1 双轨数据加载与向量化 ===")
+    p_docs, c_docs = load_all_documents_v4_dual(PDF_DATA_DIR, JAKA_MARKDOWN_PATH)
+    print(f"✅ 加载完成: {len(p_docs)} 个父切片, {len(c_docs)} 个子切片")
